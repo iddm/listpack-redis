@@ -13,6 +13,7 @@ pub mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
+pub mod error;
 pub mod listpack;
 
 /// The prelude module contains all the types and traits that you need

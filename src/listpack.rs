@@ -1,77 +1,914 @@
 //! The listpack interface.
 
-use std::{fmt::Debug, ptr::NonNull};
+use std::{
+    fmt::Debug,
+    ops::{Deref, Index},
+    ptr::NonNull,
+};
 
 use crate::bindings;
+use crate::error::Result;
 
-// #[derive(Debug, Copy, Clone)]
-// enum ListpackEntryType {
-//     String,
-//     Integer,
-// }
-
+/// The header of the listpack data structure.
+#[repr(C)]
 #[derive(Debug, Copy, Clone)]
-pub struct ListpackEntryRaw {
-    ptr: NonNull<u8>,
-    len: usize,
+pub struct ListpackHeader {
+    /// An unsigned integer holding the total amount of bytes
+    /// representing the listpack. Including the header itself and the
+    /// terminator. This basically is the total size of the allocation
+    /// needed to hold the listpack and allows to jump at the end in
+    /// order to scan the listpack in reverse order, from the last to
+    /// the first element, when needed.
+    total_bytes: u32,
+    /// An unsigned integer holding the total number of elements the
+    /// listpack holds. However if this field is set to 65535, which is
+    /// the greatest unsigned integer representable in 16 bit, it means
+    /// that the number of listpack elements is not known, so a
+    /// LIST-LENGTH operation will require to fully scan the listpack.
+    /// This happens when, at some point, the listpack has a number of
+    /// elements equal or greater than 65535. The num-elements field
+    /// will be set again to a lower number the first time a
+    /// LIST-LENGTH operation detects the elements count returned in the
+    /// representable range.
+    num_elements: u16,
 }
 
-#[derive(Debug, Clone)]
-pub enum ListpackEntry {
-    String(String),
-    Integer(i64),
-}
+impl ListpackHeader {
+    /// Returns the total amount of bytes representing the listpack.
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes as usize
+    }
 
-impl From<NonNull<u8>> for ListpackEntry {
-    fn from(ptr: NonNull<u8>) -> Self {
-        unimplemented!()
+    /// Returns the total number of elements the listpack holds.
+    pub fn num_elements(&self) -> usize {
+        self.num_elements as usize
+    }
+
+    /// Convert the header into a listpack.
+    ///
+    /// To do so, the header object must be located at the beginning of
+    /// the listpack which is already allocated.
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because it dereferences a raw pointer.
+    /// It is the caller's responsibility to verify the location of the
+    /// header and the validity of the listpack.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the header is not valid.
+    pub unsafe fn into_listpack(self) -> Listpack {
+        Listpack {
+            ptr: NonNull::new(&self as *const _ as *mut u8).expect("The header is valid."),
+        }
     }
 }
 
-impl From<String> for ListpackEntry {
-    fn from(s: String) -> Self {
-        Self::String(s)
+/// A reference to the header of the listpack data structure.
+///
+/// The header reference is a special kind of object (header) that is
+/// located at the beginning of the listpack and is used to access the
+/// listpack in a safe way. That means, it is basically a listpack
+/// itself.
+///
+/// A listpack reference is always a reference to a valid listpack
+/// header. It can be obtained using [`Listpack::header_ref`] method.
+///
+/// The header reference is a transparent wrapper around the header
+/// object ([`ListpackHeader`]).
+#[repr(transparent)]
+#[derive(Debug, Copy, Clone)]
+pub struct ListpackHeaderRef<'a>(&'a ListpackHeader);
+
+impl AsRef<ListpackHeader> for ListpackHeaderRef<'_> {
+    fn as_ref(&self) -> &ListpackHeader {
+        self.0
     }
 }
 
-macro_rules! impl_listpack_entry_from_number {
+impl Deref for ListpackHeaderRef<'_> {
+    type Target = Listpack;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*(self as *const _ as *const Listpack) }
+    }
+}
+
+impl ListpackHeaderRef<'_> {
+    /// Returns the total amount of bytes representing the listpack.
+    pub fn total_bytes(&self) -> usize {
+        self.0.total_bytes as usize
+    }
+
+    /// Returns the total number of elements the listpack holds.
+    pub fn num_elements(&self) -> usize {
+        self.0.num_elements as usize
+    }
+
+    /// Convert the header into a listpack.
+    ///
+    /// To do so, the header object must be located at the beginning of
+    /// the listpack which is already allocated.
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because it dereferences a raw pointer.
+    /// It is the caller's responsibility to verify the location of the
+    /// header and the validity of the listpack.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the header is not valid.
+    pub unsafe fn into_listpack(self) -> Listpack {
+        Listpack {
+            ptr: NonNull::new(&self as *const _ as *mut u8).expect("The header is valid."),
+        }
+    }
+}
+
+/// The subencoding type of a listpack entry.
+/// The subencoding is the encoding of a listpack entry, which is
+/// more complex than the simple encoding types, meaning it can't fit
+/// into a single byte of the header's encoding type and requires
+/// additional bytes to represent the entry, the data block.
+#[repr(u8)]
+#[derive(Debug, Copy, Clone)]
+pub enum ListpackEntrySubencodingType {
+    /// A 13-bit signed integer: the higher three bits are `110`, and
+    /// the following 13 bits are the integer itself.
+    SignedInteger13Bit = 0b11000000,
+    /// A string with length up to `4095` bytes: the higher four bits
+    /// are `1110`, the lower four bytes are the length of the string.
+    MediumString = 0b11100000,
+    /// A large string with up to `2^32 - 1` bytes: the higher four bits
+    /// are `1111`, the lower four bytes are always zero, designating
+    /// the large string encoding. After the encoding type, the
+    /// following four bytes are the length of the string (within the
+    /// data block), and then the string data itself.
+    LargeString = 0b11110000,
+    /// A 16-bit signed integer: the higher four bits are `1111`, and
+    /// the following four bits are `0001`. The following two bytes of
+    /// the data block represent a 16 bits signed integer.
+    SignedInteger16Bit = 0b11110001,
+    /// A 24-bit signed integer: the higher four bits are `1111`, and
+    /// the following four bits are `0010`. The following three bytes
+    /// of the data block represent a 24 bits signed integer.
+    SignedInteger24Bit = 0b11110010,
+    /// A 32-bit signed integer: the higher four bits are `1111`, and
+    /// the following four bits are `0011`. The following four bytes of
+    /// the data block represent a 32 bits signed integer.
+    SignedInteger32Bit = 0b11110011,
+    /// A 64-bit signed integer: the higher four bits are `1111`, and
+    /// the following four bits are `0100`. The following eight bytes of
+    /// the data block represent a 64 bits signed integer.
+    SignedInteger64Bit = 0b11110100,
+}
+
+impl TryFrom<u8> for ListpackEntrySubencodingType {
+    type Error = crate::error::Error;
+
+    fn try_from(encoding_byte: u8) -> Result<Self> {
+        match encoding_byte {
+            0b11000000 => Ok(Self::SignedInteger13Bit),
+            0b11100000 => Ok(Self::MediumString),
+            0b11110000 => Ok(Self::LargeString),
+            0b11110001 => Ok(Self::SignedInteger16Bit),
+            0b11110010 => Ok(Self::SignedInteger24Bit),
+            0b11110011 => Ok(Self::SignedInteger32Bit),
+            0b11110100 => Ok(Self::SignedInteger64Bit),
+            _ => Err(crate::error::Error::UnknownEncodingType { encoding_byte }),
+        }
+    }
+}
+
+/// The encoding type of a listpack entry.
+#[repr(u8)]
+#[derive(Debug, Copy, Clone)]
+pub enum ListpackEntryEncodingType {
+    /// A small integer is encoded within the byte itself (the
+    /// remaining 7 bits, meaning the values from 0 to 127 (a 7-bit
+    /// unsigned integer)).
+    SmallUnsignedInteger = 0b00000000,
+    /// A small string is encoded within the data block (the one
+    /// following the encoding byte). The length of such a small string
+    /// is encoded within the 6 lower bits of the encoding byte, so the
+    /// maximum length of a small string is 63 bytes (ASCII characters).
+    SmallString = 0b10000000,
+    /// If the higher 2 bits of the encoding byte are 11, the entry is
+    /// of a complex type, which may only be known after parsing the
+    /// following lower bits of the encoding type.
+    ComplexType(ListpackEntrySubencodingType),
+}
+
+impl TryFrom<u8> for ListpackEntryEncodingType {
+    type Error = crate::error::Error;
+
+    fn try_from(encoding_byte: u8) -> Result<Self> {
+        // Compare the highest two bits of the encoding byte, then if
+        // those aren't matched, delegate to the subencoding type.
+        match encoding_byte & 0b11000000 {
+            // If the first bit is unset, it's a small unsigned integer.
+            0b00000000 | 0b01000000 => Ok(Self::SmallUnsignedInteger),
+            // If the first bit is set, following the second bit which
+            // is unset, it's a small string.
+            0b10000000 => Ok(Self::SmallString),
+            // If the first two bits are set, it's a complex type.
+            0b11000000 => Ok(Self::ComplexType(ListpackEntrySubencodingType::try_from(
+                encoding_byte,
+            )?)),
+            // Ideally, this branch should never be reached.
+            _ => Err(crate::error::Error::UnknownEncodingType { encoding_byte }),
+        }
+    }
+}
+
+/// The meaning of the encoding byte.
+#[derive(Debug, Copy, Clone)]
+pub enum ListpackEntryData<'a> {
+    /// See [`ListpackEntryEncodingType::SmallUnsignedInteger`].
+    SmallUnsignedInteger(u8),
+    /// See [`ListpackEntryEncodingType::SmallString`].
+    SmallString(&'a str),
+    /// See [`ListpackEntrySubencodingType::SignedInteger13Bit`].
+    SignedInteger13Bit(i16),
+    /// See [`ListpackEntrySubencodingType::MediumString`].
+    MediumString(&'a str),
+    /// See [`ListpackEntrySubencodingType::LargeString`].
+    LargeString(&'a str),
+    /// See [`ListpackEntrySubencodingType::SignedInteger16Bit`].
+    SignedInteger16Bit(i16),
+    /// See [`ListpackEntrySubencodingType::SignedInteger24Bit`].
+    SignedInteger24Bit(i32),
+    /// See [`ListpackEntrySubencodingType::SignedInteger32Bit`].
+    SignedInteger32Bit(i32),
+    /// See [`ListpackEntrySubencodingType::SignedInteger64Bit`].
+    SignedInteger64Bit(i64),
+}
+
+impl ListpackEntryData<'_> {
+    /// Returns the encoding type of the entry.
+    pub fn encoding_type(&self) -> ListpackEntryEncodingType {
+        match self {
+            ListpackEntryData::SmallUnsignedInteger(_) => {
+                ListpackEntryEncodingType::SmallUnsignedInteger
+            }
+            ListpackEntryData::SmallString(_) => ListpackEntryEncodingType::SmallString,
+            ListpackEntryData::SignedInteger13Bit(_) => ListpackEntryEncodingType::ComplexType(
+                ListpackEntrySubencodingType::SignedInteger13Bit,
+            ),
+            ListpackEntryData::MediumString(_) => {
+                ListpackEntryEncodingType::ComplexType(ListpackEntrySubencodingType::MediumString)
+            }
+            ListpackEntryData::LargeString(_) => {
+                ListpackEntryEncodingType::ComplexType(ListpackEntrySubencodingType::LargeString)
+            }
+            ListpackEntryData::SignedInteger16Bit(_) => ListpackEntryEncodingType::ComplexType(
+                ListpackEntrySubencodingType::SignedInteger16Bit,
+            ),
+            ListpackEntryData::SignedInteger24Bit(_) => ListpackEntryEncodingType::ComplexType(
+                ListpackEntrySubencodingType::SignedInteger24Bit,
+            ),
+            ListpackEntryData::SignedInteger32Bit(_) => ListpackEntryEncodingType::ComplexType(
+                ListpackEntrySubencodingType::SignedInteger32Bit,
+            ),
+            ListpackEntryData::SignedInteger64Bit(_) => ListpackEntryEncodingType::ComplexType(
+                ListpackEntrySubencodingType::SignedInteger64Bit,
+            ),
+        }
+    }
+
+    /// Attempts to extract a small unsigned integer from the entry.
+    pub fn get_u7(&self) -> Option<u8> {
+        match self {
+            ListpackEntryData::SmallUnsignedInteger(u) => Some(*u),
+            _ => None,
+        }
+    }
+
+    /// Attempts to extract a small string from the entry.
+    pub fn get_str(&self) -> Option<&str> {
+        match self {
+            ListpackEntryData::SmallString(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Attempts to extract a signed 13-bit integer from the entry.
+    pub fn get_i13(&self) -> Option<i16> {
+        match self {
+            ListpackEntryData::SignedInteger13Bit(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// Attempts to extract a medium string from the entry.
+    pub fn get_medium_str(&self) -> Option<&str> {
+        match self {
+            ListpackEntryData::MediumString(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Attempts to extract a large string from the entry.
+    pub fn get_large_str(&self) -> Option<&str> {
+        match self {
+            ListpackEntryData::LargeString(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Attempts to extract a signed 16-bit integer from the entry.
+    pub fn get_i16(&self) -> Option<i16> {
+        match self {
+            ListpackEntryData::SignedInteger16Bit(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// Attempts to extract a signed 24-bit integer from the entry.
+    pub fn get_i24(&self) -> Option<i32> {
+        match self {
+            ListpackEntryData::SignedInteger24Bit(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// Attempts to extract a signed 32-bit integer from the entry.
+    pub fn get_i32(&self) -> Option<i32> {
+        match self {
+            ListpackEntryData::SignedInteger32Bit(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// Attempts to extract a signed 64-bit integer from the entry.
+    pub fn get_i64(&self) -> Option<i64> {
+        match self {
+            ListpackEntryData::SignedInteger64Bit(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if the entry is a small unsigned integer.
+    pub fn is_u7(&self) -> bool {
+        self.get_u7().is_some()
+    }
+
+    /// Returns `true` if the entry is a small string.
+    pub fn is_small_str(&self) -> bool {
+        self.get_str().is_some()
+    }
+
+    /// Returns `true` if the entry is a signed 13-bit integer.
+    pub fn is_i13(&self) -> bool {
+        self.get_i13().is_some()
+    }
+
+    /// Returns `true` if the entry is a medium string.
+    pub fn is_medium_str(&self) -> bool {
+        self.get_medium_str().is_some()
+    }
+
+    /// Returns `true` if the entry is a large string.
+    pub fn is_large_str(&self) -> bool {
+        self.get_large_str().is_some()
+    }
+
+    /// Returns `true` if the entry is a signed 16-bit integer.
+    pub fn is_i16(&self) -> bool {
+        self.get_i16().is_some()
+    }
+
+    /// Returns `true` if the entry is a signed 24-bit integer.
+    pub fn is_i24(&self) -> bool {
+        self.get_i24().is_some()
+    }
+
+    /// Returns `true` if the entry is a signed 32-bit integer.
+    pub fn is_i32(&self) -> bool {
+        self.get_i32().is_some()
+    }
+
+    /// Returns `true` if the entry is a signed 64-bit integer.
+    pub fn is_i64(&self) -> bool {
+        self.get_i64().is_some()
+    }
+}
+
+impl From<ListpackEntryData<'_>> for ListpackEntryEncodingType {
+    fn from(data: ListpackEntryData) -> Self {
+        data.encoding_type()
+    }
+}
+
+macro_rules! impl_listpack_entry_data_from_number {
     ($($t:ty),*) => {
         $(
-            impl From<$t> for ListpackEntry {
+            impl From<$t> for ListpackEntryData<'_> {
                 fn from(n: $t) -> Self {
-                    Self::Integer(n as i64)
+                    let n = n as i64;
+
+                    if n >= 0 && n <= 127 {
+                        Self::SmallUnsignedInteger(n as u8)
+                    } else if n >= -4096 && n <= 4095 {
+                        Self::SignedInteger13Bit(n as i16)
+                    } else if n >= -32768 && n <= 32767 {
+                        Self::SignedInteger16Bit(n as i16)
+                    } else if n >= -8388608 && n <= 8388607 {
+                        Self::SignedInteger24Bit(n as i32)
+                    } else if n >= -2147483648 && n <= 2147483647 {
+                        Self::SignedInteger32Bit(n as i32)
+                    } else {
+                        Self::SignedInteger64Bit(n)
+                    }
                 }
             }
 
-            impl TryFrom<ListpackEntry> for $t {
-                type Error = ();
+            impl TryFrom<ListpackEntryData<'_>> for $t {
+                type Error = crate::error::Error;
 
-                fn try_from(n: ListpackEntry) -> Result<Self, Self::Error> {
-                    match n {
-                        ListpackEntry::Integer(u) => Ok(u as $t),
-                        _ => Err(()),
-                    }
+                fn try_from(n: ListpackEntryData<'_>) -> Result<Self> {
+                    let min = <$t>::MIN as i64;
+                    let max = <$t>::MAX as i64;
+
+                    let range = min..=max;
+
+                    Ok(match n {
+                        ListpackEntryData::SmallUnsignedInteger(u) => if range.contains(&(u as i64)) {
+                            u as $t
+                        } else {
+                            return Err(crate::error::Error::UnsupportedNumberDataTypeBitWidth {
+                                bit_width: std::mem::size_of::<$t>() as u8 * 8,
+                            });
+                        },
+                        ListpackEntryData::SignedInteger13Bit(i) => if range.contains(&(i as i64)) {
+                            i as $t
+                        } else {
+                            return Err(crate::error::Error::UnsupportedNumberDataTypeBitWidth {
+                                bit_width: std::mem::size_of::<$t>() as u8 * 8,
+                            });
+                        },
+                        ListpackEntryData::SignedInteger16Bit(i) => if range.contains(&(i as i64)) {
+                            i as $t
+                        } else {
+                            return Err(crate::error::Error::UnsupportedNumberDataTypeBitWidth {
+                                bit_width: std::mem::size_of::<$t>() as u8 * 8,
+                            });
+                        },
+                        ListpackEntryData::SignedInteger24Bit(i) => if range.contains(&(i as i64)) {
+                            i as $t
+                        } else {
+                            return Err(crate::error::Error::UnsupportedNumberDataTypeBitWidth {
+                                bit_width: std::mem::size_of::<$t>() as u8 * 8,
+                            });
+                        },
+                        ListpackEntryData::SignedInteger64Bit(i) => if range.contains(&(i as i64)) {
+                            i as $t
+                        } else {
+                            return Err(crate::error::Error::UnsupportedNumberDataTypeBitWidth {
+                                bit_width: std::mem::size_of::<$t>() as u8 * 8,
+                            });
+                        }
+                        _ => return Err(crate::error::Error::UnsupportedNumberDataTypeBitWidth {
+                            bit_width: std::mem::size_of::<$t>() as u8 * 8,
+                        }),
+                    })
                 }
             }
         )*
     };
 }
 
-impl_listpack_entry_from_number!(i8, i16, i32, i64, u8, u16, u32, u64);
+impl_listpack_entry_data_from_number!(i8, i16, i32, i64, u8, u16, u32, u64);
 
-impl From<&str> for ListpackEntry {
+impl From<&str> for ListpackEntryData<'_> {
     fn from(s: &str) -> Self {
-        Self::String(s.to_string())
+        let len = s.len();
+        if len <= 63 {
+            Self::SmallString(s)
+        } else if len <= 4095 {
+            Self::MediumString(s)
+        } else {
+            Self::LargeString(s)
+        }
     }
 }
 
-impl From<&String> for ListpackEntry {
+impl From<&String> for ListpackEntryData<'_> {
     fn from(s: &String) -> Self {
-        Self::String(s.clone())
+        Self::from(s.as_str())
     }
 }
+
+// This header is copied from the implementation and should be kept
+// in sync with the original one.
+/// The header of a listpack entry.
+///
+/// The header isn't exactly a stand-alone object, it is rather a
+/// description of the memory layout of an entry in a listpack.
+/// The first byte contains the encoding type, after that, optionally,
+/// depending on the encoded type, the data block follows. All the time,
+/// however, after the encoding type byte or the data block, whichever
+/// comes last, the total number of bytes used to represent the entry
+/// follows, as a 4-byte unsigned integer. We cannot use the `u32` type
+/// directly, because the memory layout of the header is important.
+/// Thus, we can only provide a method to obtain it.
+#[repr(C)]
+#[derive(Debug)]
+pub struct ListpackEntryHeader {
+    /// The encoding type of the entry.
+    encoding_type: u8,
+    // The data block of the entry.
+    // data: Option<NonNull<u8>>,
+    // The total number of bytes used to represent the entry.
+    // total_bytes: u32,
+}
+
+impl ListpackEntryHeader {
+    /// Returns the byte (raw) representation of the encoding type.
+    pub fn get_encoding_type_raw(&self) -> u8 {
+        self.encoding_type
+    }
+
+    /// Returns the encoding type of the entry, parsed from the byte.
+    pub fn encoding_type(&self) -> Result<ListpackEntryEncodingType> {
+        ListpackEntryEncodingType::try_from(self.encoding_type)
+    }
+
+    /// Returns the dedicated data block of the entry, if there is one.
+    /// An entry may or may not have a data block, depending on the
+    /// encoding type.
+    pub fn get_data_raw(&self) -> Option<&[u8]> {
+        // Depending on the encoding type, the data block may or may not
+        // be present. If it is present, it is located after the encoding
+        // type byte.
+        let encoding_type = self.encoding_type().ok()?;
+
+        match encoding_type {
+            ListpackEntryEncodingType::SmallUnsignedInteger => None,
+            ListpackEntryEncodingType::SmallString => {
+                let len = (self.encoding_type & 0b00111111) as usize;
+                let data = unsafe {
+                    let ptr = (self as *const Self as *const u8).add(1);
+                    std::slice::from_raw_parts(ptr, len)
+                };
+                Some(data)
+            }
+            ListpackEntryEncodingType::ComplexType(subencoding_type) => match subencoding_type {
+                ListpackEntrySubencodingType::SignedInteger13Bit => {
+                    let data = unsafe {
+                        let ptr = (self as *const Self as *const u8).add(1);
+                        std::slice::from_raw_parts(ptr, 2)
+                    };
+                    Some(data)
+                }
+                ListpackEntrySubencodingType::MediumString => {
+                    let data = unsafe {
+                        let ptr = (self as *const Self as *const u8).add(1);
+                        let len = ((*ptr as usize) << 8) | (*ptr.add(1) as usize);
+                        let ptr = ptr.add(2);
+                        std::slice::from_raw_parts(ptr, len)
+                    };
+                    Some(data)
+                }
+                ListpackEntrySubencodingType::LargeString => {
+                    let data = unsafe {
+                        let ptr = (self as *const Self as *const u8).add(1);
+                        let len = ((*ptr as usize) << 24)
+                            | ((*ptr.add(1) as usize) << 16)
+                            | ((*ptr.add(2) as usize) << 8)
+                            | (*ptr.add(3) as usize);
+                        let ptr = ptr.add(4);
+                        std::slice::from_raw_parts(ptr, len)
+                    };
+                    Some(data)
+                }
+                ListpackEntrySubencodingType::SignedInteger16Bit => {
+                    let data = unsafe {
+                        let ptr = (self as *const Self as *const u8).add(1);
+                        std::slice::from_raw_parts(ptr, 2)
+                    };
+                    Some(data)
+                }
+                ListpackEntrySubencodingType::SignedInteger24Bit => {
+                    let data = unsafe {
+                        let ptr = (self as *const Self as *const u8).add(1);
+                        std::slice::from_raw_parts(ptr, 3)
+                    };
+                    Some(data)
+                }
+                ListpackEntrySubencodingType::SignedInteger32Bit => {
+                    let data = unsafe {
+                        let ptr = (self as *const Self as *const u8).add(1);
+                        std::slice::from_raw_parts(ptr, 4)
+                    };
+                    Some(data)
+                }
+                ListpackEntrySubencodingType::SignedInteger64Bit => {
+                    let data = unsafe {
+                        let ptr = (self as *const Self as *const u8).add(1);
+                        std::slice::from_raw_parts(ptr, 8)
+                    };
+                    Some(data)
+                }
+            },
+        }
+    }
+
+    /// Returns the number of bytes used to represent the entry.
+    ///
+    /// # Note
+    ///
+    /// Even though the return type is `usize`, the actual number of
+    /// bytes is stored as a 4-byte unsigned integer.
+    pub fn total_bytes(&self) -> usize {
+        let mut total_bytes_offset = std::mem::size_of::<u8>();
+        let data = self.get_data_raw();
+        if let Some(data) = data {
+            total_bytes_offset += data.len();
+        }
+
+        // Now return the total bytes as a 4-byte unsigned integer,
+        // which is read from the beginning of `self` + the
+        // `total_bytes_offset`.
+
+        unsafe {
+            let total_bytes_ptr = (self as *const Self as *const u8).add(total_bytes_offset);
+            let total_bytes_ptr = total_bytes_ptr as *const u32;
+            *total_bytes_ptr as usize
+        }
+    }
+
+    /// Returns the number of bytes used to represent the entry.
+    /// This is not necessarily the data of the object stored, depending
+    /// on the encoding type, it may contain the length of the data
+    /// as well.
+
+    /// Returns the data of the entry.
+    pub fn data(&self) -> Result<ListpackEntryData> {
+        let encoding_type = self.encoding_type()?;
+
+        Ok(match encoding_type {
+            ListpackEntryEncodingType::SmallUnsignedInteger => {
+                let value = self.encoding_type & 0b01111111;
+                ListpackEntryData::SmallUnsignedInteger(value)
+            }
+            ListpackEntryEncodingType::SmallString => {
+                let data = self
+                    .get_data_raw()
+                    .ok_or(crate::error::Error::MissingDataBlock)?;
+                let s = std::str::from_utf8(&data)
+                    .map_err(crate::error::Error::InvalidStringEncodingInsideDataBlock)?;
+                ListpackEntryData::SmallString(s)
+            }
+            ListpackEntryEncodingType::ComplexType(subencoding_type) => match subencoding_type {
+                ListpackEntrySubencodingType::SignedInteger13Bit => {
+                    let data = self
+                        .get_data_raw()
+                        .ok_or(crate::error::Error::MissingDataBlock)?;
+                    let n = ((data[0] as i16) << 8) | (data[1] as i16);
+                    ListpackEntryData::SignedInteger13Bit(n)
+                }
+                ListpackEntrySubencodingType::MediumString => {
+                    let data = self
+                        .get_data_raw()
+                        .ok_or(crate::error::Error::MissingDataBlock)?;
+                    let len = ((data[0] as usize) << 8) | (data[1] as usize);
+                    let s = std::str::from_utf8(&data[2..len + 2]).unwrap();
+                    ListpackEntryData::MediumString(s)
+                }
+                ListpackEntrySubencodingType::LargeString => {
+                    let data = self
+                        .get_data_raw()
+                        .ok_or(crate::error::Error::MissingDataBlock)?;
+                    let len = ((data[0] as usize) << 24)
+                        | ((data[1] as usize) << 16)
+                        | ((data[2] as usize) << 8)
+                        | (data[3] as usize);
+                    let s = std::str::from_utf8(&data[4..len + 4]).unwrap();
+                    ListpackEntryData::LargeString(s)
+                }
+                ListpackEntrySubencodingType::SignedInteger16Bit => {
+                    let data = self
+                        .get_data_raw()
+                        .ok_or(crate::error::Error::MissingDataBlock)?;
+                    let n = ((data[0] as i16) << 8) | (data[1] as i16);
+                    ListpackEntryData::SignedInteger16Bit(n)
+                }
+                ListpackEntrySubencodingType::SignedInteger24Bit => {
+                    let data = self
+                        .get_data_raw()
+                        .ok_or(crate::error::Error::MissingDataBlock)?;
+                    let n = ((data[0] as i32) << 16) | ((data[1] as i32) << 8) | (data[2] as i32);
+                    ListpackEntryData::SignedInteger24Bit(n)
+                }
+                ListpackEntrySubencodingType::SignedInteger32Bit => {
+                    let data = self
+                        .get_data_raw()
+                        .ok_or(crate::error::Error::MissingDataBlock)?;
+                    let n = ((data[0] as i32) << 24)
+                        | ((data[1] as i32) << 16)
+                        | ((data[2] as i32) << 8)
+                        | (data[3] as i32);
+                    ListpackEntryData::SignedInteger32Bit(n)
+                }
+                ListpackEntrySubencodingType::SignedInteger64Bit => {
+                    let data = self
+                        .get_data_raw()
+                        .ok_or(crate::error::Error::MissingDataBlock)?;
+                    let n = ((data[0] as i64) << 56)
+                        | ((data[1] as i64) << 48)
+                        | ((data[2] as i64) << 40)
+                        | ((data[3] as i64) << 32)
+                        | ((data[4] as i64) << 24)
+                        | ((data[5] as i64) << 16)
+                        | ((data[6] as i64) << 8)
+                        | (data[7] as i64);
+                    ListpackEntryData::SignedInteger64Bit(n)
+                }
+            },
+        })
+    }
+}
+
+impl From<NonNull<u8>> for ListpackEntryHeader {
+    fn from(ptr: NonNull<u8>) -> Self {
+        let ptr = ptr.as_ptr() as *mut Self;
+        unsafe { *ptr }
+    }
+}
+
+impl Clone for ListpackEntryHeader {
+    fn clone(&self) -> Self {
+        let data = self.get_data_raw();
+        let mut data_length = if let Some(data) = data { data.len() } else { 0 };
+        let total_bytes_length = std::mem::size_of::<u32>();
+
+        // Allocate the new contiguous memory for the new ListpackEntryHeader,
+        // then copy the memory from the old ListpackEntryHeader to the new one.
+        // TODO: use the allocator
+
+        let ptr = unsafe {
+            let destination_ptr = std::alloc::alloc(std::alloc::Layout::from_size_align_unchecked(
+                std::mem::size_of::<ListpackEntryHeader>() + data_length + total_bytes_length,
+                std::mem::align_of::<ListpackEntryHeader>(),
+            )) as *mut ListpackEntryHeader;
+
+            std::ptr::copy_nonoverlapping(self as *const Self, destination_ptr, 1);
+
+            if let Some(data) = data {
+                let data_ptr =
+                    (destination_ptr as *mut u8).add(std::mem::size_of::<ListpackEntryHeader>());
+                std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, data_length);
+            }
+
+            let total_bytes_ptr = (destination_ptr as *mut u8)
+                .add(std::mem::size_of::<ListpackEntryHeader>() + data_length);
+
+            std::ptr::copy_nonoverlapping(
+                (self as *const _ as *const u8)
+                    .add(std::mem::size_of::<ListpackEntryHeader>() + data_length)
+                    as *const u8,
+                total_bytes_ptr,
+                total_bytes_length,
+            );
+
+            destination_ptr
+        };
+
+        unsafe { *ptr }
+    }
+}
+
+/// The raw representation of a listpack entry. This is a stand-alone,
+/// owned object, which is not a part of the listpack itself.
+#[repr(C)]
+#[derive(Debug)]
+pub struct ListpackEntry {
+    ptr: NonNull<u8>,
+}
+
+impl ListpackEntry {
+    /// Returns the length of the entry.
+    pub fn len(&self) -> usize {
+        self.total_bytes()
+    }
+
+    /// Returns the pointer to the entry.
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr()
+    }
+
+    /// Returns the mutable pointer to the entry.
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+
+    /// Returns the header for this object.
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because it dereferences a raw pointer.
+    /// It is the caller's responsibility to verify the location of the
+    /// header and the validity of the listpack.
+    ///
+    /// It is only valid to call this function when the object is
+    /// already known to be a valid listpack entry.
+    pub unsafe fn get_header(&self) -> &ListpackEntryHeader {
+        &*(self.ptr.as_ptr() as *const ListpackEntryHeader)
+    }
+}
+
+impl From<NonNull<u8>> for ListpackEntry {
+    fn from(ptr: NonNull<u8>) -> Self {
+        Self { ptr }.clone()
+    }
+}
+
+impl Deref for ListpackEntry {
+    type Target = ListpackEntryHeader;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.get_header() }
+    }
+}
+
+impl Drop for ListpackEntry {
+    fn drop(&mut self) {
+        unsafe {
+            std::alloc::dealloc(
+                self.ptr.as_ptr(),
+                std::alloc::Layout::new::<ListpackEntry>(),
+            )
+        }
+    }
+}
+
+// impl Clone for ListpackEntry {
+//     fn clone(&self) -> Self {
+//         let header = unsafe { self.get_header() };
+//         let header = header.to_owned();
+//     }
+// }
+
+/// The listpack entry reference.
+#[repr(transparent)]
+#[derive(Debug, Copy, Clone)]
+pub struct ListpackEntryRef<'a>(&'a ListpackEntry);
+
+impl ListpackEntryRef<'_> {
+    /// Returns the reference to the header of the entry.
+    ///
+    /// # Safety
+    ///
+    /// This function is safe to use, as the objects of
+    /// [`ListpackEntryRef`] may only be returned by the listpack
+    /// itself, which guarantees the validity of the header.
+    pub fn get_header(&self) -> &ListpackEntryHeader {
+        unsafe { self.0.get_header() }
+    }
+}
+
+impl Deref for ListpackEntryRef<'_> {
+    type Target = ListpackEntry;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
+/// The allowed types to be inserted into a listpack.
+#[derive(Debug, Copy, Clone)]
+pub enum ListpackEntryInsert<'a> {
+    /// A string to insert into a listpack.
+    String(&'a str),
+    /// An integer to insert into a listpack.
+    Integer(i64),
+}
+
+impl<'a> From<&'a str> for ListpackEntryInsert<'a> {
+    fn from(value: &'a str) -> Self {
+        Self::String(value)
+    }
+}
+
+macro_rules! impl_listpack_entry_insert_from_number {
+    ($($t:ty),*) => {
+        $(
+            impl From<$t> for ListpackEntryInsert<'_> {
+                fn from(n: $t) -> Self {
+                    Self::Integer(n as i64)
+                }
+            }
+        )*
+    }
+}
+
+impl_listpack_entry_insert_from_number!(i8, i16, i32, i64, u8, u16, u32, u64);
 
 /// The listpack data structure.
+#[repr(transparent)]
 pub struct Listpack {
     ptr: NonNull<u8>,
 }
@@ -113,6 +950,21 @@ impl Listpack {
     /// Returns a new listpack.
     pub fn new() -> Self {
         Self::with_capacity(0)
+    }
+
+    /// An unsafe way to obtain an immutable reference to the listpack
+    /// header.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the header is not valid.
+    pub unsafe fn header_ref(&self) -> ListpackHeaderRef {
+        // &*(self.ptr.as_ptr() as *const ListpackHeader)
+        ListpackHeaderRef(
+            (self.ptr.as_ptr() as *const ListpackHeader)
+                .as_ref()
+                .expect("Header is valid"),
+        )
     }
 
     /// Creates a new listpack with the given capacity.
@@ -178,26 +1030,31 @@ impl Listpack {
     /// # Panics
     ///
     /// Panics if the string is too long to be stored in the listpack.
-    pub fn push<T: Into<ListpackEntry>>(&mut self, entry: ListpackEntry) {
+    pub fn push<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, entry: T) {
+        let entry = entry.into();
         match entry {
-            ListpackEntry::String(mut s) => {
+            ListpackEntryInsert::String(mut s) => {
                 let string_ptr = s.as_mut_ptr();
-                let len = s.len();
-                if len == 0 {
+                let len_bytes = s.len();
+                if len_bytes == 0 {
                     return;
-                } else if len > std::u32::MAX as usize {
+                }
+
+                if len_bytes > std::u32::MAX as usize {
                     panic!("The string is too long to be stored in the listpack.");
                 }
-                unsafe { bindings::lpAppend(self.ptr.as_ptr(), string_ptr, len as _) };
+
+                unsafe { bindings::lpAppend(self.ptr.as_ptr(), string_ptr, len_bytes as _) };
             }
-            ListpackEntry::Integer(n) => {
+            ListpackEntryInsert::Integer(n) => {
                 unsafe { bindings::lpAppendInteger(self.ptr.as_ptr(), n) };
             }
         }
     }
 
     /// Removes the last element from the listpack and returns it, or
-    /// [`None`] if it is empty.
+    /// [`None`] if it is empty. The returned [`ListpackEntry`] is not
+    /// a part of the listpack anymore.
     pub fn pop(&mut self) -> Option<ListpackEntry> {
         let mut ptr = NonNull::new(unsafe { bindings::lpLast(self.ptr.as_ptr()) });
 
@@ -209,6 +1066,19 @@ impl Listpack {
         }
     }
 
+    /// Removes the element at the given index from the listpack and
+    /// returns it, or [`None`] if the index is out of bounds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the index is out of bounds.
+    pub fn swap_remove(&mut self, index: usize) -> ListpackEntry {
+        let mut ptr = NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
+            .expect("Index out of bounds.");
+        unsafe { bindings::lpDelete(self.ptr.as_ptr(), ptr.as_ptr(), std::ptr::null_mut()) };
+        ListpackEntry::from(ptr)
+    }
+
     /// Returns an iterator over the elements of the listpack.
     pub fn iter(&self) -> ListpackIter {
         ListpackIter {
@@ -217,12 +1087,36 @@ impl Listpack {
         }
     }
 
-    /// Returns an iterator over the elements of the listpack.
-    pub fn iter_mut(&self) -> ListpackIterMut {
-        ListpackIterMut {
-            listpack: self,
-            index: 0,
-        }
+    // TODO:
+    // /// Returns an iterator over the elements of the listpack.
+    // pub fn iter_mut(&self) -> ListpackIterMut {
+    //     ListpackIterMut {
+    //         listpack: self,
+    //         index: 0,
+    //     }
+    // }
+}
+
+/// Slice methods.
+///
+/// Since the listpack objects aren't laid out in memory as a
+/// contiguous array, we can't implement the [`Deref`] trait to
+/// convert the listpack to a slice. Instead, we provide the
+/// corresponding methods.
+impl Listpack {
+    // TODO: return a 'ref' element instead of an owned one.
+    /// Returns an element of the listpack at the given index.
+    pub fn get(&self, index: usize) -> Option<&ListpackEntry> {
+        NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
+            .map(ListpackEntry::from)
+    }
+}
+
+impl Index<usize> for Listpack {
+    type Output = ListpackEntry;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.get(index).unwrap()
     }
 }
 
@@ -242,25 +1136,40 @@ pub struct ListpackIter<'a> {
 }
 
 impl Iterator for ListpackIter<'_> {
-    type Item = String;
+    type Item = ListpackEntry;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut len = 0;
-        let mut ptr = std::ptr::null_mut();
-        unsafe {
-            bindings::lpGet(self.listpack.ptr.as_ptr(), self.index, &mut ptr, &mut len);
+        if self.index >= self.listpack.len() {
+            return None;
         }
-        if ptr.is_null() {
-            None
-        } else {
-            self.index += 1;
-            Some(unsafe { String::from_raw_parts(ptr as *mut u8, len, len) })
-        }
+
+        let element = self.listpack.get(self.index).unwrap();
+
+        self.index += 1;
+
+        Some(element)
     }
 }
 
-/// A mutable iterator over the elements of a listpack.
-pub struct ListpackIterMut<'a> {
-    listpack: &'a Listpack,
-    index: usize,
-}
+// TODO:
+// /// A mutable iterator over the elements of a listpack.
+// pub struct ListpackIterMut<'a> {
+//     listpack: &'a Listpack,
+//     index: usize,
+// }
+
+// impl Iterator for ListpackIterMut<'_> {
+//     type Item = ListpackEntry;
+
+//     fn next(&mut self) -> Option<Self::Item> {
+//         if self.index >= self.listpack.len() {
+//             return None;
+//         }
+
+//         let element = self.listpack.get_mut(self.index).unwrap();
+
+//         self.index += 1;
+
+//         Some(element)
+//     }
+// }
