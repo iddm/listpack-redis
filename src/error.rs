@@ -6,11 +6,17 @@ use std::str::Utf8Error;
 #[derive(Debug, Copy, Clone)]
 pub enum Error {
     /// The subencoding of the listpack's entry is unknown.
-    UnknownEncodingType { encoding_byte: u8 },
+    UnknownEncodingType {
+        /// The encoding byte that caused the error.
+        encoding_byte: u8,
+    },
     /// Indicates an unsupported number data type. The bit width of the
     /// provided number which caused this error is provided in the
     /// [`bit_width`] field.
-    UnsupportedNumberDataTypeBitWidth { bit_width: u8 },
+    UnsupportedNumberDataTypeBitWidth {
+        /// The bit width of the number that caused the error.
+        bit_width: u8,
+    },
     /// An error indicating that the listpack's entry is missing a data
     /// block.
     MissingDataBlock,

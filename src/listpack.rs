@@ -409,15 +409,15 @@ macro_rules! impl_listpack_entry_data_from_number {
                 fn from(n: $t) -> Self {
                     let n = n as i64;
 
-                    if n >= 0 && n <= 127 {
+                    if (0..=127).contains(&n) {
                         Self::SmallUnsignedInteger(n as u8)
-                    } else if n >= -4096 && n <= 4095 {
+                    } else if (-4096..=4095).contains(&n) {
                         Self::SignedInteger13Bit(n as i16)
-                    } else if n >= -32768 && n <= 32767 {
+                    } else if (-32768..=32767).contains(&n) {
                         Self::SignedInteger16Bit(n as i16)
-                    } else if n >= -8388608 && n <= 8388607 {
+                    } else if (-8388608..=8388607).contains(&n) {
                         Self::SignedInteger24Bit(n as i32)
-                    } else if n >= -2147483648 && n <= 2147483647 {
+                    } else if (-2147483648..=2147483647).contains(&n) {
                         Self::SignedInteger32Bit(n as i32)
                     } else {
                         Self::SignedInteger64Bit(n)
@@ -482,8 +482,8 @@ macro_rules! impl_listpack_entry_data_from_number {
 
 impl_listpack_entry_data_from_number!(i8, i16, i32, i64, u8, u16, u32, u64);
 
-impl From<&str> for ListpackEntryData<'_> {
-    fn from(s: &str) -> Self {
+impl<'a> From<&'a str> for ListpackEntryData<'a> {
+    fn from(s: &'a str) -> Self {
         let len = s.len();
         if len <= 63 {
             Self::SmallString(s)
@@ -495,45 +495,39 @@ impl From<&str> for ListpackEntryData<'_> {
     }
 }
 
-impl From<&String> for ListpackEntryData<'_> {
-    fn from(s: &String) -> Self {
+impl<'a> From<&'a String> for ListpackEntryData<'a> {
+    fn from(s: &'a String) -> Self {
         Self::from(s.as_str())
     }
 }
 
-// This header is copied from the implementation and should be kept
-// in sync with the original one.
-/// The header of a listpack entry.
-///
-/// The header isn't exactly a stand-alone object, it is rather a
-/// description of the memory layout of an entry in a listpack.
-/// The first byte contains the encoding type, after that, optionally,
-/// depending on the encoded type, the data block follows. All the time,
-/// however, after the encoding type byte or the data block, whichever
-/// comes last, the total number of bytes used to represent the entry
-/// follows, as a 4-byte unsigned integer. We cannot use the `u32` type
-/// directly, because the memory layout of the header is important.
-/// Thus, we can only provide a method to obtain it.
+/// The raw representation of a listpack entry. This is a stand-alone,
+/// owned object, which is not a part of the listpack itself.
 #[repr(C)]
 #[derive(Debug)]
-pub struct ListpackEntryHeader {
-    /// The encoding type of the entry.
-    encoding_type: u8,
-    // The data block of the entry.
-    // data: Option<NonNull<u8>>,
-    // The total number of bytes used to represent the entry.
-    // total_bytes: u32,
+pub struct ListpackEntry {
+    ptr: NonNull<u8>,
 }
 
-impl ListpackEntryHeader {
+impl ListpackEntry {
+    /// Returns the pointer to the entry.
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr()
+    }
+
+    /// Returns the mutable pointer to the entry.
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+
     /// Returns the byte (raw) representation of the encoding type.
     pub fn get_encoding_type_raw(&self) -> u8 {
-        self.encoding_type
+        unsafe { *self.ptr.as_ref() }
     }
 
     /// Returns the encoding type of the entry, parsed from the byte.
     pub fn encoding_type(&self) -> Result<ListpackEntryEncodingType> {
-        ListpackEntryEncodingType::try_from(self.encoding_type)
+        ListpackEntryEncodingType::try_from(self.get_encoding_type_raw())
     }
 
     /// Returns the dedicated data block of the entry, if there is one.
@@ -544,11 +538,12 @@ impl ListpackEntryHeader {
         // be present. If it is present, it is located after the encoding
         // type byte.
         let encoding_type = self.encoding_type().ok()?;
+        let encoding_type_byte = self.get_encoding_type_raw();
 
         match encoding_type {
             ListpackEntryEncodingType::SmallUnsignedInteger => None,
             ListpackEntryEncodingType::SmallString => {
-                let len = (self.encoding_type & 0b00111111) as usize;
+                let len = (encoding_type_byte & 0b00111111) as usize;
                 let data = unsafe {
                     let ptr = (self as *const Self as *const u8).add(1);
                     std::slice::from_raw_parts(ptr, len)
@@ -648,17 +643,18 @@ impl ListpackEntryHeader {
     /// Returns the data of the entry.
     pub fn data(&self) -> Result<ListpackEntryData> {
         let encoding_type = self.encoding_type()?;
+        let encoding_type_byte = self.get_encoding_type_raw();
 
         Ok(match encoding_type {
             ListpackEntryEncodingType::SmallUnsignedInteger => {
-                let value = self.encoding_type & 0b01111111;
+                let value = encoding_type_byte & 0b01111111;
                 ListpackEntryData::SmallUnsignedInteger(value)
             }
             ListpackEntryEncodingType::SmallString => {
                 let data = self
                     .get_data_raw()
                     .ok_or(crate::error::Error::MissingDataBlock)?;
-                let s = std::str::from_utf8(&data)
+                let s = std::str::from_utf8(data)
                     .map_err(crate::error::Error::InvalidStringEncodingInsideDataBlock)?;
                 ListpackEntryData::SmallString(s)
             }
@@ -732,44 +728,44 @@ impl ListpackEntryHeader {
     }
 }
 
-impl From<NonNull<u8>> for ListpackEntryHeader {
+impl From<NonNull<u8>> for ListpackEntry {
     fn from(ptr: NonNull<u8>) -> Self {
-        let ptr = ptr.as_ptr() as *mut Self;
-        unsafe { *ptr }
+        Self { ptr }.clone()
     }
 }
 
-impl Clone for ListpackEntryHeader {
+impl Clone for ListpackEntry {
     fn clone(&self) -> Self {
+        let encoding_type_length = std::mem::size_of::<u8>();
         let data = self.get_data_raw();
-        let mut data_length = if let Some(data) = data { data.len() } else { 0 };
+        let data_length = if let Some(data) = data { data.len() } else { 0 };
         let total_bytes_length = std::mem::size_of::<u32>();
 
         // Allocate the new contiguous memory for the new ListpackEntryHeader,
         // then copy the memory from the old ListpackEntryHeader to the new one.
-        // TODO: use the allocator
+        // TODO: use the custom allocator
 
         let ptr = unsafe {
+            // Allocate a new memory block for the new ListpackEntry.
             let destination_ptr = std::alloc::alloc(std::alloc::Layout::from_size_align_unchecked(
-                std::mem::size_of::<ListpackEntryHeader>() + data_length + total_bytes_length,
-                std::mem::align_of::<ListpackEntryHeader>(),
-            )) as *mut ListpackEntryHeader;
+                encoding_type_length + data_length + total_bytes_length,
+                std::mem::align_of::<u8>(),
+            ));
 
-            std::ptr::copy_nonoverlapping(self as *const Self, destination_ptr, 1);
+            // Copy the encoding type byte.
+            std::ptr::copy_nonoverlapping(self as *const _ as *const u8, destination_ptr, 1);
 
+            // Copy the data block.
             if let Some(data) = data {
-                let data_ptr =
-                    (destination_ptr as *mut u8).add(std::mem::size_of::<ListpackEntryHeader>());
+                let data_ptr = destination_ptr.add(encoding_type_length);
                 std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, data_length);
             }
 
-            let total_bytes_ptr = (destination_ptr as *mut u8)
-                .add(std::mem::size_of::<ListpackEntryHeader>() + data_length);
+            let total_bytes_ptr = destination_ptr.add(encoding_type_length + data_length);
 
+            // Copy the total bytes.
             std::ptr::copy_nonoverlapping(
-                (self as *const _ as *const u8)
-                    .add(std::mem::size_of::<ListpackEntryHeader>() + data_length)
-                    as *const u8,
+                (self as *const _ as *const u8).add(encoding_type_length + data_length),
                 total_bytes_ptr,
                 total_bytes_length,
             );
@@ -777,96 +773,36 @@ impl Clone for ListpackEntryHeader {
             destination_ptr
         };
 
-        unsafe { *ptr }
-    }
-}
-
-/// The raw representation of a listpack entry. This is a stand-alone,
-/// owned object, which is not a part of the listpack itself.
-#[repr(C)]
-#[derive(Debug)]
-pub struct ListpackEntry {
-    ptr: NonNull<u8>,
-}
-
-impl ListpackEntry {
-    /// Returns the length of the entry.
-    pub fn len(&self) -> usize {
-        self.total_bytes()
-    }
-
-    /// Returns the pointer to the entry.
-    pub fn as_ptr(&self) -> *const u8 {
-        self.ptr.as_ptr()
-    }
-
-    /// Returns the mutable pointer to the entry.
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.ptr.as_ptr()
-    }
-
-    /// Returns the header for this object.
-    ///
-    /// # Safety
-    ///
-    /// This function is unsafe because it dereferences a raw pointer.
-    /// It is the caller's responsibility to verify the location of the
-    /// header and the validity of the listpack.
-    ///
-    /// It is only valid to call this function when the object is
-    /// already known to be a valid listpack entry.
-    pub unsafe fn get_header(&self) -> &ListpackEntryHeader {
-        &*(self.ptr.as_ptr() as *const ListpackEntryHeader)
-    }
-}
-
-impl From<NonNull<u8>> for ListpackEntry {
-    fn from(ptr: NonNull<u8>) -> Self {
-        Self { ptr }.clone()
-    }
-}
-
-impl Deref for ListpackEntry {
-    type Target = ListpackEntryHeader;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { self.get_header() }
+        Self {
+            ptr: NonNull::new(ptr).expect("The new ListpackEntry is allocated."),
+        }
     }
 }
 
 impl Drop for ListpackEntry {
     fn drop(&mut self) {
+        let total_size = self.total_bytes();
+
         unsafe {
             std::alloc::dealloc(
                 self.ptr.as_ptr(),
-                std::alloc::Layout::new::<ListpackEntry>(),
+                std::alloc::Layout::from_size_align_unchecked(
+                    total_size,
+                    std::mem::align_of::<u8>(),
+                ),
             )
         }
     }
 }
-
-// impl Clone for ListpackEntry {
-//     fn clone(&self) -> Self {
-//         let header = unsafe { self.get_header() };
-//         let header = header.to_owned();
-//     }
-// }
 
 /// The listpack entry reference.
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone)]
 pub struct ListpackEntryRef<'a>(&'a ListpackEntry);
 
-impl ListpackEntryRef<'_> {
-    /// Returns the reference to the header of the entry.
-    ///
-    /// # Safety
-    ///
-    /// This function is safe to use, as the objects of
-    /// [`ListpackEntryRef`] may only be returned by the listpack
-    /// itself, which guarantees the validity of the header.
-    pub fn get_header(&self) -> &ListpackEntryHeader {
-        unsafe { self.0.get_header() }
+impl From<NonNull<u8>> for ListpackEntryRef<'_> {
+    fn from(ptr: NonNull<u8>) -> Self {
+        Self(unsafe { &*(ptr.as_ptr() as *const ListpackEntry) })
     }
 }
 
@@ -955,6 +891,10 @@ impl Listpack {
     /// An unsafe way to obtain an immutable reference to the listpack
     /// header.
     ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the header is valid.
+    ///
     /// # Panics
     ///
     /// Panics if the header is not valid.
@@ -978,6 +918,12 @@ impl Listpack {
     /// Returns the number of elements of this listpack.
     pub fn len(&self) -> usize {
         unsafe { bindings::lpLength(self.ptr.as_ptr()) as usize }
+    }
+
+    /// Returns the length of the listpack, describing how many elements
+    /// are currently in this listpack.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Shrinks the capacity of the listpack to fit the number of
@@ -1033,8 +979,8 @@ impl Listpack {
     pub fn push<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, entry: T) {
         let entry = entry.into();
         match entry {
-            ListpackEntryInsert::String(mut s) => {
-                let string_ptr = s.as_mut_ptr();
+            ListpackEntryInsert::String(s) => {
+                let string_ptr = s.as_ptr() as *mut _;
                 let len_bytes = s.len();
                 if len_bytes == 0 {
                     return;
@@ -1056,7 +1002,7 @@ impl Listpack {
     /// [`None`] if it is empty. The returned [`ListpackEntry`] is not
     /// a part of the listpack anymore.
     pub fn pop(&mut self) -> Option<ListpackEntry> {
-        let mut ptr = NonNull::new(unsafe { bindings::lpLast(self.ptr.as_ptr()) });
+        let ptr = NonNull::new(unsafe { bindings::lpLast(self.ptr.as_ptr()) });
 
         if let Some(ptr) = ptr {
             unsafe { bindings::lpDelete(self.ptr.as_ptr(), ptr.as_ptr(), std::ptr::null_mut()) };
@@ -1073,7 +1019,7 @@ impl Listpack {
     ///
     /// Panics if the index is out of bounds.
     pub fn swap_remove(&mut self, index: usize) -> ListpackEntry {
-        let mut ptr = NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
+        let ptr = NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
             .expect("Index out of bounds.");
         unsafe { bindings::lpDelete(self.ptr.as_ptr(), ptr.as_ptr(), std::ptr::null_mut()) };
         ListpackEntry::from(ptr)
@@ -1104,11 +1050,10 @@ impl Listpack {
 /// convert the listpack to a slice. Instead, we provide the
 /// corresponding methods.
 impl Listpack {
-    // TODO: return a 'ref' element instead of an owned one.
     /// Returns an element of the listpack at the given index.
-    pub fn get(&self, index: usize) -> Option<&ListpackEntry> {
+    pub fn get(&self, index: usize) -> Option<ListpackEntryRef> {
         NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
-            .map(ListpackEntry::from)
+            .map(ListpackEntryRef::from)
     }
 }
 
@@ -1116,7 +1061,8 @@ impl Index<usize> for Listpack {
     type Output = ListpackEntry;
 
     fn index(&self, index: usize) -> &Self::Output {
-        &self.get(index).unwrap()
+        let entry = self.get(index).expect("Index out of bounds.");
+        entry.0
     }
 }
 
@@ -1135,8 +1081,8 @@ pub struct ListpackIter<'a> {
     index: usize,
 }
 
-impl Iterator for ListpackIter<'_> {
-    type Item = ListpackEntry;
+impl<'a> Iterator for ListpackIter<'a> {
+    type Item = ListpackEntryRef<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index >= self.listpack.len() {
