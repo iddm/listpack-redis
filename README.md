@@ -12,6 +12,10 @@ data-structure implemented in Redis as a part of Redis.
 
 Please follow the official [description](https://github.com/antirez/listpack/blob/master/listpack.md) of the data structure first.
 
+# MSRV (Minimally-Supported Rust Version)
+
+The `MSRV` is `1.70`.
+
 # Building
 
 Simply build using `cargo`:
