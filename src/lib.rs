@@ -22,3 +22,6 @@ mod redis_helpers;
 pub mod prelude {
     pub use crate::listpack::*;
 }
+
+// Re-export the prelude contents.
+pub use prelude::*;

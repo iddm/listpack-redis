@@ -9,7 +9,8 @@ use std::{
 use crate::bindings;
 use crate::error::Result;
 
-/// The header of the listpack data structure.
+/// The header of the listpack data structure. Can only be obtained
+/// from an existing listpack using the [`Listpack::header_ref`] method.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ListpackHeader {
@@ -35,11 +36,33 @@ pub struct ListpackHeader {
 
 impl ListpackHeader {
     /// Returns the total amount of bytes representing the listpack.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let listpack = Listpack::new();
+    /// let header = unsafe { listpack.header_ref() };
+    /// assert_eq!(header.total_bytes(), 7);
     pub fn total_bytes(&self) -> usize {
         self.total_bytes as usize
     }
 
     /// Returns the total number of elements the listpack holds.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let listpack = Listpack::new();
+    /// let header = unsafe { listpack.header_ref() };
+    /// assert_eq!(header.num_elements(), 0);
+    ///
+    /// let listpack = Listpack::from(&[1, 2, 3]);
+    /// let header = unsafe { listpack.header_ref() };
+    /// assert_eq!(header.num_elements(), 3);
     pub fn num_elements(&self) -> usize {
         self.num_elements as usize
     }
@@ -786,12 +809,24 @@ impl<'a> From<&'a str> for ListpackEntryInsert<'a> {
     }
 }
 
+impl<'a> From<&'a String> for ListpackEntryInsert<'a> {
+    fn from(value: &'a String) -> Self {
+        Self::String(value.as_str())
+    }
+}
+
 macro_rules! impl_listpack_entry_insert_from_number {
     ($($t:ty),*) => {
         $(
             impl From<$t> for ListpackEntryInsert<'_> {
                 fn from(n: $t) -> Self {
                     Self::Integer(n as i64)
+                }
+            }
+
+            impl From<&$t> for ListpackEntryInsert<'_> {
+                fn from(n: &$t) -> Self {
+                    Self::Integer(*n as i64)
                 }
             }
         )*
@@ -803,10 +838,48 @@ impl_listpack_entry_insert_from_number!(i8, i16, i32, i64, u8, u16, u32, u64);
 /// The listpack entry which is removed from listpack.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ListpackEntryRemoved {
-    /// A string to insert into a listpack.
+    /// A string which was removed from a listpack.
     String(String),
-    /// An integer to insert into a listpack.
+    /// An integer which was removed from a listpack.
     Integer(i64),
+}
+
+impl ListpackEntryRemoved {
+    /// Returns the string representation of the entry, if it is a
+    /// string.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::ListpackEntryRemoved;
+    ///
+    /// let entry = ListpackEntryRemoved::String("Hello, world!".to_owned());
+    /// assert_eq!(entry.get_str(), Some("Hello, world!"));
+    /// ```
+    pub fn get_str(&self) -> Option<&str> {
+        match self {
+            Self::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Returns the integer representation of the entry, if it is an
+    /// integer.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::ListpackEntryRemoved;
+    ///
+    /// let entry = ListpackEntryRemoved::Integer(42);
+    /// assert_eq!(entry.get_i64(), Some(42));
+    /// ```
+    pub fn get_i64(&self) -> Option<i64> {
+        match self {
+            Self::Integer(n) => Some(*n),
+            _ => None,
+        }
+    }
 }
 
 impl From<&str> for ListpackEntryRemoved {
@@ -892,11 +965,99 @@ impl Clone for Listpack {
     }
 }
 
+impl<'a, T> From<&'a [T]> for Listpack
+where
+    &'a T: Into<ListpackEntryInsert<'a>>,
+    ListpackEntryInsert<'a>: std::convert::From<&'a T>,
+{
+    fn from(slice: &'a [T]) -> Self {
+        let mut listpack = Listpack::with_capacity(slice.len());
+        for item in slice {
+            let item: ListpackEntryInsert<'a> = ListpackEntryInsert::from(item);
+            listpack.push(item);
+        }
+        listpack
+    }
+}
+
+impl<'a, T, const N: usize> From<&'a [T; N]> for Listpack
+where
+    &'a T: Into<ListpackEntryInsert<'a>>,
+    ListpackEntryInsert<'a>: std::convert::From<&'a T>,
+{
+    fn from(slice: &'a [T; N]) -> Self {
+        let mut listpack = Listpack::with_capacity(slice.len());
+        for item in slice {
+            let item: ListpackEntryInsert<'a> = ListpackEntryInsert::from(item);
+            listpack.push(item);
+        }
+        listpack
+    }
+}
+
 /// The [`Vec`]-like interface for the listpack.
 impl Listpack {
     /// Returns a new listpack.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let listpack = Listpack::new();
+    /// assert!(listpack.is_empty());
+    /// ```
     pub fn new() -> Self {
         Self::with_capacity(0)
+    }
+
+    /// Creates a new listpack with the given capacity.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let listpack = Listpack::with_capacity(10);
+    /// assert!(listpack.is_empty());
+    /// ```
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            ptr: NonNull::new(unsafe { bindings::lpNew(capacity) })
+                .expect("could not create listpack"),
+        }
+    }
+
+    /// Creates a new listpack from the given raw pointer.
+    ///
+    /// # Safety
+    ///
+    /// 1. The caller must ensure that the pointer is valid.
+    /// 2. Since there is no way to track the pointer returned by the
+    ///    [`Listpack::as_ptr`] method, the caller must ensure that the
+    ///    pointer is not used after the listpack is dropped, and that
+    ///    the listpack this pointer was taken from **is** dropped if
+    ///    another listpack is created from the same pointer, using
+    ///    [`Listpack::from_raw_parts`], as in the example.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    /// use std::ptr::NonNull;
+    ///
+    /// let mut old = Listpack::new();
+    /// old.push("Hello, world!");
+    /// let ptr = unsafe { NonNull::new_unchecked(old.as_mut_ptr()) };
+    /// let new = unsafe { Listpack::from_raw_parts(ptr) };
+    /// assert_eq!(old.get(0), new.get(0));
+    ///
+    /// // The old listpack is forgotten so that there is no
+    /// // double-free.
+    /// std::mem::forget(old);
+    /// ```
+    pub unsafe fn from_raw_parts(ptr: NonNull<u8>) -> Self {
+        Self { ptr }
     }
 
     /// An unsafe way to obtain an immutable reference to the listpack
@@ -909,6 +1070,16 @@ impl Listpack {
     /// # Panics
     ///
     /// Panics if the header is not valid.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let listpack = Listpack::new();
+    /// let header = unsafe { listpack.header_ref() };
+    /// assert_eq!(header.num_elements(), 0);
+    /// ```
     pub unsafe fn header_ref(&self) -> ListpackHeaderRef {
         // &*(self.ptr.as_ptr() as *const ListpackHeader)
         ListpackHeaderRef(
@@ -918,31 +1089,66 @@ impl Listpack {
         )
     }
 
-    /// Creates a new listpack with the given capacity.
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            ptr: NonNull::new(unsafe { bindings::lpNew(capacity) })
-                .expect("could not create listpack"),
-        }
-
-        // let mut ptr =
-        //     NonNull::new(unsafe { bindings::lpNew(capacity) }).expect("could not create listpack");
-        // unsafe { std::ptr::read(ptr.as_mut() as *mut _ as *mut Self) }
-    }
-
     /// Returns the number of elements of this listpack.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello, world!");
+    /// assert_eq!(listpack.len(), 1);
+    /// ```
     pub fn len(&self) -> usize {
         unsafe { bindings::lpLength(self.ptr.as_ptr()) as usize }
     }
 
     /// Returns the length of the listpack, describing how many elements
     /// are currently in this listpack.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello, world!");
+    /// assert!(!listpack.is_empty());
+    /// ```
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Shrinks the capacity of the listpack to fit the number of
     /// elements.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the listpack was shrunk, `false` if it wasn't.
+    // Commented out, as this method seems redundant: it seems that
+    // `shrink_to_fit` is called automatically when the listpack is
+    // modified (at least always when something is deleted).
+    // ///
+    // /// # Example
+    // ///
+    // /// ```
+    // /// use listpack_redis::Listpack;
+    // ///
+    // /// let mut listpack = Listpack::with_capacity(10);
+    // /// assert_eq!(listpack.get_storage_bytes(), 7);
+    // /// listpack.push("Hello, world!");
+    // /// assert_eq!(listpack.get_storage_bytes(), 22);
+    // /// listpack.push("Hello!");
+    // /// assert_eq!(listpack.get_storage_bytes(), 30);
+    // /// assert!(listpack.shrink_to_fit());
+    // /// assert_eq!(listpack.get_storage_bytes(), 22);
+    // /// let _ = listpack.pop();
+    // /// assert_eq!(listpack.get_storage_bytes(), 20);
+    // /// ```
+    // ///
+    // /// See [`Listpack::get_storage_bytes`] and
+    // /// [`Listpack::get_total_bytes`] for more information.
     pub fn shrink_to_fit(&mut self) -> bool {
         if let Some(ptr) = NonNull::new(unsafe { bindings::lpShrinkToFit(self.ptr.as_ptr()) }) {
             self.ptr = ptr;
@@ -953,6 +1159,20 @@ impl Listpack {
     }
 
     /// Truncates the listpack, keeping only the first `len` elements.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// assert_eq!(listpack.len(), 0);
+    /// listpack.push("Hello, world!");
+    /// assert_eq!(listpack.len(), 1);
+    /// listpack.push("Hello!");
+    /// assert_eq!(listpack.len(), 2);
+    /// listpack.truncate(1);
+    /// assert_eq!(listpack.len(), 1);
     pub fn truncate(&mut self, len: usize) {
         if len > self.len() {
             return;
@@ -967,17 +1187,51 @@ impl Listpack {
         }
     }
 
-    /// Returns a raw pointer to the listpack.
+    /// Returns a raw pointer to the listpack. The returned pointer is
+    /// never null.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let listpack = Listpack::new();
+    /// let ptr = listpack.as_ptr();
+    /// assert!(!ptr.is_null());
+    /// ```
     pub fn as_ptr(&self) -> *const u8 {
         self.ptr.as_ptr()
     }
 
-    /// Returns a mutable raw pointer to the listpack.
+    /// Returns a mutable raw pointer to the listpack. The returned
+    /// pointer is never null.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// let ptr = listpack.as_mut_ptr();
+    /// assert!(!ptr.is_null());
+    /// ```
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.ptr.as_ptr()
     }
 
-    /// Clears the entire listpack.
+    /// Clears the entire listpack. Same as calling [`Self::truncate()`]
+    /// with `0` as an argument.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello, world!");
+    /// assert_eq!(listpack.len(), 1);
+    /// listpack.clear();
+    /// assert_eq!(listpack.len(), 0);
+    /// ```
     pub fn clear(&mut self) {
         self.truncate(0)
     }
@@ -991,6 +1245,16 @@ impl Listpack {
     /// # Panics
     ///
     /// Panics if the string is too long to be stored in the listpack.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello, world!");
+    /// assert_eq!(listpack.len(), 1);
+    /// ```
     pub fn push<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, entry: T) {
         let entry = entry.into();
         self.ptr = NonNull::new(match entry {
@@ -1017,6 +1281,19 @@ impl Listpack {
     /// Removes the last element from the listpack and returns it, or
     /// [`None`] if it is empty. The returned [`ListpackEntry`] is not
     /// a part of the listpack anymore.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello, world!");
+    /// assert_eq!(listpack.len(), 1);
+    /// let removed = listpack.pop().unwrap();
+    /// assert_eq!(listpack.len(), 0);
+    /// assert_eq!(removed.get_str().unwrap(), "Hello, world!");
+    /// ```
     pub fn pop(&mut self) -> Option<ListpackEntryRemoved> {
         let ptr = NonNull::new(unsafe { bindings::lpLast(self.ptr.as_ptr()) });
 
@@ -1031,22 +1308,42 @@ impl Listpack {
         }
     }
 
-    /// Removes the element at the given index from the listpack and
-    /// returns it, or [`None`] if the index is out of bounds.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the index is out of bounds.
-    pub fn swap_remove(&mut self, index: usize) -> ListpackEntryRemoved {
-        let ptr = NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
-            .expect("Index out of bounds.");
-        let cloned = ListpackEntryRemoved::from(ptr);
-        self.ptr = NonNull::new(unsafe {
-            bindings::lpDelete(self.ptr.as_ptr(), ptr.as_ptr(), std::ptr::null_mut())
-        })
-        .expect("Deleted from listpack");
-        cloned
-    }
+    // Commented out, as there is no such method in listpack C API as
+    // of now.
+    // /// Removes the element at the given index from the listpack and
+    // /// returns it, swapping it with the last element.
+    // ///
+    // /// # Panics
+    // ///
+    // /// Panics if the index is out of bounds.
+    // ///
+    // /// # Example
+    // ///
+    // /// ```
+    // /// use listpack_redis::Listpack;
+    // ///
+    // /// let mut listpack = Listpack::new();
+    // /// listpack.push("Hello");
+    // /// listpack.push("World");
+    // /// listpack.push("!");
+    // /// let removed = listpack.swap_remove(0);
+    // /// assert_eq!(listpack.len(), 2);
+    // /// assert_eq!(removed.as_str().unwrap(), "Hello");
+    // /// assert_eq!(listpack.get(0).unwrap().data().unwrap().get_small_str().unwrap(), "!");
+    // /// assert_eq!(listpack.get(1).unwrap().data().unwrap().get_small_str().unwrap(), "World");
+    // /// ```
+    // pub fn swap_remove(&mut self, index: usize) -> ListpackEntryRemoved {
+    //     let ptr = NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
+    //         .expect("Index out of bounds.");
+    //     let cloned = ListpackEntryRemoved::from(ptr);
+    //     let last = NonNull::new(unsafe { bindings::lpLast(self.ptr.as_ptr()) })
+    //         .expect("The last element is accessible.");
+    //     self.ptr = NonNull::new(unsafe {
+    //         bindings::lpDelete(self.ptr.as_ptr(), ptr.as_ptr(), std::ptr::null_mut())
+    //     })
+    //     .expect("Deleted from listpack");
+    //     cloned
+    // }
 
     /// Returns an iterator over the elements of the listpack.
     pub fn iter(&self) -> ListpackIter {
@@ -1074,6 +1371,19 @@ impl Listpack {
 /// corresponding methods.
 impl Listpack {
     /// Returns an element of the listpack at the given index.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello");
+    /// listpack.push("World");
+    /// assert_eq!(listpack.get(0).unwrap().data().unwrap().get_small_str().unwrap(), "Hello");
+    /// assert_eq!(listpack.get(1).unwrap().data().unwrap().get_small_str().unwrap(), "World");
+    /// assert!(listpack.get(2).is_none());
+    /// ```
     pub fn get(&self, index: usize) -> Option<&ListpackEntry> {
         NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
             .map(ListpackEntry::ref_from_ptr)
@@ -1092,9 +1402,47 @@ impl Index<usize> for Listpack {
 impl Listpack {
     /// Returns the amount of bytes used by the listpack to store the
     /// elements.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::with_capacity(10);
+    /// assert_eq!(listpack.get_storage_bytes(), 7);
+    /// listpack.push("Hello, world!");
+    /// assert_eq!(listpack.get_storage_bytes(), 22);
+    /// listpack.push("Hello!");
+    /// assert_eq!(listpack.get_storage_bytes(), 30);
+    /// let _ = listpack.pop();
+    /// assert_eq!(listpack.get_storage_bytes(), 22);
+    /// ```
     pub fn get_storage_bytes(&self) -> usize {
         unsafe { bindings::lpBytes(self.ptr.as_ptr()) }
     }
+
+    // Commented out, as listpack C API doesn't provide a method to
+    // return the total bytes used by the listpack (including the
+    // capacity).
+    // /// Returns the total number of bytes used by the listpack,
+    // /// not just the storage bytes (the actual elements), but also the
+    // /// memory allocated for the capacity.
+    // ///
+    // /// # Example
+    // ///
+    // /// ```
+    // /// use listpack_redis::Listpack;
+    // ///
+    // /// let mut listpack = Listpack::with_capacity(10);
+    // /// assert_eq!(listpack.get_total_bytes(), 7);
+    // /// assert_eq!(listpack.get_storage_bytes(), 7);
+    // /// listpack.push("Hello, world!");
+    // /// assert_eq!(listpack.get_storage_bytes(), 22);
+    // /// assert_eq!(listpack.get_total_bytes(), 22);
+    // /// ```
+    // pub fn get_total_bytes(&self) -> usize {
+    //     unsafe { self.header_ref() }.total_bytes()
+    // }
 }
 
 /// An iterator over the elements of a listpack.
@@ -1158,7 +1506,7 @@ mod tests {
     }
 
     #[test]
-    fn test_listpack_header() {
+    fn header() {
         let mut listpack = Listpack::new();
 
         unsafe {
@@ -1189,7 +1537,7 @@ mod tests {
     }
 
     #[test]
-    fn test_listpack_iter() {
+    fn iter() {
         let mut listpack = Listpack::new();
         let mut iter = listpack.iter();
 
@@ -1223,7 +1571,7 @@ mod tests {
     }
 
     #[test]
-    fn test_listpack_get() {
+    fn get() {
         let listpack = create_hello_world_listpack();
 
         assert_eq!(
@@ -1250,7 +1598,7 @@ mod tests {
     }
 
     #[test]
-    fn test_listpack_clone() {
+    fn clone() {
         let listpack = create_hello_world_listpack();
 
         assert_eq!(
@@ -1307,7 +1655,16 @@ mod tests {
     }
 
     #[test]
-    fn test_listpack_index() {
+    fn pop() {
+        let mut listpack = create_hello_world_listpack();
+
+        assert_eq!(listpack.pop().unwrap().get_str().unwrap(), "World");
+        assert_eq!(listpack.pop().unwrap().get_str().unwrap(), "Hello");
+        assert_eq!(listpack.pop(), None);
+    }
+
+    #[test]
+    fn index() {
         let listpack = create_hello_world_listpack();
 
         assert_eq!(listpack[0].data().unwrap().get_str().unwrap(), "Hello");
@@ -1315,7 +1672,7 @@ mod tests {
     }
 
     #[test]
-    fn test_listpack_get_storage_bytes() {
+    fn get_storage_bytes() {
         let listpack = Listpack::new();
 
         assert_eq!(listpack.get_storage_bytes(), 7);
