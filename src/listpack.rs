@@ -2,8 +2,6 @@
 
 use std::{
     fmt::Debug,
-    marker::PhantomData,
-    mem::ManuallyDrop,
     ops::{Deref, Index},
     ptr::NonNull,
 };
@@ -645,7 +643,6 @@ impl ListpackEntry {
             let total_bytes_ptr = (self as *const Self as *const u8).add(total_bytes_offset);
             let total_bytes_ptr = total_bytes_ptr as *const u32;
             total_bytes_ptr.read_unaligned() as usize
-            // *total_bytes_ptr as usize
         }
     }
 
