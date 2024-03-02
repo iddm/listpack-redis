@@ -513,11 +513,12 @@ impl<'a> From<&'a String> for ListpackEntryData<'a> {
     }
 }
 
-/// The raw representation of a listpack entry. This is a stand-alone,
-/// owned object, which is not a part of the listpack itself.
+/// The raw representation of a listpack entry. This is a transparent,
+/// zero-sized object, which designates a reference to the actual
+/// listpack entry.
 #[repr(transparent)]
 #[derive(Debug)]
-pub struct ListpackEntry;
+pub struct ListpackEntry(());
 
 impl ListpackEntry {
     /// Returns the pointer to the entry.
@@ -643,7 +644,8 @@ impl ListpackEntry {
         unsafe {
             let total_bytes_ptr = (self as *const Self as *const u8).add(total_bytes_offset);
             let total_bytes_ptr = total_bytes_ptr as *const u32;
-            *total_bytes_ptr as usize
+            total_bytes_ptr.read_unaligned() as usize
+            // *total_bytes_ptr as usize
         }
     }
 
@@ -1248,6 +1250,63 @@ mod tests {
             "World"
         );
         assert_eq!(listpack.get(2), None);
+    }
+
+    #[test]
+    fn test_listpack_clone() {
+        let listpack = create_hello_world_listpack();
+
+        assert_eq!(
+            listpack
+                .get(0)
+                .unwrap()
+                .data()
+                .unwrap()
+                .get_small_str()
+                .unwrap(),
+            "Hello"
+        );
+        assert_eq!(
+            listpack
+                .get(1)
+                .unwrap()
+                .data()
+                .unwrap()
+                .get_small_str()
+                .unwrap(),
+            "World"
+        );
+        assert_eq!(listpack.get(2), None);
+
+        let cloned = listpack.clone();
+
+        assert_eq!(
+            cloned
+                .get(0)
+                .unwrap()
+                .data()
+                .unwrap()
+                .get_small_str()
+                .unwrap(),
+            "Hello"
+        );
+
+        assert_eq!(
+            cloned
+                .get(1)
+                .unwrap()
+                .data()
+                .unwrap()
+                .get_small_str()
+                .unwrap(),
+            "World"
+        );
+
+        assert_eq!(cloned.get(2), None);
+
+        assert_eq!(listpack.get(0), cloned.get(0));
+        assert_eq!(listpack.get(1), cloned.get(1));
+        assert_eq!(listpack.get(2), cloned.get(2));
     }
 
     #[test]
