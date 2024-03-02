@@ -2,7 +2,7 @@
 
 use std::{
     fmt::Debug,
-    ops::{Deref, Index},
+    ops::{Deref, Index, RangeBounds},
     ptr::NonNull,
 };
 
@@ -1314,6 +1314,152 @@ impl Listpack {
         .expect("Appended to listpack");
     }
 
+    // TODO: doc
+    /// Inserts an element at the given index into the listpack.
+    pub fn insert<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
+        todo!("Implement insert method.")
+        // let entry = entry.into();
+        // let ptr = NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
+        //     .expect("Index out of bounds.");
+
+        // let ptr = NonNull::new(match entry {
+        //     ListpackEntryInsert::String(s) => {
+        //         let string_ptr = s.as_ptr() as *mut _;
+        //         let len_bytes = s.len();
+        //         if len_bytes == 0 {
+        //             return;
+        //         }
+
+        //         if len_bytes > std::u32::MAX as usize {
+        //             panic!("The string is too long to be stored in the listpack.");
+        //         }
+
+        //         unsafe {
+        //             bindings::lpInsert(self.ptr.as_ptr(), ptr.as_ptr(), string_ptr, len_bytes as _)
+        //         }
+        //     }
+        //     ListpackEntryInsert::Integer(n) => unsafe {
+        //         bindings::lpInsertInteger(self.ptr.as_ptr(), ptr.as_ptr(), n)
+        //     },
+        // })
+        // .expect("Inserted into listpack");
+
+        // self.ptr = ptr;
+    }
+
+    // TODO: doc
+    /// Removes the element at the given index from the listpack and
+    /// returns it.
+    pub fn remove(&mut self, index: usize) -> ListpackEntryRemoved {
+        todo!("Implement remove method.")
+        // let ptr = NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
+        //     .expect("Index out of bounds.");
+        // let cloned = ListpackEntryRemoved::from(ptr);
+        // self.ptr = NonNull::new(unsafe {
+        //     bindings::lpDelete(self.ptr.as_ptr(), ptr.as_ptr(), std::ptr::null_mut())
+        // })
+        // .expect("Deleted from listpack");
+        // cloned
+    }
+
+    // TODO: doc
+    /// Retains only the elements specified by the predicate.
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&ListpackEntry) -> bool,
+    {
+        todo!("Implement retain method.")
+        // let mut index = 0;
+        // while index < self.len() {
+        //     let entry = self.get(index).unwrap();
+        //     if !f(entry) {
+        //         let _ = self.remove(index);
+        //     } else {
+        //         index += 1;
+        //     }
+        // }
+    }
+
+    // TODO: doc
+    /// Appends the elements of another listpack to the back of this
+    /// listpack.
+    pub fn append(&mut self, other: &mut Self) {
+        todo!("Implement append method.")
+        // let ptr = NonNull::new(unsafe { bindings::lpAppendLP(self.ptr.as_ptr(), other.ptr.as_ptr()) })
+        //     .expect("Appended to listpack");
+        // self.ptr = ptr;
+    }
+
+    // TODO: doc
+    /// Removes the elements in the specified range from the listpack
+    /// in bulk, returning all removed elements as an iterator.
+    pub fn drain<R>(&mut self, range: R) -> ListpackDrain
+    where
+        R: RangeBounds<usize>,
+    {
+        todo!("Implement drain method.")
+        // let start = match range.start_bound() {
+        //     Bound::Included(&start) => start,
+        //     Bound::Excluded(&start) => start + 1,
+        //     Bound::Unbounded => 0,
+        // };
+
+        // let end = match range.end_bound() {
+        //     Bound::Included(&end) => end + 1,
+        //     Bound::Excluded(&end) => end,
+        //     Bound::Unbounded => self.len(),
+        // };
+
+        // let length = end - start;
+        // let ptr = unsafe { bindings::lpDeleteRange(self.ptr.as_ptr(), start as _, length as _) };
+
+        // if let Some(ptr) = NonNull::new(ptr) {
+        //     self.ptr = ptr;
+        // }
+
+        // ListpackDrain {
+        //     listpack: self,
+        //     start,
+        //     end,
+        // }
+    }
+
+    /// Splits the listpack into two at the given index. Returns a new
+    /// listpack containing the elements from `at` to the end, and
+    /// removes those elements from the original listpack.
+    pub fn split_off(&mut self, at: usize) -> Self {
+        todo!("Implement split_off method.")
+    }
+
+    // TODO: doc
+    /// Appends all the elements of a slice to the listpack.
+    pub fn extend_from_slice<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, slice: &'a [T]) {
+        todo!("Implement extend_from_slice method.")
+        // for item in slice {
+        //     self.push(item);
+        // }
+    }
+
+    // TODO: doc
+    /// Removes consecutive repeated elements from the listpack.
+    pub fn dedup(&mut self) {
+        todo!("Implement dedup method.")
+    }
+
+    /// Returns the first element of the listpack, or [`None`] if it is
+    /// empty.
+    pub fn first(&self) -> Option<&ListpackEntry> {
+        self.get(0)
+    }
+
+    /// Returns the last element of the listpack, or [`None`] if it is
+    /// empty.
+    pub fn last(&self) -> Option<&ListpackEntry> {
+        self.get(self.len() - 1)
+    }
+
+    // TODO: more elements from slice.
+
     /// Removes the last element from the listpack and returns it, or
     /// [`None`] if it is empty. The returned [`ListpackEntry`] is not
     /// a part of the listpack anymore.
@@ -1505,6 +1651,12 @@ impl<'a> Iterator for ListpackIter<'a> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.index, Some(self.listpack.len()))
     }
+}
+
+/// An iterator over the elements of a listpack, which removes the
+/// elements from the listpack.
+pub struct ListpackDrain<'a> {
+    listpack: &'a mut Listpack,
 }
 
 // TODO:
