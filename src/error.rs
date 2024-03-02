@@ -12,7 +12,7 @@ pub enum Error {
     },
     /// Indicates an unsupported number data type. The bit width of the
     /// provided number which caused this error is provided in the
-    /// [`bit_width`] field.
+    /// [`Self::UnsupportedNumberDataTypeBitWidth::bit_width`] field.
     UnsupportedNumberDataTypeBitWidth {
         /// The bit width of the number that caused the error.
         bit_width: u8,

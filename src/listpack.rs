@@ -66,26 +66,6 @@ impl ListpackHeader {
     pub fn num_elements(&self) -> usize {
         self.num_elements as usize
     }
-
-    /// Convert the header into a listpack.
-    ///
-    /// To do so, the header object must be located at the beginning of
-    /// the listpack which is already allocated.
-    ///
-    /// # Safety
-    ///
-    /// This function is unsafe because it dereferences a raw pointer.
-    /// It is the caller's responsibility to verify the location of the
-    /// header and the validity of the listpack.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the header is not valid.
-    pub unsafe fn into_listpack(self) -> Listpack {
-        Listpack {
-            ptr: NonNull::new(&self as *const _ as *mut u8).expect("The header is valid."),
-        }
-    }
 }
 
 /// A reference to the header of the listpack data structure.
@@ -120,33 +100,17 @@ impl Deref for ListpackHeaderRef<'_> {
 
 impl ListpackHeaderRef<'_> {
     /// Returns the total amount of bytes representing the listpack.
+    ///
+    /// See [`ListpackHeader::total_bytes`].
     pub fn total_bytes(&self) -> usize {
         self.0.total_bytes as usize
     }
 
     /// Returns the total number of elements the listpack holds.
+    ///
+    /// See [`ListpackHeader::num_elements`].
     pub fn num_elements(&self) -> usize {
         self.0.num_elements as usize
-    }
-
-    /// Convert the header into a listpack.
-    ///
-    /// To do so, the header object must be located at the beginning of
-    /// the listpack which is already allocated.
-    ///
-    /// # Safety
-    ///
-    /// This function is unsafe because it dereferences a raw pointer.
-    /// It is the caller's responsibility to verify the location of the
-    /// header and the validity of the listpack.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the header is not valid.
-    pub unsafe fn into_listpack(self) -> Listpack {
-        Listpack {
-            ptr: NonNull::new(&self as *const _ as *mut u8).expect("The header is valid."),
-        }
     }
 }
 
@@ -156,7 +120,7 @@ impl ListpackHeaderRef<'_> {
 /// into a single byte of the header's encoding type and requires
 /// additional bytes to represent the entry, the data block.
 #[repr(u8)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ListpackEntrySubencodingType {
     /// A 13-bit signed integer: the higher three bits are `110`, and
     /// the following 13 bits are the integer itself.
@@ -207,7 +171,7 @@ impl TryFrom<u8> for ListpackEntrySubencodingType {
 
 /// The encoding type of a listpack entry.
 #[repr(u8)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ListpackEntryEncodingType {
     /// A small integer is encoded within the byte itself (the
     /// remaining 7 bits, meaning the values from 0 to 127 (a 7-bit
@@ -543,31 +507,61 @@ pub struct ListpackEntry(());
 
 impl ListpackEntry {
     /// Returns the pointer to the entry.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello");
+    /// let entry = listpack.get(0).unwrap();
+    /// let ptr = unsafe { entry.as_ptr() };
+    /// ```
     pub fn as_ptr(&self) -> *const u8 {
         self as *const _ as *const u8
     }
 
+    // TODO: add an example using the mutable ListpackEntry.
     /// Returns the mutable pointer to the entry.
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self as *mut _ as *mut u8
     }
 
     /// Returns the byte (raw) representation of the encoding type.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello");
+    /// let entry = listpack.get(0).unwrap();
+    /// let encoding_type = unsafe { entry.get_encoding_type_raw() };
+    /// ```
     pub fn get_encoding_type_raw(&self) -> u8 {
-        // unsafe { *self.ptr.as_ref() }
-        // unsafe { *self.ptr.as_ptr() }
-        unsafe { std::ptr::read(self.as_ptr()) }
+        unsafe { std::ptr::read_unaligned(self.as_ptr()) }
     }
 
     /// Returns the encoding type of the entry, parsed from the byte.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello");
+    /// let entry = listpack.get(0).unwrap();
+    /// let encoding_type = entry.encoding_type().unwrap();
+    /// assert_eq!(encoding_type, listpack_redis::ListpackEntryEncodingType::SmallString);
+    /// ```
     pub fn encoding_type(&self) -> Result<ListpackEntryEncodingType> {
         ListpackEntryEncodingType::try_from(self.get_encoding_type_raw())
     }
 
-    /// Returns the dedicated data block of the entry, if there is one.
-    /// An entry may or may not have a data block, depending on the
-    /// encoding type.
-    pub fn get_data_raw(&self) -> Option<&[u8]> {
+    fn get_data_raw_and_total_bytes(&self) -> Option<(&[u8], usize)> {
         // Depending on the encoding type, the data block may or may not
         // be present. If it is present, it is located after the encoding
         // type byte.
@@ -580,7 +574,9 @@ impl ListpackEntry {
                 let len = (encoding_type_byte & 0b00111111) as usize;
                 let data = unsafe {
                     let ptr = (self as *const Self as *const u8).add(1);
-                    std::slice::from_raw_parts(ptr, len)
+                    let data = std::slice::from_raw_parts(ptr, len);
+                    let total_bytes = ptr.add(len).cast::<u8>().read_unaligned() as _;
+                    (data, total_bytes)
                 };
                 Some(data)
             }
@@ -588,7 +584,9 @@ impl ListpackEntry {
                 ListpackEntrySubencodingType::SignedInteger13Bit => {
                     let data = unsafe {
                         let ptr = (self as *const Self as *const u8).add(1);
-                        std::slice::from_raw_parts(ptr, 2)
+                        let data = std::slice::from_raw_parts(ptr, 2);
+                        let total_bytes = ptr.add(2).cast::<u8>().read_unaligned() as _;
+                        (data, total_bytes)
                     };
                     Some(data)
                 }
@@ -597,7 +595,10 @@ impl ListpackEntry {
                         let ptr = (self as *const Self as *const u8).add(1);
                         let len = ((*ptr as usize) << 8) | (*ptr.add(1) as usize);
                         let ptr = ptr.add(2);
-                        std::slice::from_raw_parts(ptr, len)
+                        let data = std::slice::from_raw_parts(ptr, len);
+                        // TODO: either u8 or u16, in big endian.
+                        let total_bytes = ptr.add(len).cast::<u8>().read_unaligned() as _;
+                        (data, total_bytes)
                     };
                     Some(data)
                 }
@@ -609,40 +610,74 @@ impl ListpackEntry {
                             | ((*ptr.add(2) as usize) << 8)
                             | (*ptr.add(3) as usize);
                         let ptr = ptr.add(4);
-                        std::slice::from_raw_parts(ptr, len)
+                        let data = std::slice::from_raw_parts(ptr, len);
+                        // TODO: either u16, u24, or u32, in big endian.
+                        let total_bytes = ptr.add(len).cast::<u16>().read_unaligned() as _;
+                        (data, total_bytes)
                     };
                     Some(data)
                 }
                 ListpackEntrySubencodingType::SignedInteger16Bit => {
                     let data = unsafe {
                         let ptr = (self as *const Self as *const u8).add(1);
-                        std::slice::from_raw_parts(ptr, 2)
+                        let data = std::slice::from_raw_parts(ptr, 2);
+                        let total_bytes = ptr.add(2).cast::<u8>().read_unaligned() as _;
+                        (data, total_bytes)
                     };
                     Some(data)
                 }
                 ListpackEntrySubencodingType::SignedInteger24Bit => {
                     let data = unsafe {
                         let ptr = (self as *const Self as *const u8).add(1);
-                        std::slice::from_raw_parts(ptr, 3)
+                        let data = std::slice::from_raw_parts(ptr, 3);
+                        let total_bytes = ptr.add(3).cast::<u8>().read_unaligned() as _;
+                        (data, total_bytes)
                     };
                     Some(data)
                 }
                 ListpackEntrySubencodingType::SignedInteger32Bit => {
                     let data = unsafe {
                         let ptr = (self as *const Self as *const u8).add(1);
-                        std::slice::from_raw_parts(ptr, 4)
+                        let data = std::slice::from_raw_parts(ptr, 4);
+                        let total_bytes = ptr.add(4).cast::<u8>().read_unaligned() as _;
+                        (data, total_bytes)
                     };
                     Some(data)
                 }
                 ListpackEntrySubencodingType::SignedInteger64Bit => {
                     let data = unsafe {
                         let ptr = (self as *const Self as *const u8).add(1);
-                        std::slice::from_raw_parts(ptr, 8)
+                        let data = std::slice::from_raw_parts(ptr, 8);
+                        let total_bytes = ptr.add(8).cast::<u8>().read_unaligned() as _;
+                        (data, total_bytes)
                     };
                     Some(data)
                 }
             },
         }
+    }
+
+    /// Returns the dedicated data block of the entry, if there is one.
+    /// An entry may or may not have a data block, depending on the
+    /// encoding type.
+    ///
+    /// The returned block of memory should be treated as a chunk of
+    /// bytes, the interpretation of which should be dealth with by the
+    /// [`ListpackEntryData`] object, which correctly parses the block,
+    /// depending on the encoding type.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello");
+    /// let entry = listpack.get(0).unwrap();
+    /// let data = entry.get_data_raw().unwrap();
+    /// ```
+    pub fn get_data_raw(&self) -> Option<&[u8]> {
+        self.get_data_raw_and_total_bytes().map(|(data, _)| data)
     }
 
     /// Returns the number of bytes used to represent the entry.
@@ -651,22 +686,23 @@ impl ListpackEntry {
     ///
     /// Even though the return type is `usize`, the actual number of
     /// bytes is stored as a 4-byte unsigned integer.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello");
+    /// let entry = listpack.get(0).unwrap();
+    /// let total_bytes = entry.total_bytes();
+    /// // Five ascii characters, plus the encoding type byte.
+    /// assert_eq!(total_bytes, 6);
+    /// ```
     pub fn total_bytes(&self) -> usize {
-        let mut total_bytes_offset = std::mem::size_of::<u8>();
-        let data = self.get_data_raw();
-        if let Some(data) = data {
-            total_bytes_offset += data.len();
-        }
-
-        // Now return the total bytes as a 4-byte unsigned integer,
-        // which is read from the beginning of `self` + the
-        // `total_bytes_offset`.
-
-        unsafe {
-            let total_bytes_ptr = (self as *const Self as *const u8).add(total_bytes_offset);
-            let total_bytes_ptr = total_bytes_ptr as *const u32;
-            total_bytes_ptr.read_unaligned() as usize
-        }
+        self.get_data_raw_and_total_bytes()
+            .map(|(_, total_bytes)| total_bytes)
+            .unwrap_or(0)
     }
 
     /// Returns the number of bytes used to represent the entry.
@@ -1676,5 +1712,16 @@ mod tests {
         let listpack = Listpack::new();
 
         assert_eq!(listpack.get_storage_bytes(), 7);
+    }
+
+    #[test]
+    fn entry_total_bytes() {
+        let mut listpack = Listpack::new();
+
+        listpack.push("Hello");
+
+        let entry = listpack.get(0).unwrap();
+        let total_bytes = entry.total_bytes();
+        assert_eq!(total_bytes, 6);
     }
 }
