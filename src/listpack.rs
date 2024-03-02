@@ -2,6 +2,8 @@
 
 use std::{
     fmt::Debug,
+    marker::PhantomData,
+    mem::ManuallyDrop,
     ops::{Deref, Index},
     ptr::NonNull,
 };
@@ -287,7 +289,7 @@ impl ListpackEntryData<'_> {
     }
 
     /// Attempts to extract a small string from the entry.
-    pub fn get_str(&self) -> Option<&str> {
+    pub fn get_small_str(&self) -> Option<&str> {
         match self {
             ListpackEntryData::SmallString(s) => Some(s),
             _ => None,
@@ -313,6 +315,16 @@ impl ListpackEntryData<'_> {
     /// Attempts to extract a large string from the entry.
     pub fn get_large_str(&self) -> Option<&str> {
         match self {
+            ListpackEntryData::LargeString(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Attempts to extract any kind of string from the entry.
+    pub fn get_str(&self) -> Option<&str> {
+        match self {
+            ListpackEntryData::SmallString(s) => Some(s),
+            ListpackEntryData::MediumString(s) => Some(s),
             ListpackEntryData::LargeString(s) => Some(s),
             _ => None,
         }
@@ -357,7 +369,7 @@ impl ListpackEntryData<'_> {
 
     /// Returns `true` if the entry is a small string.
     pub fn is_small_str(&self) -> bool {
-        self.get_str().is_some()
+        self.get_small_str().is_some()
     }
 
     /// Returns `true` if the entry is a signed 13-bit integer.
@@ -503,7 +515,7 @@ impl<'a> From<&'a String> for ListpackEntryData<'a> {
 
 /// The raw representation of a listpack entry. This is a stand-alone,
 /// owned object, which is not a part of the listpack itself.
-#[repr(C)]
+#[repr(transparent)]
 #[derive(Debug)]
 pub struct ListpackEntry {
     ptr: NonNull<u8>,
@@ -522,7 +534,9 @@ impl ListpackEntry {
 
     /// Returns the byte (raw) representation of the encoding type.
     pub fn get_encoding_type_raw(&self) -> u8 {
-        unsafe { *self.ptr.as_ref() }
+        // unsafe { *self.ptr.as_ref() }
+        // unsafe { *self.ptr.as_ptr() }
+        unsafe { std::ptr::read(self.ptr.as_ptr()) }
     }
 
     /// Returns the encoding type of the entry, parsed from the byte.
@@ -734,6 +748,16 @@ impl From<NonNull<u8>> for ListpackEntry {
     }
 }
 
+impl PartialEq for ListpackEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.total_bytes() == other.total_bytes()
+            && self.get_encoding_type_raw() == other.get_encoding_type_raw()
+            && self.get_data_raw() == other.get_data_raw()
+    }
+}
+
+impl Eq for ListpackEntry {}
+
 impl Clone for ListpackEntry {
     fn clone(&self) -> Self {
         let encoding_type_length = std::mem::size_of::<u8>();
@@ -797,25 +821,34 @@ impl Drop for ListpackEntry {
 
 /// The listpack entry reference.
 #[repr(transparent)]
-#[derive(Debug, Copy, Clone)]
-pub struct ListpackEntryRef<'a>(&'a ListpackEntry);
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct ListpackEntryRef<'a> {
+    ptr: NonNull<u8>,
+    _phantom_data: PhantomData<&'a ()>,
+}
 
-impl From<NonNull<u8>> for ListpackEntryRef<'_> {
+impl<'a> From<NonNull<u8>> for ListpackEntryRef<'a> {
     fn from(ptr: NonNull<u8>) -> Self {
-        Self(unsafe { &*(ptr.as_ptr() as *const ListpackEntry) })
+        // Self(unsafe { &*(ptr.as_ptr() as *const ListpackEntry) })
+        Self {
+            ptr,
+            _phantom_data: PhantomData,
+        }
     }
 }
 
-impl Deref for ListpackEntryRef<'_> {
+impl<'a> Deref for ListpackEntryRef<'a> {
     type Target = ListpackEntry;
 
     fn deref(&self) -> &Self::Target {
-        self.0
+        let entry = ListpackEntry { ptr: self.ptr };
+        &entry
+        // Self(unsafe { &*(ptr.as_ptr() as *const ListpackEntry) })
     }
 }
 
 /// The allowed types to be inserted into a listpack.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ListpackEntryInsert<'a> {
     /// A string to insert into a listpack.
     String(&'a str),
@@ -913,6 +946,10 @@ impl Listpack {
             ptr: NonNull::new(unsafe { bindings::lpNew(capacity) })
                 .expect("could not create listpack"),
         }
+
+        // let mut ptr =
+        //     NonNull::new(unsafe { bindings::lpNew(capacity) }).expect("could not create listpack");
+        // unsafe { std::ptr::read(ptr.as_mut() as *mut _ as *mut Self) }
     }
 
     /// Returns the number of elements of this listpack.
@@ -964,7 +1001,7 @@ impl Listpack {
 
     /// Clears the entire listpack.
     pub fn clear(&mut self) {
-        self.truncate(self.len())
+        self.truncate(0)
     }
 
     // pub fn allocator(&self) -> bindings::lpAlloc {
@@ -978,7 +1015,7 @@ impl Listpack {
     /// Panics if the string is too long to be stored in the listpack.
     pub fn push<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, entry: T) {
         let entry = entry.into();
-        match entry {
+        self.ptr = NonNull::new(match entry {
             ListpackEntryInsert::String(s) => {
                 let string_ptr = s.as_ptr() as *mut _;
                 let len_bytes = s.len();
@@ -990,12 +1027,13 @@ impl Listpack {
                     panic!("The string is too long to be stored in the listpack.");
                 }
 
-                unsafe { bindings::lpAppend(self.ptr.as_ptr(), string_ptr, len_bytes as _) };
+                unsafe { bindings::lpAppend(self.ptr.as_ptr(), string_ptr, len_bytes as _) }
             }
-            ListpackEntryInsert::Integer(n) => {
-                unsafe { bindings::lpAppendInteger(self.ptr.as_ptr(), n) };
-            }
-        }
+            ListpackEntryInsert::Integer(n) => unsafe {
+                bindings::lpAppendInteger(self.ptr.as_ptr(), n)
+            },
+        })
+        .expect("Appended to listpack");
     }
 
     /// Removes the last element from the listpack and returns it, or
@@ -1005,7 +1043,9 @@ impl Listpack {
         let ptr = NonNull::new(unsafe { bindings::lpLast(self.ptr.as_ptr()) });
 
         if let Some(ptr) = ptr {
-            unsafe { bindings::lpDelete(self.ptr.as_ptr(), ptr.as_ptr(), std::ptr::null_mut()) };
+            self.ptr = NonNull::new(unsafe {
+                bindings::lpDelete(self.ptr.as_ptr(), ptr.as_ptr(), std::ptr::null_mut())
+            })?;
             Some(ListpackEntry::from(ptr))
         } else {
             None
@@ -1021,7 +1061,10 @@ impl Listpack {
     pub fn swap_remove(&mut self, index: usize) -> ListpackEntry {
         let ptr = NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
             .expect("Index out of bounds.");
-        unsafe { bindings::lpDelete(self.ptr.as_ptr(), ptr.as_ptr(), std::ptr::null_mut()) };
+        self.ptr = NonNull::new(unsafe {
+            bindings::lpDelete(self.ptr.as_ptr(), ptr.as_ptr(), std::ptr::null_mut())
+        })
+        .expect("Deleted from listpack");
         ListpackEntry::from(ptr)
     }
 
@@ -1058,11 +1101,10 @@ impl Listpack {
 }
 
 impl Index<usize> for Listpack {
-    type Output = ListpackEntry;
+    type Output = ListpackEntryRef<'a>;
 
-    fn index(&self, index: usize) -> &Self::Output {
-        let entry = self.get(index).expect("Index out of bounds.");
-        entry.0
+    fn index(&self, index: usize) -> &'a Self::Output {
+        &self.get(index).expect("Index out of bounds.")
     }
 }
 
@@ -1089,11 +1131,15 @@ impl<'a> Iterator for ListpackIter<'a> {
             return None;
         }
 
-        let element = self.listpack.get(self.index).unwrap();
+        let element = self.listpack.get(self.index)?;
 
         self.index += 1;
 
         Some(element)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.index, Some(self.listpack.len()))
     }
 }
 
@@ -1119,3 +1165,122 @@ impl<'a> Iterator for ListpackIter<'a> {
 //         Some(element)
 //     }
 // }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_hello_world_listpack() -> Listpack {
+        let mut listpack = Listpack::new();
+        listpack.push("Hello");
+        listpack.push("World");
+        listpack
+    }
+
+    #[test]
+    fn test_listpack_header() {
+        let mut listpack = Listpack::new();
+
+        unsafe {
+            assert_eq!(listpack.header_ref().total_bytes(), 7);
+            assert_eq!(listpack.header_ref().num_elements(), 0);
+        }
+
+        listpack.push("Hello");
+
+        unsafe {
+            assert_eq!(listpack.header_ref().total_bytes(), 14);
+            assert_eq!(listpack.header_ref().num_elements(), 1);
+        }
+
+        listpack.push("World");
+
+        unsafe {
+            assert_eq!(listpack.header_ref().total_bytes(), 21);
+            assert_eq!(listpack.header_ref().num_elements(), 2);
+        }
+
+        listpack.clear();
+
+        unsafe {
+            assert_eq!(listpack.header_ref().total_bytes(), 7);
+            assert_eq!(listpack.header_ref().num_elements(), 0);
+        }
+    }
+
+    #[test]
+    fn test_listpack_iter() {
+        let mut listpack = Listpack::new();
+        let mut iter = listpack.iter();
+
+        assert_eq!(iter.next(), None);
+
+        listpack.push("Hello");
+        listpack.push("World");
+
+        let mut iter = listpack.iter();
+
+        assert_eq!(
+            iter.next()
+                .unwrap()
+                .data()
+                .unwrap()
+                .get_small_str()
+                .unwrap(),
+            "Hello"
+        );
+        assert_eq!(
+            iter.next()
+                .unwrap()
+                .data()
+                .unwrap()
+                .get_small_str()
+                .unwrap(),
+            "World"
+        );
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.size_hint(), (2, Some(2)));
+    }
+
+    #[test]
+    fn test_listpack_get() {
+        let listpack = create_hello_world_listpack();
+
+        assert_eq!(
+            listpack
+                .get(0)
+                .unwrap()
+                .data()
+                .unwrap()
+                .get_small_str()
+                .unwrap(),
+            "Hello"
+        );
+        assert_eq!(
+            listpack
+                .get(1)
+                .unwrap()
+                .data()
+                .unwrap()
+                .get_small_str()
+                .unwrap(),
+            "World"
+        );
+        assert_eq!(listpack.get(2), None);
+    }
+
+    #[test]
+    fn test_listpack_index() {
+        let listpack = create_hello_world_listpack();
+
+        assert_eq!(listpack[0].data().unwrap().get_str().unwrap(), "Hello");
+        assert_eq!(listpack[1].data().unwrap().get_str().unwrap(), "World");
+    }
+
+    #[test]
+    fn test_listpack_get_storage_bytes() {
+        let listpack = Listpack::new();
+
+        assert_eq!(listpack.get_storage_bytes(), 7);
+    }
+}
