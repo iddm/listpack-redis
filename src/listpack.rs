@@ -517,26 +517,24 @@ impl<'a> From<&'a String> for ListpackEntryData<'a> {
 /// owned object, which is not a part of the listpack itself.
 #[repr(transparent)]
 #[derive(Debug)]
-pub struct ListpackEntry {
-    ptr: NonNull<u8>,
-}
+pub struct ListpackEntry;
 
 impl ListpackEntry {
     /// Returns the pointer to the entry.
     pub fn as_ptr(&self) -> *const u8 {
-        self.ptr.as_ptr()
+        self as *const _ as *const u8
     }
 
     /// Returns the mutable pointer to the entry.
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.ptr.as_ptr()
+        self as *mut _ as *mut u8
     }
 
     /// Returns the byte (raw) representation of the encoding type.
     pub fn get_encoding_type_raw(&self) -> u8 {
         // unsafe { *self.ptr.as_ref() }
         // unsafe { *self.ptr.as_ptr() }
-        unsafe { std::ptr::read(self.ptr.as_ptr()) }
+        unsafe { std::ptr::read(self.as_ptr()) }
     }
 
     /// Returns the encoding type of the entry, parsed from the byte.
@@ -740,11 +738,11 @@ impl ListpackEntry {
             },
         })
     }
-}
 
-impl From<NonNull<u8>> for ListpackEntry {
-    fn from(ptr: NonNull<u8>) -> Self {
-        Self { ptr }.clone()
+    /// Returns a reference from a pointer.
+    fn ref_from_ptr<'a>(ptr: NonNull<u8>) -> &'a ListpackEntry {
+        unsafe { ptr.cast().as_ref() }
+        // unsafe { &*ptr.as_ptr().cast::<Self>() }
     }
 }
 
@@ -758,92 +756,19 @@ impl PartialEq for ListpackEntry {
 
 impl Eq for ListpackEntry {}
 
-impl Clone for ListpackEntry {
-    fn clone(&self) -> Self {
-        let encoding_type_length = std::mem::size_of::<u8>();
-        let data = self.get_data_raw();
-        let data_length = if let Some(data) = data { data.len() } else { 0 };
-        let total_bytes_length = std::mem::size_of::<u32>();
-
-        // Allocate the new contiguous memory for the new ListpackEntryHeader,
-        // then copy the memory from the old ListpackEntryHeader to the new one.
-        // TODO: use the custom allocator
-
-        let ptr = unsafe {
-            // Allocate a new memory block for the new ListpackEntry.
-            let destination_ptr = std::alloc::alloc(std::alloc::Layout::from_size_align_unchecked(
-                encoding_type_length + data_length + total_bytes_length,
-                std::mem::align_of::<u8>(),
-            ));
-
-            // Copy the encoding type byte.
-            std::ptr::copy_nonoverlapping(self as *const _ as *const u8, destination_ptr, 1);
-
-            // Copy the data block.
-            if let Some(data) = data {
-                let data_ptr = destination_ptr.add(encoding_type_length);
-                std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, data_length);
-            }
-
-            let total_bytes_ptr = destination_ptr.add(encoding_type_length + data_length);
-
-            // Copy the total bytes.
-            std::ptr::copy_nonoverlapping(
-                (self as *const _ as *const u8).add(encoding_type_length + data_length),
-                total_bytes_ptr,
-                total_bytes_length,
-            );
-
-            destination_ptr
-        };
-
-        Self {
-            ptr: NonNull::new(ptr).expect("The new ListpackEntry is allocated."),
-        }
-    }
-}
-
 impl Drop for ListpackEntry {
     fn drop(&mut self) {
         let total_size = self.total_bytes();
 
         unsafe {
             std::alloc::dealloc(
-                self.ptr.as_ptr(),
+                self.as_mut_ptr(),
                 std::alloc::Layout::from_size_align_unchecked(
                     total_size,
                     std::mem::align_of::<u8>(),
                 ),
             )
         }
-    }
-}
-
-/// The listpack entry reference.
-#[repr(transparent)]
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub struct ListpackEntryRef<'a> {
-    ptr: NonNull<u8>,
-    _phantom_data: PhantomData<&'a ()>,
-}
-
-impl<'a> From<NonNull<u8>> for ListpackEntryRef<'a> {
-    fn from(ptr: NonNull<u8>) -> Self {
-        // Self(unsafe { &*(ptr.as_ptr() as *const ListpackEntry) })
-        Self {
-            ptr,
-            _phantom_data: PhantomData,
-        }
-    }
-}
-
-impl<'a> Deref for ListpackEntryRef<'a> {
-    type Target = ListpackEntry;
-
-    fn deref(&self) -> &Self::Target {
-        let entry = ListpackEntry { ptr: self.ptr };
-        &entry
-        // Self(unsafe { &*(ptr.as_ptr() as *const ListpackEntry) })
     }
 }
 
@@ -875,6 +800,60 @@ macro_rules! impl_listpack_entry_insert_from_number {
 }
 
 impl_listpack_entry_insert_from_number!(i8, i16, i32, i64, u8, u16, u32, u64);
+
+/// The listpack entry which is removed from listpack.
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum ListpackEntryRemoved {
+    /// A string to insert into a listpack.
+    String(String),
+    /// An integer to insert into a listpack.
+    Integer(i64),
+}
+
+impl From<&str> for ListpackEntryRemoved {
+    fn from(value: &str) -> Self {
+        Self::String(value.to_owned())
+    }
+}
+
+impl From<&String> for ListpackEntryRemoved {
+    fn from(value: &String) -> Self {
+        Self::String(value.to_owned())
+    }
+}
+
+impl From<NonNull<u8>> for ListpackEntryRemoved {
+    fn from(ptr: NonNull<u8>) -> Self {
+        let entry = ListpackEntry::ref_from_ptr(ptr);
+        let data = entry.data().unwrap();
+
+        match data {
+            ListpackEntryData::SmallString(s)
+            | ListpackEntryData::MediumString(s)
+            | ListpackEntryData::LargeString(s) => Self::String(s.to_owned()),
+            ListpackEntryData::SignedInteger13Bit(n) => Self::Integer(n as i64),
+            ListpackEntryData::SignedInteger16Bit(n) => Self::Integer(n as i64),
+            ListpackEntryData::SignedInteger24Bit(n) => Self::Integer(n as i64),
+            ListpackEntryData::SignedInteger32Bit(n) => Self::Integer(n as i64),
+            ListpackEntryData::SignedInteger64Bit(n) => Self::Integer(n),
+            ListpackEntryData::SmallUnsignedInteger(u) => Self::Integer(u as i64),
+        }
+    }
+}
+
+macro_rules! impl_listpack_entry_removed_from_number {
+    ($($t:ty),*) => {
+        $(
+            impl From<$t> for ListpackEntryRemoved {
+                fn from(n: $t) -> Self {
+                    Self::Integer(n as i64)
+                }
+            }
+        )*
+    }
+}
+
+impl_listpack_entry_removed_from_number!(i8, i16, i32, i64, u8, u16, u32, u64);
 
 /// The listpack data structure.
 #[repr(transparent)]
@@ -1039,14 +1018,15 @@ impl Listpack {
     /// Removes the last element from the listpack and returns it, or
     /// [`None`] if it is empty. The returned [`ListpackEntry`] is not
     /// a part of the listpack anymore.
-    pub fn pop(&mut self) -> Option<ListpackEntry> {
+    pub fn pop(&mut self) -> Option<ListpackEntryRemoved> {
         let ptr = NonNull::new(unsafe { bindings::lpLast(self.ptr.as_ptr()) });
 
         if let Some(ptr) = ptr {
+            let cloned = ListpackEntryRemoved::from(ptr);
             self.ptr = NonNull::new(unsafe {
                 bindings::lpDelete(self.ptr.as_ptr(), ptr.as_ptr(), std::ptr::null_mut())
             })?;
-            Some(ListpackEntry::from(ptr))
+            Some(cloned)
         } else {
             None
         }
@@ -1058,14 +1038,15 @@ impl Listpack {
     /// # Panics
     ///
     /// Panics if the index is out of bounds.
-    pub fn swap_remove(&mut self, index: usize) -> ListpackEntry {
+    pub fn swap_remove(&mut self, index: usize) -> ListpackEntryRemoved {
         let ptr = NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
             .expect("Index out of bounds.");
+        let cloned = ListpackEntryRemoved::from(ptr);
         self.ptr = NonNull::new(unsafe {
             bindings::lpDelete(self.ptr.as_ptr(), ptr.as_ptr(), std::ptr::null_mut())
         })
         .expect("Deleted from listpack");
-        ListpackEntry::from(ptr)
+        cloned
     }
 
     /// Returns an iterator over the elements of the listpack.
@@ -1094,17 +1075,17 @@ impl Listpack {
 /// corresponding methods.
 impl Listpack {
     /// Returns an element of the listpack at the given index.
-    pub fn get(&self, index: usize) -> Option<ListpackEntryRef> {
+    pub fn get(&self, index: usize) -> Option<&ListpackEntry> {
         NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
-            .map(ListpackEntryRef::from)
+            .map(ListpackEntry::ref_from_ptr)
     }
 }
 
 impl Index<usize> for Listpack {
-    type Output = ListpackEntryRef<'a>;
+    type Output = ListpackEntry;
 
-    fn index(&self, index: usize) -> &'a Self::Output {
-        &self.get(index).expect("Index out of bounds.")
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("Index out of bounds.")
     }
 }
 
@@ -1124,7 +1105,7 @@ pub struct ListpackIter<'a> {
 }
 
 impl<'a> Iterator for ListpackIter<'a> {
-    type Item = ListpackEntryRef<'a>;
+    type Item = &'a ListpackEntry;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index >= self.listpack.len() {
