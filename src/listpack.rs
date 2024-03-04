@@ -874,6 +874,22 @@ impl PartialEq for ListpackEntry {
     }
 }
 
+impl PartialEq<str> for ListpackEntry {
+    fn eq(&self, other: &str) -> bool {
+        self.data()
+            .map(|data| data.get_str() == Some(other))
+            .unwrap_or(false)
+    }
+}
+
+impl PartialEq<i64> for ListpackEntry {
+    fn eq(&self, other: &i64) -> bool {
+        self.data()
+            .map(|data| data.get_integer() == Some(*other))
+            .unwrap_or(false)
+    }
+}
+
 impl Eq for ListpackEntry {}
 
 impl Drop for ListpackEntry {
@@ -1884,30 +1900,65 @@ impl Listpack {
             })
     }
 
-    // /// Removes the given prefix from the listpack and returns it, or
-    // /// [`None`] if the listpack doesn't start with the prefix.
-    // ///
-    // /// # Example
-    // ///
-    // /// ```
-    // /// use listpack_redis::Listpack;
-    // ///
-    // /// let mut listpack = Listpack::new();
-    // /// listpack.push("Hello");
-    // /// listpack.push("World");
-    // /// assert_eq!(listpack.strip_prefix(&["Hello"]), vec!["Hello"]);
-    // /// assert_eq!(listpack.len(), 1);
-    // /// assert_eq!(listpack.first().unwrap().to_string(), "World");
-    // /// ```
-    // pub fn strip_prefix<'a, 'b, T>(&'b mut self, prefix: &'a [T]) -> Vec<&'b ListpackEntry>
-    // where
-    //     ListpackEntryInsert<'a>: std::convert::From<&'a T>,
-    // {
-    //     let length = prefix.len();
-    //     if self.starts_with(prefix) {
-    //         let _ = self.drain(0..length);
-    //     }
-    // }
+    /// Returns a sublist of objects with the prefix removed.
+    /// [`None`] if the listpack doesn't start with the prefix.
+    ///
+    /// # Note
+    ///
+    /// As the listpack's elements cannot be of the same size, there is
+    /// no way to produce a slice of the listpack, so the method
+    /// returns a [`Vec`] of references to the elements.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello");
+    /// listpack.push("World");
+    /// assert_eq!(listpack.strip_prefix(&["Hello"]), vec!["World"]);
+    /// ```
+    pub fn strip_prefix<'a, 'b, T>(&'b self, prefix: &'a [T]) -> Vec<&'b ListpackEntry>
+    where
+        ListpackEntryInsert<'a>: std::convert::From<&'a T>,
+    {
+        if self.starts_with(prefix) {
+            self.iter().skip(prefix.len()).collect()
+        } else {
+            Vec::default()
+        }
+    }
+
+    /// Returns a sublist of objects with the suffix removed.
+    /// [`None`] if the listpack doesn't start with the suffix.
+    ///
+    /// # Note
+    ///
+    /// As the listpack's elements cannot be of the same size, there is
+    /// no way to produce a slice of the listpack, so the method
+    /// returns a [`Vec`] of references to the elements.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello");
+    /// listpack.push("World");
+    /// assert_eq!(listpack.strip_suffix(&["World"]), vec!["Hello"]);
+    /// ```
+    pub fn strip_suffix<'a, 'b, T>(&'b mut self, suffix: &'a [T]) -> Vec<&'b ListpackEntry>
+    where
+        ListpackEntryInsert<'a>: std::convert::From<&'a T>,
+    {
+        if self.ends_with(suffix) {
+            self.iter().take(self.len() - suffix.len()).collect()
+        } else {
+            Vec::default()
+        }
+    }
 
     /// Returns an iterator over the elements of the listpack.
     pub fn iter(&self) -> ListpackIter {
