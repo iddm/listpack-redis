@@ -1499,8 +1499,39 @@ impl Listpack {
     /// Returns an iterator over all contiguous windows of length
     /// `size`. The windows overlap. If the listpack is shorter than
     /// `size`, the iterator returns no values.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the size is zero.
+    ///
+    /// See [`ListpackWindows`] for more information.
     pub fn windows(&self, size: usize) -> ListpackWindows {
+        if size == 0 {
+            panic!("The size must be greater than zero.");
+        }
+
         ListpackWindows {
+            listpack: self,
+            size,
+            index: 0,
+        }
+    }
+
+    /// Returns an iterator over all contiguous windows of length
+    /// `size`. The windows overlap. If the listpack is shorter than
+    /// `size`, the iterator returns no values.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the size is zero.
+    ///
+    /// See [`ListpackChunks`] for more information.
+    pub fn chunks(&self, size: usize) -> ListpackChunks {
+        if size == 0 {
+            panic!("The size must be greater than zero.");
+        }
+
+        ListpackChunks {
             listpack: self,
             size,
             index: 0,
@@ -1772,6 +1803,76 @@ impl<'a> Iterator for ListpackWindows<'a> {
         self.index += 1;
 
         Some(window)
+    }
+}
+
+/// An iterator over the elements of a listpack, which returns chunks
+/// of elements.
+///
+/// # Example
+///
+/// ```
+/// use listpack_redis::Listpack;
+///
+/// let mut listpack = Listpack::new();
+/// listpack.push("Hello");
+/// listpack.push("World");
+/// listpack.push("!");
+/// let mut iter = listpack.chunks(2);
+/// assert_eq!(iter.next().unwrap().len(), 2);
+/// assert_eq!(iter.next().unwrap().len(), 1);
+/// assert!(iter.next().is_none());
+/// ```
+///
+/// Or with values:
+///
+/// ```
+/// use listpack_redis::Listpack;
+///
+/// let mut listpack = Listpack::new();
+/// listpack.push("Hello");
+/// listpack.push("World");
+/// listpack.push("!");
+///
+/// let mut iter = listpack.chunks(2);
+///
+/// let value = iter.next().unwrap();
+///
+/// assert_eq!(value[0].to_string(), "Hello");
+/// assert_eq!(value[1].to_string(), "World");
+/// assert_eq!(value.len(), 2);
+///
+/// let value = iter.next().unwrap();
+///
+/// assert_eq!(value[0].to_string(), "!");
+/// assert_eq!(value.len(), 1);
+///
+/// assert!(iter.next().is_none());
+/// ```
+
+pub struct ListpackChunks<'a> {
+    listpack: &'a Listpack,
+    size: usize,
+    index: usize,
+}
+
+impl<'a> Iterator for ListpackChunks<'a> {
+    type Item = Vec<&'a ListpackEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.listpack.len() {
+            return None;
+        }
+
+        let remaining = (self.listpack.len() - self.index).min(self.size);
+        let mut chunk = Vec::with_capacity(remaining);
+        for i in self.index..self.index + remaining {
+            chunk.push(self.listpack.get(i).unwrap());
+        }
+
+        self.index += remaining;
+
+        Some(chunk)
     }
 }
 
