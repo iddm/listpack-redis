@@ -1033,6 +1033,30 @@ impl From<NonNull<u8>> for ListpackEntryRemoved {
     }
 }
 
+impl From<ListpackEntry> for ListpackEntryRemoved {
+    fn from(entry: ListpackEntry) -> Self {
+        Self::from(&entry)
+    }
+}
+
+impl From<&ListpackEntry> for ListpackEntryRemoved {
+    fn from(entry: &ListpackEntry) -> Self {
+        let data = entry.data().unwrap();
+
+        match data {
+            ListpackEntryData::SmallString(s)
+            | ListpackEntryData::MediumString(s)
+            | ListpackEntryData::LargeString(s) => Self::String(s.to_owned()),
+            ListpackEntryData::SignedInteger13Bit(n) => Self::Integer(n as i64),
+            ListpackEntryData::SignedInteger16Bit(n) => Self::Integer(n as i64),
+            ListpackEntryData::SignedInteger24Bit(n) => Self::Integer(n as i64),
+            ListpackEntryData::SignedInteger32Bit(n) => Self::Integer(n as i64),
+            ListpackEntryData::SignedInteger64Bit(n) => Self::Integer(n),
+            ListpackEntryData::SmallUnsignedInteger(u) => Self::Integer(u as i64),
+        }
+    }
+}
+
 macro_rules! impl_listpack_entry_removed_from_number {
     ($($t:ty),*) => {
         $(
@@ -1490,38 +1514,91 @@ impl Listpack {
         // self.ptr = ptr;
     }
 
-    // TODO: doc
     /// Removes the elements in the specified range from the listpack
     /// in bulk, returning all removed elements as an iterator.
-    pub fn drain<R>(&mut self, range: R) -> ListpackDrain
+    ///
+    /// See [`ListpackDrain`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the starting point is greater than the end point
+    /// or if the end point is greater than the length of the listpack.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello, world!");
+    /// listpack.push("Hello!");
+    /// listpack.push("World!");
+    /// let removed = listpack.drain(1..3).collect::<Vec<_>>();
+    /// assert_eq!(listpack.len(), 1);
+    /// assert_eq!(removed.len(), 2);
+    /// assert_eq!(removed[0].get_str().unwrap(), "Hello!");
+    /// assert_eq!(removed[1].get_str().unwrap(), "World!");
+    /// ```
+    ///
+    /// Use it the same way as [`Self::clear`], if you want to remove
+    /// all elements from the listpack:
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello, world!");
+    /// listpack.push("Hello!");
+    /// listpack.push("World!");
+    /// let removed = listpack.drain(..).collect::<Vec<_>>();
+    /// assert!(listpack.is_empty());
+    /// assert_eq!(removed.len(), 3);
+    /// assert_eq!(removed[0].get_str().unwrap(), "Hello, world!");
+    /// assert_eq!(removed[1].get_str().unwrap(), "Hello!");
+    /// assert_eq!(removed[2].get_str().unwrap(), "World!");
+    /// ```
+    ///
+    /// See [std::vec::Vec::drain] for more information.
+    pub fn drain<R>(&mut self, range: R) -> impl std::iter::Iterator<Item = ListpackEntryRemoved>
     where
         R: RangeBounds<usize>,
     {
-        todo!("Implement drain method.")
-        // let start = match range.start_bound() {
-        //     Bound::Included(&start) => start,
-        //     Bound::Excluded(&start) => start + 1,
-        //     Bound::Unbounded => 0,
-        // };
+        use std::ops::Bound;
 
-        // let end = match range.end_bound() {
-        //     Bound::Included(&end) => end + 1,
-        //     Bound::Excluded(&end) => end,
-        //     Bound::Unbounded => self.len(),
-        // };
+        let start = match range.start_bound() {
+            Bound::Included(&start) => start,
+            Bound::Excluded(&start) => start + 1,
+            Bound::Unbounded => 0,
+        };
 
-        // let length = end - start;
-        // let ptr = unsafe { bindings::lpDeleteRange(self.ptr.as_ptr(), start as _, length as _) };
+        let end = match range.end_bound() {
+            Bound::Included(&end) => end + 1,
+            Bound::Excluded(&end) => end,
+            Bound::Unbounded => self.len(),
+        };
 
-        // if let Some(ptr) = NonNull::new(ptr) {
-        //     self.ptr = ptr;
-        // }
+        if start > end {
+            panic!("The start is greater than the end.")
+        } else if end > self.len() {
+            panic!("The end is greater than the length of the listpack.")
+        }
 
-        // ListpackDrain {
-        //     listpack: self,
-        //     start,
-        //     end,
-        // }
+        let length = end - start;
+        let removed_elements = self
+            .iter()
+            .skip(start)
+            .take(length)
+            .map(ListpackEntryRemoved::from)
+            .collect::<Vec<_>>();
+        let ptr = unsafe { bindings::lpDeleteRange(self.ptr.as_ptr(), start as _, length as _) };
+
+        if let Some(ptr) = NonNull::new(ptr) {
+            self.ptr = ptr;
+        } else {
+            panic!("The range is out of bounds.");
+        }
+
+        removed_elements.into_iter()
     }
 
     /// Splits the listpack into two at the given index. Returns a new
@@ -1807,6 +1884,31 @@ impl Listpack {
             })
     }
 
+    // /// Removes the given prefix from the listpack and returns it, or
+    // /// [`None`] if the listpack doesn't start with the prefix.
+    // ///
+    // /// # Example
+    // ///
+    // /// ```
+    // /// use listpack_redis::Listpack;
+    // ///
+    // /// let mut listpack = Listpack::new();
+    // /// listpack.push("Hello");
+    // /// listpack.push("World");
+    // /// assert_eq!(listpack.strip_prefix(&["Hello"]), vec!["Hello"]);
+    // /// assert_eq!(listpack.len(), 1);
+    // /// assert_eq!(listpack.first().unwrap().to_string(), "World");
+    // /// ```
+    // pub fn strip_prefix<'a, 'b, T>(&'b mut self, prefix: &'a [T]) -> Vec<&'b ListpackEntry>
+    // where
+    //     ListpackEntryInsert<'a>: std::convert::From<&'a T>,
+    // {
+    //     let length = prefix.len();
+    //     if self.starts_with(prefix) {
+    //         let _ = self.drain(0..length);
+    //     }
+    // }
+
     /// Returns an iterator over the elements of the listpack.
     pub fn iter(&self) -> ListpackIter {
         ListpackIter {
@@ -1905,9 +2007,57 @@ impl Listpack {
     // pub fn get_total_bytes(&self) -> usize {
     //     unsafe { self.header_ref() }.total_bytes()
     // }
+
+    /// Removes the elements in the specified range from the listpack.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range is out of bounds.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello, world!");
+    /// listpack.push("Hello!");
+    /// listpack.push("World!");
+    /// listpack.remove_range(1, 2);
+    /// assert_eq!(listpack.len(), 1);
+    /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello, world!");
+    /// ```
+    pub fn remove_range(&mut self, start: usize, length: usize) {
+        if start + length > self.len() {
+            panic!("The range is out of bounds.");
+        }
+
+        let ptr = unsafe { bindings::lpDeleteRange(self.ptr.as_ptr(), start as _, length as _) };
+
+        if let Some(ptr) = NonNull::new(ptr) {
+            self.ptr = ptr;
+        } else {
+            panic!("The delete range failed.");
+        }
+    }
 }
 
 /// An iterator over the elements of a listpack.
+///
+/// # Example
+///
+/// ```
+/// use listpack_redis::Listpack;
+///
+/// let mut listpack = Listpack::new();
+/// listpack.push("Hello");
+/// listpack.push("World");
+/// let mut iter = listpack.iter();
+/// assert_eq!(iter.next().unwrap().to_string(), "Hello");
+/// assert_eq!(iter.next().unwrap().to_string(), "World");
+/// assert!(iter.next().is_none());
+/// ```
+#[derive(Debug)]
 pub struct ListpackIter<'a> {
     listpack: &'a Listpack,
     index: usize,
@@ -1946,12 +2096,6 @@ impl DoubleEndedIterator for ListpackIter<'_> {
 
         Some(element)
     }
-}
-
-/// An iterator over the elements of a listpack, which removes the
-/// elements from the listpack.
-pub struct ListpackDrain<'a> {
-    listpack: &'a mut Listpack,
 }
 
 /// An iterator over the elements of a listpack, which returns
@@ -1998,6 +2142,7 @@ pub struct ListpackDrain<'a> {
 ///
 /// assert!(iter.next().is_none());
 /// ```
+#[derive(Debug)]
 pub struct ListpackWindows<'a> {
     listpack: &'a Listpack,
     size: usize,
@@ -2085,6 +2230,7 @@ impl DoubleEndedIterator for ListpackWindows<'_> {
 ///
 /// assert!(iter.next().is_none());
 /// ```
+#[derive(Debug)]
 
 pub struct ListpackChunks<'a> {
     listpack: &'a Listpack,
@@ -2109,6 +2255,80 @@ impl<'a> Iterator for ListpackChunks<'a> {
         self.index += remaining;
 
         Some(chunk)
+    }
+}
+
+/// Removes the specified range from the vector in bulk, returning all
+/// removed elements as an iterator. If the iterator is dropped before
+/// being fully consumed, it drops the remaining removed elements.
+///
+/// The returned iterator keeps a mutable borrow on the vector to
+/// optimize its implementation.
+///
+/// # Example
+///
+/// ```
+/// use listpack_redis::Listpack;
+///
+/// let mut listpack = Listpack::new();
+/// listpack.push("Hello");
+/// listpack.push("World");
+/// listpack.push("!");
+/// let removed = listpack.drain(..).collect::<Vec<_>>();
+/// assert!(listpack.is_empty());
+/// assert_eq!(removed.len(), 3);
+
+#[derive(Debug)]
+pub struct ListpackDrain<'a> {
+    listpack: &'a mut Listpack,
+    offset: usize,
+    start: usize,
+    end: usize,
+}
+
+impl<'a> Iterator for ListpackDrain<'a> {
+    type Item = ListpackEntryRemoved;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset >= self.end - self.start || self.offset + self.start >= self.listpack.len() {
+            return None;
+        }
+
+        let element = self.listpack.remove(self.start + self.offset);
+        self.offset += 1;
+
+        Some(element)
+    }
+}
+
+impl<'a> DoubleEndedIterator for ListpackDrain<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.offset >= self.end - self.start || self.offset + self.start >= self.listpack.len() {
+            return None;
+        }
+
+        let element = self.listpack.remove(self.end - self.offset - 1);
+        self.offset += 1;
+
+        Some(element)
+    }
+}
+
+impl Drop for ListpackDrain<'_> {
+    fn drop(&mut self) {
+        let ptr = unsafe {
+            bindings::lpDeleteRange(
+                self.listpack.ptr.as_ptr(),
+                (self.start + self.offset) as _,
+                (self.end - self.start - self.offset) as _,
+            )
+        };
+
+        if let Some(ptr) = NonNull::new(ptr) {
+            self.listpack.ptr = ptr;
+        } else {
+            panic!("The range is out of bounds.");
+        }
     }
 }
 
