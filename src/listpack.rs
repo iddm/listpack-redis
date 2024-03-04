@@ -1454,40 +1454,124 @@ impl Listpack {
         .expect("Appended to listpack");
     }
 
-    // TODO: doc
     /// Inserts an element at the given index into the listpack.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the string is too long to be stored in the listpack
+    /// or if the index is out of bounds.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello, world!");
+    /// listpack.insert(0, "Hello!");
+    /// assert_eq!(listpack.len(), 2);
+    /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello!");
+    /// assert_eq!(listpack.get(1).unwrap().to_string(), "Hello, world!");
+    /// ```
     pub fn insert<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
-        todo!("Implement insert method.")
-        // let entry = entry.into();
-        // let ptr = NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
-        //     .expect("Index out of bounds.");
-
-        // let ptr = NonNull::new(match entry {
-        //     ListpackEntryInsert::String(s) => {
-        //         let string_ptr = s.as_ptr() as *mut _;
-        //         let len_bytes = s.len();
-        //         if len_bytes == 0 {
-        //             return;
-        //         }
-
-        //         if len_bytes > std::u32::MAX as usize {
-        //             panic!("The string is too long to be stored in the listpack.");
-        //         }
-
-        //         unsafe {
-        //             bindings::lpInsert(self.ptr.as_ptr(), ptr.as_ptr(), string_ptr, len_bytes as _)
-        //         }
-        //     }
-        //     ListpackEntryInsert::Integer(n) => unsafe {
-        //         bindings::lpInsertInteger(self.ptr.as_ptr(), ptr.as_ptr(), n)
-        //     },
-        // })
-        // .expect("Inserted into listpack");
-
-        // self.ptr = ptr;
+        self.insert_internal(index, entry, bindings::LP_BEFORE)
     }
 
-    // TODO: doc
+    /// Inserts an element at the given index into the listpack, after
+    /// the specified index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the string is too long to be stored in the listpack
+    /// or if the index is out of bounds.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello, world!");
+    /// listpack.insert(0, "Hello!");
+    /// assert_eq!(listpack.len(), 2);
+    /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello, world!");
+    /// assert_eq!(listpack.get(1).unwrap().to_string(), "Hello!");
+    /// ```
+    pub fn insert_after<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
+        self.insert_internal(index, entry, bindings::LP_AFTER)
+    }
+
+    fn insert_internal<'a, T: Into<ListpackEntryInsert<'a>>>(
+        &mut self,
+        index: usize,
+        entry: T,
+        location: u32,
+    ) {
+        let entry = entry.into();
+        let ptr_to_replace =
+            NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
+                .expect("Index out of bounds.");
+
+        let ptr = NonNull::new(match entry {
+            ListpackEntryInsert::String(s) => {
+                let string_ptr = s.as_ptr() as *mut _;
+                let len_bytes = s.len();
+                if len_bytes == 0 {
+                    return;
+                }
+
+                if len_bytes > std::u32::MAX as usize {
+                    panic!("The string is too long to be stored in the listpack.");
+                }
+
+                unsafe {
+                    bindings::lpInsertString(
+                        self.ptr.as_ptr(),
+                        string_ptr,
+                        len_bytes as _,
+                        ptr_to_replace.as_ptr(),
+                        location as _,
+                        std::ptr::null_mut(),
+                    )
+                }
+            }
+            ListpackEntryInsert::Integer(n) => unsafe {
+                bindings::lpInsertInteger(
+                    self.ptr.as_ptr(),
+                    n,
+                    ptr_to_replace.as_ptr(),
+                    location as _,
+                    std::ptr::null_mut(),
+                )
+            },
+        })
+        .expect("Replaced an element in listpack");
+
+        self.ptr = ptr;
+    }
+
+    /// Replaces the element at the given index with the given element.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the string is too long to be stored in the listpack
+    /// or if the index is out of bounds.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello, world!");
+    /// listpack.replace(0, "Hello!");
+    /// assert_eq!(listpack.len(), 1);
+    /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello!");
+    /// ```
+    pub fn replace<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
+        self.insert_internal(index, entry, bindings::LP_REPLACE)
+    }
+
     /// Removes the element at the given index from the listpack and
     /// returns it.
     pub fn remove(&mut self, index: usize) -> ListpackEntryRemoved {
