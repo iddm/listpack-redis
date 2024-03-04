@@ -399,6 +399,22 @@ impl From<ListpackEntryData<'_>> for ListpackEntryEncodingType {
     }
 }
 
+impl std::fmt::Display for ListpackEntryData<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ListpackEntryData::SmallUnsignedInteger(u) => write!(f, "{u}"),
+            ListpackEntryData::SmallString(s) => write!(f, "{s}"),
+            ListpackEntryData::SignedInteger13Bit(i) => write!(f, "{i}"),
+            ListpackEntryData::MediumString(s) => write!(f, "{s}"),
+            ListpackEntryData::LargeString(s) => write!(f, "{s}"),
+            ListpackEntryData::SignedInteger16Bit(i) => write!(f, "{i}"),
+            ListpackEntryData::SignedInteger24Bit(i) => write!(f, "{i}"),
+            ListpackEntryData::SignedInteger32Bit(i) => write!(f, "{i}"),
+            ListpackEntryData::SignedInteger64Bit(i) => write!(f, "{i}"),
+        }
+    }
+}
+
 macro_rules! impl_listpack_entry_data_from_number {
     ($($t:ty),*) => {
         $(
@@ -502,7 +518,6 @@ impl<'a> From<&'a String> for ListpackEntryData<'a> {
 /// zero-sized object, which designates a reference to the actual
 /// listpack entry.
 #[repr(transparent)]
-#[derive(Debug)]
 pub struct ListpackEntry(());
 
 impl ListpackEntry {
@@ -827,6 +842,23 @@ impl Drop for ListpackEntry {
                 ),
             )
         }
+    }
+}
+
+impl std::fmt::Debug for ListpackEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let encoding_type = self.encoding_type().map_err(|_| std::fmt::Error)?;
+        let data = self.data().map_err(|_| std::fmt::Error)?;
+
+        write!(f, "ListpackEntry({encoding_type:?}, {data:?})")
+    }
+}
+
+impl std::fmt::Display for ListpackEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let data = self.data().map_err(|_| std::fmt::Error)?;
+
+        write!(f, "{data}")
     }
 }
 
@@ -1459,6 +1491,21 @@ impl Listpack {
     }
 
     // TODO: more elements from slice.
+    /// Reverses the order of the elements in the listpack in place.
+    pub fn reverse(&mut self) {
+        todo!("Implement reverse method.")
+    }
+
+    /// Returns an iterator over all contiguous windows of length
+    /// `size`. The windows overlap. If the listpack is shorter than
+    /// `size`, the iterator returns no values.
+    pub fn windows(&self, size: usize) -> ListpackWindows {
+        ListpackWindows {
+            listpack: self,
+            size,
+            index: 0,
+        }
+    }
 
     /// Removes the last element from the listpack and returns it, or
     /// [`None`] if it is empty. The returned [`ListpackEntry`] is not
@@ -1657,6 +1704,75 @@ impl<'a> Iterator for ListpackIter<'a> {
 /// elements from the listpack.
 pub struct ListpackDrain<'a> {
     listpack: &'a mut Listpack,
+}
+
+/// An iterator over the elements of a listpack, which returns
+/// contiguous windows of elements.
+///
+/// # Example
+///
+/// ```
+/// use listpack_redis::Listpack;
+///
+/// let mut listpack = Listpack::new();
+/// listpack.push("Hello");
+/// listpack.push("World");
+/// listpack.push("!");
+/// let mut iter = listpack.windows(2);
+/// assert_eq!(iter.next().unwrap().len(), 2);
+/// assert_eq!(iter.next().unwrap().len(), 2);
+/// assert!(iter.next().is_none());
+/// ```
+///
+/// Or with values:
+///
+/// ```
+/// use listpack_redis::Listpack;
+///
+/// let mut listpack = Listpack::new();
+/// listpack.push("Hello");
+/// listpack.push("World");
+/// listpack.push("!");
+///
+/// let mut iter = listpack.windows(2);
+///
+/// let value = iter.next().unwrap();
+///
+/// assert_eq!(value[0].to_string(), "Hello");
+/// assert_eq!(value[1].to_string(), "World");
+/// assert_eq!(value.len(), 2);
+///
+/// let value = iter.next().unwrap();
+///
+/// assert_eq!(value[0].to_string(), "World");
+/// assert_eq!(value[1].to_string(), "!");
+/// assert_eq!(value.len(), 2);
+///
+/// assert!(iter.next().is_none());
+/// ```
+pub struct ListpackWindows<'a> {
+    listpack: &'a Listpack,
+    size: usize,
+    index: usize,
+}
+
+impl<'a> Iterator for ListpackWindows<'a> {
+    type Item = Vec<&'a ListpackEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index + self.size > self.listpack.len() {
+            return None;
+        }
+
+        let mut window = Vec::with_capacity(self.size);
+        for i in self.index..self.index + self.size {
+            window.push(self.listpack.get(i).unwrap());
+        }
+
+        self.index += 1;
+
+        Some(window)
+    }
 }
 
 // TODO:
