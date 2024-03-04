@@ -1,7 +1,7 @@
 //! The listpack interface.
 
 use std::{
-    fmt::Debug,
+    fmt::{Debug, Write},
     ops::{Deref, Index, RangeBounds},
     ptr::NonNull,
 };
@@ -210,6 +210,24 @@ impl TryFrom<u8> for ListpackEntryEncodingType {
     }
 }
 
+impl From<ListpackEntryEncodingType> for u8 {
+    fn from(encoding_type: ListpackEntryEncodingType) -> u8 {
+        match encoding_type {
+            ListpackEntryEncodingType::SmallUnsignedInteger => 0b00000000,
+            ListpackEntryEncodingType::SmallString => 0b10000000,
+            ListpackEntryEncodingType::ComplexType(subencoding_type) => match subencoding_type {
+                ListpackEntrySubencodingType::SignedInteger13Bit => 0b11000000,
+                ListpackEntrySubencodingType::MediumString => 0b11100000,
+                ListpackEntrySubencodingType::LargeString => 0b11110000,
+                ListpackEntrySubencodingType::SignedInteger16Bit => 0b11110001,
+                ListpackEntrySubencodingType::SignedInteger24Bit => 0b11110010,
+                ListpackEntrySubencodingType::SignedInteger32Bit => 0b11110011,
+                ListpackEntrySubencodingType::SignedInteger64Bit => 0b11110100,
+            },
+        }
+    }
+}
+
 /// The meaning of the encoding byte.
 #[derive(Debug, Copy, Clone)]
 pub enum ListpackEntryData<'a> {
@@ -391,6 +409,19 @@ impl ListpackEntryData<'_> {
     pub fn is_i64(&self) -> bool {
         self.get_i64().is_some()
     }
+
+    /// Attempts to extract an integer from the entry.
+    pub fn get_integer(&self) -> Option<i64> {
+        Some(match self {
+            ListpackEntryData::SmallUnsignedInteger(u) => *u as i64,
+            ListpackEntryData::SignedInteger13Bit(i) => *i as i64,
+            ListpackEntryData::SignedInteger16Bit(i) => *i as i64,
+            ListpackEntryData::SignedInteger24Bit(i) => *i as i64,
+            ListpackEntryData::SignedInteger32Bit(i) => *i as i64,
+            ListpackEntryData::SignedInteger64Bit(i) => *i,
+            _ => return None,
+        })
+    }
 }
 
 impl From<ListpackEntryData<'_>> for ListpackEntryEncodingType {
@@ -411,6 +442,22 @@ impl std::fmt::Display for ListpackEntryData<'_> {
             ListpackEntryData::SignedInteger24Bit(i) => write!(f, "{i}"),
             ListpackEntryData::SignedInteger32Bit(i) => write!(f, "{i}"),
             ListpackEntryData::SignedInteger64Bit(i) => write!(f, "{i}"),
+        }
+    }
+}
+
+impl<'a> TryFrom<&'a ListpackEntryData<'a>> for ListpackEntryInsert<'a> {
+    type Error = crate::error::Error;
+
+    fn try_from(data: &'a ListpackEntryData<'a>) -> Result<Self> {
+        if let Some(data) = data.get_str() {
+            Ok(Self::String(data))
+        } else if let Some(data) = data.get_i64() {
+            Ok(Self::Integer(data))
+        } else {
+            Err(crate::error::Error::UnknownEncodingType {
+                encoding_byte: data.encoding_type().into(),
+            })
         }
     }
 }
@@ -847,10 +894,9 @@ impl Drop for ListpackEntry {
 
 impl std::fmt::Debug for ListpackEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let encoding_type = self.encoding_type().map_err(|_| std::fmt::Error)?;
         let data = self.data().map_err(|_| std::fmt::Error)?;
 
-        write!(f, "ListpackEntry({encoding_type:?}, {data:?})")
+        write!(f, "{data:?}")
     }
 }
 
@@ -873,6 +919,12 @@ pub enum ListpackEntryInsert<'a> {
 
 impl<'a> From<&'a str> for ListpackEntryInsert<'a> {
     fn from(value: &'a str) -> Self {
+        Self::String(value)
+    }
+}
+
+impl<'a> From<&'a &str> for ListpackEntryInsert<'a> {
+    fn from(value: &'a &str) -> Self {
         Self::String(value)
     }
 }
@@ -998,6 +1050,7 @@ impl_listpack_entry_removed_from_number!(i8, i16, i32, i64, u8, u16, u32, u64);
 /// The listpack data structure.
 #[repr(transparent)]
 pub struct Listpack {
+    /// A pointer to the listpack object in C.
     ptr: NonNull<u8>,
 }
 
@@ -1009,11 +1062,26 @@ impl Default for Listpack {
 
 impl Debug for Listpack {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // let elements = self.iter().collect()
         f.debug_struct("Listpack")
-            // .field("listpack_ptr", &self.listpack_ptr)
-            // TODO: output the pointer and elements as an array.
+            .field("ptr", &self.ptr)
+            .field("elements", &self.iter().collect::<Vec<_>>())
             .finish()
+    }
+}
+
+impl std::fmt::Display for Listpack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_char('[')?;
+
+        for (i, element) in self.iter().enumerate() {
+            f.write_str(&element.to_string())?;
+
+            if i < self.len() - 1 {
+                f.write_str(", ")?;
+            }
+        }
+
+        f.write_char(']')
     }
 }
 
@@ -1605,6 +1673,140 @@ impl Listpack {
     //     cloned
     // }
 
+    /// Returns `true` if the listpack contains an element with the
+    /// given value.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello");
+    /// listpack.push("World");
+    /// assert!(listpack.contains("Hello"));
+    /// assert!(listpack.contains("World"));
+    /// assert!(!listpack.contains("Hello, world!"));
+    /// assert!(!listpack.contains(2));
+    /// ```
+    pub fn contains<'a, T: Into<ListpackEntryInsert<'a>>>(&self, object: T) -> bool {
+        let object = object.into();
+
+        self.iter().any(|entry| -> bool {
+            if let Ok(data) = entry.data() {
+                if let Some(string) = data.get_str() {
+                    ListpackEntryInsert::String(string) == object
+                } else if let Some(integer) = data.get_i64() {
+                    ListpackEntryInsert::Integer(integer) == object
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        })
+    }
+    // pub fn contains<'a, T: Into<ListpackEntryInsert<'a>>>(&self, object: T) -> bool {
+    //     let object = object.into();
+
+    //     self.iter().any(|entry| -> bool {
+    //         if let Ok(data) = entry
+    //             .data()
+    //             .and_then(|data| ListpackEntryInsert::try_from(&data))
+    //         {
+    //             data == object
+    //         } else {
+    //             false
+    //         }
+    //     })
+    // }
+
+    /// Returns `true` if the listpack begins with the elements of the
+    /// given prefix.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello");
+    /// listpack.push("World");
+    /// assert!(listpack.starts_with(&["Hello"]));
+    /// assert!(listpack.starts_with(&["Hello", "World"]));
+    /// assert!(!listpack.starts_with(&["Hello", "World", "!"]));
+    /// ```
+    pub fn starts_with<'a, T>(&self, prefix: &'a [T]) -> bool
+    where
+        ListpackEntryInsert<'a>: std::convert::From<&'a T>,
+    {
+        if prefix.len() > self.len() {
+            return false;
+        }
+
+        self.iter()
+            .zip(
+                prefix
+                    .iter()
+                    .map(ListpackEntryInsert::from)
+                    .take(self.len()),
+            )
+            .filter_map(|(entry, prefix)| Some((entry.data().ok()?, prefix)))
+            .all(|(data, object)| {
+                if let Some(string) = data.get_str() {
+                    ListpackEntryInsert::String(string) == object
+                } else if let Some(integer) = data.get_i64() {
+                    ListpackEntryInsert::Integer(integer) == object
+                } else {
+                    false
+                }
+            })
+    }
+
+    /// Returns `true` if the listpack ends with the elements of the
+    /// given suffix.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello");
+    /// listpack.push("World");
+    /// assert!(listpack.ends_with(&["World"]));
+    /// assert!(listpack.ends_with(&["Hello", "World"]));
+    /// assert!(!listpack.ends_with(&["Hello", "World", "!"]));
+    /// ```
+    pub fn ends_with<'a, T>(&self, suffix: &'a [T]) -> bool
+    where
+        ListpackEntryInsert<'a>: std::convert::From<&'a T>,
+    {
+        if suffix.len() > self.len() {
+            return false;
+        }
+
+        self.iter()
+            .rev()
+            .zip(
+                suffix
+                    .iter()
+                    .map(ListpackEntryInsert::from)
+                    .take(self.len())
+                    .rev(),
+            )
+            .filter_map(|(entry, suffix)| Some((entry.data().ok()?, suffix)))
+            .all(|(data, object)| {
+                if let Some(string) = data.get_str() {
+                    ListpackEntryInsert::String(string) == object
+                } else if let Some(integer) = data.get_i64() {
+                    ListpackEntryInsert::Integer(integer) == object
+                } else {
+                    false
+                }
+            })
+    }
+
     /// Returns an iterator over the elements of the listpack.
     pub fn iter(&self) -> ListpackIter {
         ListpackIter {
@@ -1731,6 +1933,21 @@ impl<'a> Iterator for ListpackIter<'a> {
     }
 }
 
+impl DoubleEndedIterator for ListpackIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.index >= self.listpack.len() {
+            return None;
+        }
+
+        let index = self.listpack.len() - self.index - 1;
+        let element = self.listpack.get(index)?;
+
+        self.index += 1;
+
+        Some(element)
+    }
+}
+
 /// An iterator over the elements of a listpack, which removes the
 /// elements from the listpack.
 pub struct ListpackDrain<'a> {
@@ -1797,6 +2014,25 @@ impl<'a> Iterator for ListpackWindows<'a> {
 
         let mut window = Vec::with_capacity(self.size);
         for i in self.index..self.index + self.size {
+            window.push(self.listpack.get(i).unwrap());
+        }
+
+        self.index += 1;
+
+        Some(window)
+    }
+}
+
+impl DoubleEndedIterator for ListpackWindows<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let length = self.listpack.len();
+
+        if self.index + self.size > length {
+            return None;
+        }
+
+        let mut window = Vec::with_capacity(self.size);
+        for i in length - self.index - self.size..length - self.index + self.size {
             window.push(self.listpack.get(i).unwrap());
         }
 
@@ -1939,6 +2175,43 @@ mod tests {
             assert_eq!(listpack.header_ref().total_bytes(), 7);
             assert_eq!(listpack.header_ref().num_elements(), 0);
         }
+    }
+
+    #[test]
+    fn starts_with() {
+        let mut listpack = Listpack::new();
+        listpack.push("Hello");
+        listpack.push("World");
+
+        assert!(listpack.starts_with(&["Hello"]));
+        assert!(listpack.starts_with(&["Hello", "World"]));
+        assert!(!listpack.starts_with(&["Hello", "World", "!"]));
+    }
+
+    #[test]
+    fn ends_with() {
+        let mut listpack = Listpack::new();
+        listpack.push("Hello");
+        listpack.push("World");
+
+        assert!(listpack.ends_with(&["World"]));
+        assert!(listpack.ends_with(&["Hello", "World"]));
+        assert!(!listpack.ends_with(&["Hello", "World", "!"]));
+    }
+
+    #[test]
+    fn debug() {
+        let listpack = create_hello_world_listpack();
+        assert!(!format!("{listpack:?}").is_empty());
+        dbg!(&listpack);
+    }
+
+    #[test]
+    fn display() {
+        let listpack = create_hello_world_listpack();
+        let display = format!("{listpack}");
+        assert!(!display.is_empty());
+        println!("{display}");
     }
 
     #[test]
