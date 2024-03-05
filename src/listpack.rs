@@ -1932,7 +1932,16 @@ impl Listpack {
     /// assert_eq!(listpack[2].to_string(), "Hello");
     /// ```
     pub fn reverse(&mut self) {
-        todo!("Reverse the listpack in place.")
+        let length = self.len();
+        let mut indexes_to_swap = Vec::new();
+
+        for i in 0..length / 2 {
+            indexes_to_swap.push((i, length - i - 1));
+        }
+
+        for (a, b) in indexes_to_swap {
+            self.swap(a, b);
+        }
     }
 
     /// Swaps two elements in the listpack.
