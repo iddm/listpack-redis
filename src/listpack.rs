@@ -1082,6 +1082,15 @@ impl From<&ListpackEntry> for ListpackEntryRemoved {
     }
 }
 
+impl<'a> From<&'a ListpackEntryRemoved> for ListpackEntryInsert<'a> {
+    fn from(removed: &'a ListpackEntryRemoved) -> Self {
+        match removed {
+            ListpackEntryRemoved::String(s) => Self::String(s),
+            ListpackEntryRemoved::Integer(n) => Self::Integer(*n),
+        }
+    }
+}
+
 macro_rules! impl_listpack_entry_removed_from_number {
     ($($t:ty),*) => {
         $(
@@ -1740,8 +1749,42 @@ impl Listpack {
     /// Splits the listpack into two at the given index. Returns a new
     /// listpack containing the elements from `at` to the end, and
     /// removes those elements from the original listpack.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the index is out of bounds.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello, world!");
+    /// listpack.push("Hello!");
+    /// listpack.push("World!");
+    ///
+    /// let other = listpack.split_off(1);
+    ///
+    /// assert_eq!(listpack.len(), 1);
+    /// assert_eq!(other.len(), 2);
+    ///
+    /// assert_eq!(listpack[0].to_string(), "Hello, world!");
+    /// assert_eq!(other[0].to_string(), "Hello!");
+    /// assert_eq!(other[1].to_string(), "World!");
+    /// ```
     pub fn split_off(&mut self, at: usize) -> Self {
-        todo!("Implement split_off method.")
+        let length = self.len();
+        if at > length {
+            panic!("The index is out of bounds.")
+        }
+
+        let mut other = Self::with_capacity(length - at);
+
+        self.drain(at..(at + length - 1))
+            .for_each(|entry| other.push(ListpackEntryInsert::from(&entry)));
+
+        other
     }
 
     // TODO: doc
