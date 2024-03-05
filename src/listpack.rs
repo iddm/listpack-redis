@@ -1978,6 +1978,34 @@ impl Listpack {
             panic!("The index is out of bounds.");
         }
 
+        unsafe { self.swap_unchecked(a, b) }
+    }
+
+    /// Swaps two elements in the listpack without doing any bounds
+    /// checking.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the indexes are not out of bounds.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    ///
+    /// listpack.push("Hello");
+    /// listpack.push("World");
+    ///
+    /// unsafe { listpack.swap_unchecked(0, 1) };
+    ///
+    /// assert_eq!(listpack.len(), 2);
+    ///
+    /// assert_eq!(listpack[0].to_string(), "World");
+    /// assert_eq!(listpack[1].to_string(), "Hello");
+    /// ```
+    pub unsafe fn swap_unchecked(&mut self, a: usize, b: usize) {
         let a_object = ListpackEntryRemoved::from(self.get(a).expect("Get an entry from listpack"));
         let b_object = ListpackEntryRemoved::from(self.get(b).expect("Get an entry from listpack"));
 
@@ -2299,14 +2327,14 @@ impl Listpack {
         }
     }
 
-    // TODO: doc
-    /// Returns an iterator over the elements of the listpack.
-    pub fn iter_mut(&mut self) -> ListpackIterMut {
-        ListpackIterMut {
-            listpack: self,
-            index: 0,
-        }
-    }
+    // // TODO: doc
+    // /// Returns an iterator over the elements of the listpack.
+    // pub fn iter_mut(&mut self) -> ListpackIterMut {
+    //     ListpackIterMut {
+    //         listpack: self,
+    //         index: 0,
+    //     }
+    // }
 }
 
 /// Slice methods.
@@ -2346,8 +2374,8 @@ impl Listpack {
     /// let mut listpack = Listpack::new();
     /// listpack.push("Hello");
     /// listpack.push("World");
-    /// assert_eq!(listpack.get_mut(0).to_string(), "Hello");
-    /// assert_eq!(listpack.get_mut(1).to_string(), "World");
+    /// assert_eq!(listpack.get_mut(0).unwrap().to_string(), "Hello");
+    /// assert_eq!(listpack.get_mut(1).unwrap().to_string(), "World");
     /// assert!(listpack.get_mut(2).is_none());
     /// ```
     pub fn get_mut(&mut self, index: usize) -> Option<ListpackEntryMutable> {
@@ -2799,16 +2827,6 @@ pub struct ListpackEntryMutable<'a> {
     index: usize,
 }
 
-// impl<'a> Clone for ListpackEntryMutable<'a> {
-//     fn clone(&self) -> Self {
-//         ListpackEntryMutable {
-//             listpack: self.listpack,
-//             entry: self.entry,
-//             index: self.index,
-//         }
-//     }
-// }
-
 impl<'a> ListpackEntryMutable<'a> {
     /// Modifies the value of the entry in-place.
     ///
@@ -2835,26 +2853,26 @@ impl<'a> Deref for ListpackEntryMutable<'a> {
     }
 }
 
-/// A mutable iterator over the elements of a listpack.
-///
-/// # Example
-///
-/// ```
-/// use listpack_redis::Listpack;
-///
-/// let mut listpack = Listpack::new();
-/// listpack.push("Hello");
-/// listpack.push("World");
-/// let mut iter = listpack.iter_mut();
-/// assert_eq!(iter.next().unwrap().to_string(), "Hello");
-/// assert_eq!(iter.next().unwrap().to_string(), "World");
-/// assert!(iter.next().is_none());
-/// ```
-#[derive(Debug)]
-pub struct ListpackIterMut<'a> {
-    listpack: &'a mut Listpack,
-    index: usize,
-}
+// /// A mutable iterator over the elements of a listpack.
+// ///
+// /// # Example
+// ///
+// /// ```
+// /// use listpack_redis::Listpack;
+// ///
+// /// let mut listpack = Listpack::new();
+// /// listpack.push("Hello");
+// /// listpack.push("World");
+// /// let mut iter = listpack.iter_mut();
+// /// assert_eq!(iter.next().unwrap().to_string(), "Hello");
+// /// assert_eq!(iter.next().unwrap().to_string(), "World");
+// /// assert!(iter.next().is_none());
+// /// ```
+// #[derive(Debug)]
+// pub struct ListpackIterMut<'a> {
+//     listpack: &'a mut Listpack,
+//     index: usize,
+// }
 
 // impl<'a> Iterator for ListpackIterMut<'a> {
 //     type Item = ListpackEntryMutable<'a>;
@@ -2868,7 +2886,7 @@ pub struct ListpackIterMut<'a> {
 
 //         self.index += 1;
 
-//         Some(element.clone())
+//         Some(element)
 //     }
 
 //     fn size_hint(&self) -> (usize, Option<usize>) {
