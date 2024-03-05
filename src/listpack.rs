@@ -1934,10 +1934,67 @@ impl Listpack {
         self.get(self.len() - 1)
     }
 
-    // TODO: more elements from slice.
     /// Reverses the order of the elements in the listpack in place.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello");
+    /// listpack.push("World");
+    /// listpack.push("!");
+    ///
+    /// listpack.reverse();
+    ///
+    /// assert_eq!(listpack.len(), 3);
+    /// assert_eq!(listpack[0].to_string(), "!");
+    /// assert_eq!(listpack[1].to_string(), "World");
+    /// assert_eq!(listpack[2].to_string(), "Hello");
+    /// ```
     pub fn reverse(&mut self) {
-        todo!("Implement reverse method.")
+        todo!("Reverse the listpack in place.")
+    }
+
+    /// Swaps two elements in the listpack.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either `a` or `b` are out of bounds.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello");
+    /// listpack.push("World");
+    /// listpack.push("!");
+    ///
+    /// listpack.swap(0, 2);
+    ///
+    /// assert_eq!(listpack.len(), 3);
+    /// assert_eq!(listpack[0].to_string(), "!");
+    /// assert_eq!(listpack[1].to_string(), "World");
+    /// assert_eq!(listpack[2].to_string(), "Hello");
+    /// ```
+    pub fn swap(&mut self, a: usize, b: usize) {
+        let range = 0..self.len();
+
+        if !range.contains(&a) || !range.contains(&b) {
+            panic!("The index is out of bounds.");
+        }
+
+        let a_object = ListpackEntryRemoved::from(self.get(a).expect("Get an entry from listpack"));
+        let b_object = ListpackEntryRemoved::from(self.get(b).expect("Get an entry from listpack"));
+
+        let b_object = ListpackEntryInsert::from(&b_object);
+        self.replace(a, b_object);
+
+        let a_object = ListpackEntryInsert::from(&a_object);
+        self.replace(b, a_object);
     }
 
     /// Returns an iterator over all contiguous windows of length
