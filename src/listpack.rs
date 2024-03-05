@@ -1878,10 +1878,48 @@ impl Listpack {
         }
     }
 
-    // TODO: doc
     /// Removes consecutive repeated elements from the listpack.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello");
+    /// listpack.push("Hello");
+    /// listpack.push("World");
+    /// listpack.push("World");
+    /// listpack.push("World");
+    /// listpack.push("!");
+    /// listpack.dedup();
+    /// assert_eq!(listpack.len(), 3);
+    /// assert_eq!(listpack[0].to_string(), "Hello");
+    /// assert_eq!(listpack[1].to_string(), "World");
+    /// assert_eq!(listpack[2].to_string(), "!");
+    /// ```
     pub fn dedup(&mut self) {
-        todo!("Implement dedup method.")
+        let mut index = 0;
+        let mut indexes_to_remove = Vec::new();
+
+        while index < self.len() {
+            let entry = self.get(index).unwrap();
+            let mut next_index = index + 1;
+            while next_index < self.len() {
+                let next_entry = self.get(next_index).unwrap();
+                if entry == next_entry {
+                    indexes_to_remove.push(next_index);
+                    next_index += 1;
+                } else {
+                    break;
+                }
+            }
+            index = next_index;
+        }
+
+        for index in indexes_to_remove.into_iter().rev() {
+            let _ = self.remove(index);
+        }
     }
 
     /// Returns the first element of the listpack, or [`None`] if it is
