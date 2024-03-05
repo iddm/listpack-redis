@@ -1576,32 +1576,78 @@ impl Listpack {
         removed
     }
 
-    // TODO: doc
     /// Retains only the elements specified by the predicate.
+    ///
+    /// In other words, removes all elements `e` such that `f(&e)`
+    /// returns `false`. This method operates in place, visiting each
+    /// element exactly once in the original order, and preserves the
+    /// order of the retained elements.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello, world!");
+    /// listpack.push("Hello!");
+    /// listpack.push("World!");
+    /// listpack.retain(|entry| entry.to_string().contains("Hello"));
+    ///
+    /// assert_eq!(listpack.len(), 2);
+    /// assert_eq!(listpack[0].to_string(), "Hello, world!");
+    /// assert_eq!(listpack[1].to_string(), "Hello!");
+    /// ```
     pub fn retain<F>(&mut self, mut f: F)
     where
         F: FnMut(&ListpackEntry) -> bool,
     {
-        todo!("Implement retain method.")
-        // let mut index = 0;
-        // while index < self.len() {
-        //     let entry = self.get(index).unwrap();
-        //     if !f(entry) {
-        //         let _ = self.remove(index);
-        //     } else {
-        //         index += 1;
-        //     }
-        // }
+        let mut index = 0;
+        while index < self.len() {
+            let entry = self.get(index).unwrap();
+            if !f(entry) {
+                let _ = self.remove(index);
+            } else {
+                index += 1;
+            }
+        }
     }
 
-    // TODO: doc
     /// Appends the elements of another listpack to the back of this
     /// listpack.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the listpacks cannot be merged.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack1 = Listpack::new();
+    /// listpack1.push("Hello, world!");
+    /// listpack1.push("Hello!");
+    ///
+    /// let mut listpack2 = Listpack::new();
+    /// listpack2.push("World!");
+    ///
+    /// listpack1.append(&mut listpack2);
+    ///
+    /// assert_eq!(listpack1.len(), 3);
+    /// assert_eq!(listpack2.len(), 1);
+    ///
+    /// assert_eq!(listpack1[0].to_string(), "Hello, world!");
+    /// assert_eq!(listpack1[1].to_string(), "Hello!");
+    /// assert_eq!(listpack1[2].to_string(), "World!");
+    /// ```
     pub fn append(&mut self, other: &mut Self) {
-        todo!("Implement append method.")
-        // let ptr = NonNull::new(unsafe { bindings::lpAppendLP(self.ptr.as_ptr(), other.ptr.as_ptr()) })
-        //     .expect("Appended to listpack");
-        // self.ptr = ptr;
+        other.iter().for_each(|entry| {
+            let data = entry.data().expect("Extract an entry from listpack");
+            let entry = ListpackEntryInsert::try_from(&data)
+                .expect("Convert an entry to ListpackEntryInsert");
+            self.push(entry);
+        });
     }
 
     /// Removes the elements in the specified range from the listpack
