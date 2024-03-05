@@ -584,7 +584,6 @@ impl ListpackEntry {
         self as *const _ as *const u8
     }
 
-    // TODO: add an example using the mutable ListpackEntry.
     /// Returns the mutable pointer to the entry.
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self as *mut _ as *mut u8
@@ -864,10 +863,10 @@ impl ListpackEntry {
         unsafe { ptr.cast().as_ref() }
     }
 
-    /// Returns a mutable reference from a pointer.
-    fn ref_mut_from_ptr<'a>(ptr: NonNull<u8>) -> &'a mut ListpackEntry {
-        unsafe { ptr.cast().as_mut() }
-    }
+    // /// Returns a mutable reference from a pointer.
+    // fn ref_mut_from_ptr<'a>(ptr: NonNull<u8>) -> &'a mut ListpackEntry {
+    //     unsafe { ptr.cast().as_mut() }
+    // }
 }
 
 impl PartialEq for ListpackEntry {
@@ -891,6 +890,24 @@ impl PartialEq<i64> for ListpackEntry {
         self.data()
             .map(|data| data.get_integer() == Some(*other))
             .unwrap_or(false)
+    }
+}
+
+impl PartialEq<ListpackEntryInsert<'_>> for ListpackEntry {
+    fn eq(&self, other: &ListpackEntryInsert) -> bool {
+        match other {
+            ListpackEntryInsert::String(s) => self == *s,
+            ListpackEntryInsert::Integer(n) => self == n,
+        }
+    }
+}
+
+impl PartialEq<ListpackEntryInsert<'_>> for &ListpackEntry {
+    fn eq(&self, other: &ListpackEntryInsert) -> bool {
+        match other {
+            ListpackEntryInsert::String(s) => *self == *s,
+            ListpackEntryInsert::Integer(n) => *self == n,
+        }
     }
 }
 
@@ -1162,6 +1179,63 @@ impl Clone for Listpack {
         }
     }
 }
+
+impl PartialEq for Listpack {
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+/// Comparing a listpack against a slice of insertable entries.
+///
+/// # Example
+///
+/// ```
+/// use listpack_redis::{Listpack, ListpackEntryInsert};
+///
+/// let array = ["Hello", "World"];
+///
+/// let listpack = Listpack::from(&["Hello", "World"]);
+/// assert_eq!(listpack, &array);
+/// ```
+impl<'a, T> PartialEq<&'a [T]> for Listpack
+where
+    ListpackEntryInsert<'a>: std::convert::From<&'a T>,
+{
+    fn eq(&self, other: &&'a [T]) -> bool {
+        for (a, b) in self.iter().zip(other.iter()) {
+            let b = ListpackEntryInsert::from(b);
+            if a != b {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+/// Comparing a listpack against a slice of insertable entries, but
+/// of static length.
+///
+/// # Example
+///
+/// ```
+/// use listpack_redis::{Listpack, ListpackEntryInsert};
+///
+/// let listpack = Listpack::from(&["Hello", "World"]);
+/// assert_eq!(listpack, &["Hello", "World"]);
+/// ```
+impl<'a, T, const N: usize> PartialEq<&'a [T; N]> for Listpack
+where
+    &'a T: Into<ListpackEntryInsert<'a>>,
+    ListpackEntryInsert<'a>: std::convert::From<&'a T>,
+{
+    fn eq(&self, other: &&'a [T; N]) -> bool {
+        self.eq(&other.as_slice())
+    }
+}
+
+impl Eq for Listpack {}
 
 impl<'a, T> From<&'a [T]> for Listpack
 where
@@ -2158,20 +2232,6 @@ impl Listpack {
             }
         })
     }
-    // pub fn contains<'a, T: Into<ListpackEntryInsert<'a>>>(&self, object: T) -> bool {
-    //     let object = object.into();
-
-    //     self.iter().any(|entry| -> bool {
-    //         if let Ok(data) = entry
-    //             .data()
-    //             .and_then(|data| ListpackEntryInsert::try_from(&data))
-    //         {
-    //             data == object
-    //         } else {
-    //             false
-    //         }
-    //     })
-    // }
 
     /// Returns `true` if the listpack begins with the elements of the
     /// given prefix.
