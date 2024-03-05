@@ -862,7 +862,11 @@ impl ListpackEntry {
     /// Returns a reference from a pointer.
     fn ref_from_ptr<'a>(ptr: NonNull<u8>) -> &'a ListpackEntry {
         unsafe { ptr.cast().as_ref() }
-        // unsafe { &*ptr.as_ptr().cast::<Self>() }
+    }
+
+    /// Returns a mutable reference from a pointer.
+    fn ref_mut_from_ptr<'a>(ptr: NonNull<u8>) -> &'a mut ListpackEntry {
+        unsafe { ptr.cast().as_mut() }
     }
 }
 
@@ -1556,7 +1560,7 @@ impl Listpack {
                 )
             },
         })
-        .expect("Replaced an element in listpack");
+        .expect("Insert an element in listpack");
 
         self.ptr = ptr;
     }
@@ -2295,14 +2299,14 @@ impl Listpack {
         }
     }
 
-    // TODO:
-    // /// Returns an iterator over the elements of the listpack.
-    // pub fn iter_mut(&self) -> ListpackIterMut {
-    //     ListpackIterMut {
-    //         listpack: self,
-    //         index: 0,
-    //     }
-    // }
+    // TODO: doc
+    /// Returns an iterator over the elements of the listpack.
+    pub fn iter_mut(&mut self) -> ListpackIterMut {
+        ListpackIterMut {
+            listpack: self,
+            index: 0,
+        }
+    }
 }
 
 /// Slice methods.
@@ -2327,8 +2331,34 @@ impl Listpack {
     /// assert!(listpack.get(2).is_none());
     /// ```
     pub fn get(&self, index: usize) -> Option<&ListpackEntry> {
-        NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
+        self.get_internal_entry_ptr(index)
             .map(ListpackEntry::ref_from_ptr)
+    }
+
+    /// Returns a mutable reference to element of the listpack at the
+    /// given index.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello");
+    /// listpack.push("World");
+    /// assert_eq!(listpack.get_mut(0).to_string(), "Hello");
+    /// assert_eq!(listpack.get_mut(1).to_string(), "World");
+    /// assert!(listpack.get_mut(2).is_none());
+    /// ```
+    pub fn get_mut(&mut self, index: usize) -> Option<ListpackEntryMutable> {
+        self.get_internal_entry_ptr(index).map(|ptr| {
+            let entry = ListpackEntry::ref_from_ptr(ptr);
+            ListpackEntryMutable {
+                listpack: self,
+                entry,
+                index,
+            }
+        })
     }
 }
 
@@ -2342,6 +2372,10 @@ impl Index<usize> for Listpack {
 
 /// Specific methods for this list-pack implementation.
 impl Listpack {
+    /// Returns a pointer to the listpack's entry at the given index.
+    fn get_internal_entry_ptr(&self, index: usize) -> Option<NonNull<u8>> {
+        NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
+    }
     /// Returns the amount of bytes used by the listpack to store the
     /// elements.
     ///
@@ -2434,10 +2468,10 @@ impl Listpack {
     ///
     /// let mut listpack = Listpack::new();
     /// listpack.push("Hello, world!");
-    /// listpack.insert(0, "Hello!");
+    /// listpack.insert_after(0, "Hello!");
     /// assert_eq!(listpack.len(), 2);
-    /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello!");
-    /// assert_eq!(listpack.get(1).unwrap().to_string(), "Hello, world!");
+    /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello, world!");
+    /// assert_eq!(listpack.get(1).unwrap().to_string(), "Hello!");
     /// ```
     pub fn insert_after<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
         self.insert_internal(index, entry, bindings::LP_AFTER)
@@ -2756,15 +2790,74 @@ impl Drop for ListpackDrain<'_> {
     }
 }
 
-// TODO:
-// /// A mutable iterator over the elements of a listpack.
-// pub struct ListpackIterMut<'a> {
-//     listpack: &'a Listpack,
-//     index: usize,
+/// A mutable reference to an entry in a listpack, mainly used for
+/// modifying the entry in place using the mutable iterator.
+#[derive(Debug)]
+pub struct ListpackEntryMutable<'a> {
+    listpack: &'a mut Listpack,
+    entry: &'a ListpackEntry,
+    index: usize,
+}
+
+// impl<'a> Clone for ListpackEntryMutable<'a> {
+//     fn clone(&self) -> Self {
+//         ListpackEntryMutable {
+//             listpack: self.listpack,
+//             entry: self.entry,
+//             index: self.index,
+//         }
+//     }
 // }
 
-// impl Iterator for ListpackIterMut<'_> {
-//     type Item = ListpackEntry;
+impl<'a> ListpackEntryMutable<'a> {
+    /// Modifies the value of the entry in-place.
+    ///
+    /// See [`Listpack::replace`] for more information.
+    pub fn set<T>(&mut self, value: T)
+    where
+        ListpackEntryInsert<'a>: std::convert::From<T>,
+    {
+        let entry = ListpackEntryInsert::from(value);
+        self.listpack.replace(self.index, entry);
+    }
+
+    /// Returns a reference to this entry.
+    pub fn get(&self) -> &ListpackEntry {
+        self.entry
+    }
+}
+
+impl<'a> Deref for ListpackEntryMutable<'a> {
+    type Target = ListpackEntry;
+
+    fn deref(&self) -> &Self::Target {
+        self.entry
+    }
+}
+
+/// A mutable iterator over the elements of a listpack.
+///
+/// # Example
+///
+/// ```
+/// use listpack_redis::Listpack;
+///
+/// let mut listpack = Listpack::new();
+/// listpack.push("Hello");
+/// listpack.push("World");
+/// let mut iter = listpack.iter_mut();
+/// assert_eq!(iter.next().unwrap().to_string(), "Hello");
+/// assert_eq!(iter.next().unwrap().to_string(), "World");
+/// assert!(iter.next().is_none());
+/// ```
+#[derive(Debug)]
+pub struct ListpackIterMut<'a> {
+    listpack: &'a mut Listpack,
+    index: usize,
+}
+
+// impl<'a> Iterator for ListpackIterMut<'a> {
+//     type Item = ListpackEntryMutable<'a>;
 
 //     fn next(&mut self) -> Option<Self::Item> {
 //         if self.index >= self.listpack.len() {
@@ -2775,7 +2868,31 @@ impl Drop for ListpackDrain<'_> {
 
 //         self.index += 1;
 
-//         Some(element)
+//         Some(element.clone())
+//     }
+
+//     fn size_hint(&self) -> (usize, Option<usize>) {
+//         (self.index, Some(self.listpack.len()))
+//     }
+// }
+
+// impl<'a> DoubleEndedIterator for ListpackIterMut<'a> {
+//     fn next_back(&mut self) -> Option<Self::Item> {
+//         if self.index >= self.listpack.len() {
+//             return None;
+//         }
+
+//         let index = self.listpack.len() - self.index - 1;
+//         let element = self.listpack.get(self.index).unwrap();
+//         let entry = ListpackEntryMutable {
+//             listpack: self.listpack,
+//             entry: element,
+//             index: self.index - 1,
+//         };
+
+//         self.index += 1;
+
+//         Some(entry)
 //     }
 // }
 
