@@ -1787,13 +1787,28 @@ impl Listpack {
         other
     }
 
-    // TODO: doc
     /// Appends all the elements of a slice to the listpack.
-    pub fn extend_from_slice<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, slice: &'a [T]) {
-        todo!("Implement extend_from_slice method.")
-        // for item in slice {
-        //     self.push(item);
-        // }
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.extend_from_slice(&["Hello", "World", "!"]);
+    /// assert_eq!(listpack.len(), 3);
+    /// assert_eq!(listpack[0].to_string(), "Hello");
+    /// assert_eq!(listpack[1].to_string(), "World");
+    /// assert_eq!(listpack[2].to_string(), "!");
+    /// ```
+    pub fn extend_from_slice<'a, T>(&mut self, slice: &'a [T])
+    where
+        &'a T: Into<ListpackEntryInsert<'a>>,
+        ListpackEntryInsert<'a>: std::convert::From<&'a T>,
+    {
+        for item in slice {
+            self.push(item.into());
+        }
     }
 
     // TODO: doc
