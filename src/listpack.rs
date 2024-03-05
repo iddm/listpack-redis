@@ -1018,6 +1018,15 @@ impl ListpackEntryRemoved {
     }
 }
 
+impl std::fmt::Display for ListpackEntryRemoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::String(s) => write!(f, "{s}"),
+            Self::Integer(n) => write!(f, "{n}"),
+        }
+    }
+}
+
 impl From<&str> for ListpackEntryRemoved {
     fn from(value: &str) -> Self {
         Self::String(value.to_owned())
@@ -1455,6 +1464,8 @@ impl Listpack {
     }
 
     /// Inserts an element at the given index into the listpack.
+    /// The insertion is done before the specified index, shifting
+    /// all the elements past this index to the right.
     ///
     /// # Panics
     ///
@@ -1473,32 +1484,23 @@ impl Listpack {
     /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello!");
     /// assert_eq!(listpack.get(1).unwrap().to_string(), "Hello, world!");
     /// ```
-    pub fn insert<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
-        self.insert_internal(index, entry, bindings::LP_BEFORE)
-    }
-
-    /// Inserts an element at the given index into the listpack, after
-    /// the specified index.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the string is too long to be stored in the listpack
-    /// or if the index is out of bounds.
-    ///
-    /// # Example
-    ///
+    /// Or a more familiar example from [`std::vec::Vec`]:
     /// ```
     /// use listpack_redis::Listpack;
-    ///
     /// let mut listpack = Listpack::new();
-    /// listpack.push("Hello, world!");
-    /// listpack.insert(0, "Hello!");
-    /// assert_eq!(listpack.len(), 2);
-    /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello, world!");
-    /// assert_eq!(listpack.get(1).unwrap().to_string(), "Hello!");
+    /// listpack.push(1);
+    /// listpack.push(2);
+    /// listpack.push(3);
+    ///
+    /// listpack.insert(1, 4);
+    /// assert_eq!(listpack.len(), 4);
+    /// assert_eq!(listpack.get(0).unwrap().to_string(), "1");
+    /// assert_eq!(listpack.get(1).unwrap().to_string(), "4");
+    /// assert_eq!(listpack.get(2).unwrap().to_string(), "2");
+    /// assert_eq!(listpack.get(3).unwrap().to_string(), "3");
     /// ```
-    pub fn insert_after<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
-        self.insert_internal(index, entry, bindings::LP_AFTER)
+    pub fn insert<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
+        self.insert_internal(index, entry, bindings::LP_BEFORE)
     }
 
     fn insert_internal<'a, T: Into<ListpackEntryInsert<'a>>>(
@@ -1508,7 +1510,7 @@ impl Listpack {
         location: u32,
     ) {
         let entry = entry.into();
-        let ptr_to_replace =
+        let referred_element =
             NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
                 .expect("Index out of bounds.");
 
@@ -1529,7 +1531,7 @@ impl Listpack {
                         self.ptr.as_ptr(),
                         string_ptr,
                         len_bytes as _,
-                        ptr_to_replace.as_ptr(),
+                        referred_element.as_ptr(),
                         location as _,
                         std::ptr::null_mut(),
                     )
@@ -1539,7 +1541,7 @@ impl Listpack {
                 bindings::lpInsertInteger(
                     self.ptr.as_ptr(),
                     n,
-                    ptr_to_replace.as_ptr(),
+                    referred_element.as_ptr(),
                     location as _,
                     std::ptr::null_mut(),
                 )
@@ -1550,12 +1552,12 @@ impl Listpack {
         self.ptr = ptr;
     }
 
-    /// Replaces the element at the given index with the given element.
+    /// Removes the element at the given index from the listpack and
+    /// returns it.
     ///
     /// # Panics
     ///
-    /// Panics if the string is too long to be stored in the listpack
-    /// or if the index is out of bounds.
+    /// Panics if the index is out of bounds.
     ///
     /// # Example
     ///
@@ -1564,26 +1566,14 @@ impl Listpack {
     ///
     /// let mut listpack = Listpack::new();
     /// listpack.push("Hello, world!");
-    /// listpack.replace(0, "Hello!");
-    /// assert_eq!(listpack.len(), 1);
-    /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello!");
+    /// let removed = listpack.remove(0);
+    /// assert_eq!(listpack.len(), 0);
+    /// assert_eq!(removed.to_string(), "Hello, world!");
     /// ```
-    pub fn replace<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
-        self.insert_internal(index, entry, bindings::LP_REPLACE)
-    }
-
-    /// Removes the element at the given index from the listpack and
-    /// returns it.
     pub fn remove(&mut self, index: usize) -> ListpackEntryRemoved {
-        todo!("Implement remove method.")
-        // let ptr = NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
-        //     .expect("Index out of bounds.");
-        // let cloned = ListpackEntryRemoved::from(ptr);
-        // self.ptr = NonNull::new(unsafe {
-        //     bindings::lpDelete(self.ptr.as_ptr(), ptr.as_ptr(), std::ptr::null_mut())
-        // })
-        // .expect("Deleted from listpack");
-        // cloned
+        let removed = self.get(index).unwrap().into();
+        self.remove_range(index, 1);
+        removed
     }
 
     // TODO: doc
@@ -2175,6 +2165,52 @@ impl Listpack {
             panic!("The delete range failed.");
         }
     }
+
+    /// Inserts an element at the given index into the listpack, after
+    /// the specified index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the string is too long to be stored in the listpack
+    /// or if the index is out of bounds.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello, world!");
+    /// listpack.insert(0, "Hello!");
+    /// assert_eq!(listpack.len(), 2);
+    /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello!");
+    /// assert_eq!(listpack.get(1).unwrap().to_string(), "Hello, world!");
+    /// ```
+    pub fn insert_after<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
+        self.insert_internal(index, entry, bindings::LP_AFTER)
+    }
+
+    /// Replaces the element at the given index with the given element.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the string is too long to be stored in the listpack
+    /// or if the index is out of bounds.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello, world!");
+    /// listpack.replace(0, "Hello!");
+    /// assert_eq!(listpack.len(), 1);
+    /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello!");
+    /// ```
+    pub fn replace<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
+        self.insert_internal(index, entry, bindings::LP_REPLACE)
+    }
 }
 
 /// An iterator over the elements of a listpack.
@@ -2489,6 +2525,42 @@ impl Drop for ListpackDrain<'_> {
 //         Some(element)
 //     }
 // }
+
+/// A macro that creates a new listpack from a list of elements.
+/// An analogue of the [`vec!`] macro.
+///
+/// # Example
+///
+/// ```
+/// use listpack_redis::listpack;
+///
+/// let listpack = listpack!["Hello", "World"];
+/// assert_eq!(listpack.len(), 2);
+/// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello");
+/// assert_eq!(listpack.get(1).unwrap().to_string(), "World");
+/// ```
+/// Or a more vec-like equivalent:
+/// ```
+/// use listpack_redis::listpack;
+///
+/// let listpack = listpack![1, 2, 3];
+/// assert_eq!(listpack.len(), 3);
+/// assert_eq!(listpack[0].to_string(), "1");
+/// assert_eq!(listpack[1].to_string(), "2");
+/// assert_eq!(listpack[2].to_string(), "3");
+/// ```
+#[macro_export]
+macro_rules! listpack {
+    ( $ ( $ x : expr ) , * ) => {
+        {
+            let mut listpack = $crate::Listpack::new();
+            $ (
+                listpack.push($x);
+            ) *
+            listpack
+        };
+    }
+}
 
 #[cfg(test)]
 mod tests {
