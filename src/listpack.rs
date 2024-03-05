@@ -1789,6 +1789,10 @@ impl Listpack {
 
     /// Appends all the elements of a slice to the listpack.
     ///
+    /// # Note
+    ///
+    /// The elements must be convertible to [`ListpackEntryInsert`].
+    ///
     /// # Example
     ///
     /// ```
@@ -1808,6 +1812,69 @@ impl Listpack {
     {
         for item in slice {
             self.push(item.into());
+        }
+    }
+
+    /// Copies elements from `src` range to the end of the listpack.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range is out of bounds.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    ///
+    /// listpack.push("Hello");
+    /// listpack.push("World");
+    /// listpack.push("!");
+    ///
+    /// // Copy the first two elements to the end of the listpack.
+    /// listpack.extend_from_within(0..2);
+    ///
+    /// assert_eq!(listpack.len(), 5);
+    /// assert_eq!(listpack[0].to_string(), "Hello");
+    /// assert_eq!(listpack[1].to_string(), "World");
+    /// assert_eq!(listpack[2].to_string(), "!");
+    /// assert_eq!(listpack[3].to_string(), "Hello");
+    /// assert_eq!(listpack[4].to_string(), "World");
+    /// ```
+    pub fn extend_from_within(&mut self, src: std::ops::Range<usize>) {
+        if src.contains(&self.len()) {
+            panic!("The range is out of bounds.");
+        }
+
+        for i in src {
+            let entry = self.get(i).unwrap();
+            let data = entry
+                .data()
+                .expect("The ListpackEntry data can be retrieved.");
+            let entry = ListpackEntryInsert::try_from(&data)
+                .expect("Convert an entry to ListpackEntryInsert");
+
+            // self.push(entry);
+            self.ptr = NonNull::new(match entry {
+                ListpackEntryInsert::String(s) => {
+                    let string_ptr = s.as_ptr() as *mut _;
+                    let len_bytes = s.len();
+                    if len_bytes == 0 {
+                        return;
+                    }
+
+                    if len_bytes > std::u32::MAX as usize {
+                        panic!("The string is too long to be stored in the listpack.");
+                    }
+
+                    unsafe { bindings::lpAppend(self.ptr.as_ptr(), string_ptr, len_bytes as _) }
+                }
+                ListpackEntryInsert::Integer(n) => unsafe {
+                    bindings::lpAppendInteger(self.ptr.as_ptr(), n)
+                },
+            })
+            .expect("Appended to listpack");
         }
     }
 
