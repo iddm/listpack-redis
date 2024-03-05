@@ -13,6 +13,7 @@ pub mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
+pub mod entry;
 pub mod error;
 pub mod listpack;
 mod redis_helpers;
@@ -20,6 +21,7 @@ mod redis_helpers;
 /// The prelude module contains all the types and traits that you need
 /// to use the listpack library.
 pub mod prelude {
+    pub use crate::entry::*;
     pub use crate::listpack::*;
 }
 
