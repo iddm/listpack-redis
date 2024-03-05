@@ -1849,32 +1849,10 @@ impl Listpack {
 
         for i in src {
             let entry = self.get(i).unwrap();
-            let data = entry
-                .data()
-                .expect("The ListpackEntry data can be retrieved.");
-            let entry = ListpackEntryInsert::try_from(&data)
-                .expect("Convert an entry to ListpackEntryInsert");
+            let entry = ListpackEntryRemoved::from(entry);
+            let entry = ListpackEntryInsert::from(&entry);
 
-            // self.push(entry);
-            self.ptr = NonNull::new(match entry {
-                ListpackEntryInsert::String(s) => {
-                    let string_ptr = s.as_ptr() as *mut _;
-                    let len_bytes = s.len();
-                    if len_bytes == 0 {
-                        return;
-                    }
-
-                    if len_bytes > std::u32::MAX as usize {
-                        panic!("The string is too long to be stored in the listpack.");
-                    }
-
-                    unsafe { bindings::lpAppend(self.ptr.as_ptr(), string_ptr, len_bytes as _) }
-                }
-                ListpackEntryInsert::Integer(n) => unsafe {
-                    bindings::lpAppendInteger(self.ptr.as_ptr(), n)
-                },
-            })
-            .expect("Appended to listpack");
+            self.push(entry);
         }
     }
 
