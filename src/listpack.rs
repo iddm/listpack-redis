@@ -550,6 +550,9 @@ impl Listpack {
     /// Panics if the string is too long to be stored in the listpack
     /// or if the index is out of bounds.
     ///
+    /// The maximum length of a string stored within the listpack is
+    /// (`std::u32::MAX - 1`) bytes.
+    ///
     /// # Example
     ///
     /// ```
@@ -2262,14 +2265,14 @@ mod tests {
 
         listpack.push("Hello");
 
-        let entry = listpack.get(0).unwrap();
-        let total_bytes = entry.total_bytes();
-        assert_eq!(total_bytes, 6);
-
-        for (magnitude, expected_length) in [(7u32, 131), (20u32, 1048582)] {
+        for (length, expected_length) in [
+            (5, 6),
+            (2usize.pow(7), 130),
+            (2usize.pow(12), 4101),
+            (2usize.pow(20), 1048581),
+        ] {
             // A single ASCII-character repeated (2^7 + 1) times, to test
             // the 14-bit encoding (2 bytes for the length).
-            let length = 2usize.pow(magnitude) + 1;
             let string = "a".repeat(length);
             listpack.replace(0, &string);
 
@@ -2277,6 +2280,44 @@ mod tests {
             let total_bytes = entry.total_bytes();
             assert_eq!(total_bytes, expected_length);
             assert_eq!(entry.to_string(), string);
+        }
+    }
+
+    #[test]
+    fn entry_can_store_and_extract_different_types() {
+        let mut listpack = Listpack::from(&["Hello"]);
+
+        // Replace the `0`th element with the object of type above
+        // and check if it can be extracted correctly and the value
+        // is the same as the original one.
+        let small_string = "a".repeat(63);
+        let medium_string = "a".repeat(4095);
+        // TODO: figure out where this `18` comes from.
+        let large_string = "a".repeat(2usize.pow(32) - 18);
+        let objects = [
+            ListpackEntryInsert::Integer(127),
+            ListpackEntryInsert::String(&small_string),
+            ListpackEntryInsert::Integer(4000),
+            ListpackEntryInsert::String(&medium_string),
+            ListpackEntryInsert::String(&large_string),
+            ListpackEntryInsert::Integer(7800),
+            ListpackEntryInsert::Integer(4_088_608),
+            ListpackEntryInsert::Integer(1_047_483_648),
+            ListpackEntryInsert::Integer(4_023_372_036_854_775_807),
+        ];
+
+        for object in objects.iter() {
+            listpack.replace(0, *object);
+            let entry = listpack.get(0).unwrap();
+            let data = entry.data().unwrap();
+            match object {
+                ListpackEntryInsert::Integer(integer) => {
+                    assert_eq!(data.get_integer().unwrap(), *integer);
+                }
+                ListpackEntryInsert::String(string) => {
+                    assert_eq!(data.get_str().unwrap(), *string);
+                }
+            }
         }
     }
 }

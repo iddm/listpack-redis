@@ -29,7 +29,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Error::UnknownEncodingType { encoding_byte } => {
-                write!(f, "Unknown encoding byte: {encoding_byte}")
+                write!(f, "Unknown encoding byte: {encoding_byte:b}")
             }
             Error::UnsupportedNumberDataTypeBitWidth { bit_width } => {
                 write!(f, "Unsupported number data type bit width: {bit_width}")

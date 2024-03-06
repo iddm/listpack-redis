@@ -47,14 +47,20 @@ impl TryFrom<u8> for ListpackEntrySubencodingType {
 
     fn try_from(encoding_byte: u8) -> Result<Self> {
         match encoding_byte {
-            0b11000000 => Ok(Self::SignedInteger13Bit),
-            0b11100000 => Ok(Self::MediumString),
             0b11110000 => Ok(Self::LargeString),
             0b11110001 => Ok(Self::SignedInteger16Bit),
             0b11110010 => Ok(Self::SignedInteger24Bit),
             0b11110011 => Ok(Self::SignedInteger32Bit),
             0b11110100 => Ok(Self::SignedInteger64Bit),
-            _ => Err(crate::error::Error::UnknownEncodingType { encoding_byte }),
+            _ => {
+                if encoding_byte & 0b11100000 == 0b11000000 {
+                    Ok(Self::SignedInteger13Bit)
+                } else if encoding_byte & 0b11110000 == 0b11100000 {
+                    Ok(Self::MediumString)
+                } else {
+                    Err(crate::error::Error::UnknownEncodingType { encoding_byte })
+                }
+            }
         }
     }
 }
@@ -687,7 +693,7 @@ impl ListpackEntry {
                     let data = self
                         .get_data_raw()
                         .ok_or(crate::error::Error::MissingDataBlock)?;
-                    let n = ((data[0] as i16) << 8) | (data[1] as i16);
+                    let n = (((encoding_type_byte & 0b00011111) as i16) << 8) | (data[0] as i16);
                     ListpackEntryData::SignedInteger13Bit(n)
                 }
                 ListpackEntrySubencodingType::MediumString => {
@@ -708,38 +714,38 @@ impl ListpackEntry {
                     let data = self
                         .get_data_raw()
                         .ok_or(crate::error::Error::MissingDataBlock)?;
-                    let n = ((data[0] as i16) << 8) | (data[1] as i16);
+                    let n = ((data[1] as i16) << 8) | (data[0] as i16);
                     ListpackEntryData::SignedInteger16Bit(n)
                 }
                 ListpackEntrySubencodingType::SignedInteger24Bit => {
                     let data = self
                         .get_data_raw()
                         .ok_or(crate::error::Error::MissingDataBlock)?;
-                    let n = ((data[0] as i32) << 16) | ((data[1] as i32) << 8) | (data[2] as i32);
+                    let n = ((data[2] as i32) << 16) | ((data[1] as i32) << 8) | (data[0] as i32);
                     ListpackEntryData::SignedInteger24Bit(n)
                 }
                 ListpackEntrySubencodingType::SignedInteger32Bit => {
                     let data = self
                         .get_data_raw()
                         .ok_or(crate::error::Error::MissingDataBlock)?;
-                    let n = ((data[0] as i32) << 24)
-                        | ((data[1] as i32) << 16)
-                        | ((data[2] as i32) << 8)
-                        | (data[3] as i32);
+                    let n = ((data[3] as i32) << 24)
+                        | ((data[2] as i32) << 16)
+                        | ((data[1] as i32) << 8)
+                        | (data[0] as i32);
                     ListpackEntryData::SignedInteger32Bit(n)
                 }
                 ListpackEntrySubencodingType::SignedInteger64Bit => {
                     let data = self
                         .get_data_raw()
                         .ok_or(crate::error::Error::MissingDataBlock)?;
-                    let n = ((data[0] as i64) << 56)
-                        | ((data[1] as i64) << 48)
-                        | ((data[2] as i64) << 40)
-                        | ((data[3] as i64) << 32)
-                        | ((data[4] as i64) << 24)
-                        | ((data[5] as i64) << 16)
-                        | ((data[6] as i64) << 8)
-                        | (data[7] as i64);
+                    let n = ((data[7] as i64) << 56)
+                        | ((data[6] as i64) << 48)
+                        | ((data[5] as i64) << 40)
+                        | ((data[4] as i64) << 32)
+                        | ((data[3] as i64) << 24)
+                        | ((data[2] as i64) << 16)
+                        | ((data[1] as i64) << 8)
+                        | (data[0] as i64);
                     ListpackEntryData::SignedInteger64Bit(n)
                 }
             },
