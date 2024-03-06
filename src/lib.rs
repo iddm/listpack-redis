@@ -36,6 +36,17 @@
 //! assert_eq!(listpack.len(), 0);
 //! assert!(listpack.is_empty());
 //! ```
+//!
+//! The listpack data structure can be used as a replacement for the
+//! standard library's `Vec` data structure, however, it cannot produce
+//! slices to the underlying data and stores different types within
+//! itself, contrary to the `Vec` data structure, which only stores
+//! elements of the same type.
+//!
+//! The listpack data structure, as a result of storing different types
+//! within itself, is not as flexible as the `Vec` data structure, for
+//! example, it cannot be sorted and it cannot provide with mutable
+//! iterators.
 #![deny(missing_docs)]
 
 #[allow(warnings)]

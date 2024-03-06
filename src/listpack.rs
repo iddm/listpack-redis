@@ -2265,5 +2265,18 @@ mod tests {
         let entry = listpack.get(0).unwrap();
         let total_bytes = entry.total_bytes();
         assert_eq!(total_bytes, 6);
+
+        for (magnitude, expected_length) in [(7u32, 131), (20u32, 1048582)] {
+            // A single ASCII-character repeated (2^7 + 1) times, to test
+            // the 14-bit encoding (2 bytes for the length).
+            let length = 2usize.pow(magnitude) + 1;
+            let string = "a".repeat(length);
+            listpack.replace(0, &string);
+
+            let entry = listpack.get(0).unwrap();
+            let total_bytes = entry.total_bytes();
+            assert_eq!(total_bytes, expected_length);
+            assert_eq!(entry.to_string(), string);
+        }
     }
 }

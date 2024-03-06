@@ -458,6 +458,8 @@ impl<'a> From<&'a String> for ListpackEntryData<'a> {
 pub struct ListpackEntry(());
 
 impl ListpackEntry {
+    const ENCODING_TYPE_BYTE_LENGTH: usize = std::mem::size_of::<u8>();
+
     /// Returns the pointer to the entry.
     ///
     /// # Example
@@ -470,11 +472,13 @@ impl ListpackEntry {
     /// let entry = listpack.get(0).unwrap();
     /// let ptr = unsafe { entry.as_ptr() };
     /// ```
+    #[inline]
     pub fn as_ptr(&self) -> *const u8 {
         self as *const _ as *const u8
     }
 
     /// Returns the mutable pointer to the entry.
+    #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self as *mut _ as *mut u8
     }
@@ -491,6 +495,7 @@ impl ListpackEntry {
     /// let entry = listpack.get(0).unwrap();
     /// let encoding_type = unsafe { entry.get_encoding_type_raw() };
     /// ```
+    #[inline]
     pub fn get_encoding_type_raw(&self) -> u8 {
         unsafe { std::ptr::read_unaligned(self.as_ptr()) }
     }
@@ -508,23 +513,28 @@ impl ListpackEntry {
     /// let encoding_type = entry.encoding_type().unwrap();
     /// assert_eq!(encoding_type, listpack_redis::ListpackEntryEncodingType::SmallString);
     /// ```
+    #[inline]
     pub fn encoding_type(&self) -> Result<ListpackEntryEncodingType> {
         ListpackEntryEncodingType::try_from(self.get_encoding_type_raw())
     }
 
+    /// This method doesn't return the total number of bytes from the
+    /// entry, but rather calculates it on the fly, as the length is
+    /// already known when reading from the left-to-right.
     fn get_data_raw_and_total_bytes(&self) -> Option<(&[u8], usize)> {
         // Depending on the encoding type, the data block may or may not
         // be present. If it is present, it is located after the encoding
         // type byte.
         let encoding_type = self.encoding_type().ok()?;
         let encoding_type_byte = self.get_encoding_type_raw();
+        // Skip the encoding byte.
+        let ptr = unsafe { (self as *const Self as *const u8).add(1) };
 
         match encoding_type {
             ListpackEntryEncodingType::SmallUnsignedInteger => None,
             ListpackEntryEncodingType::SmallString => {
                 let len = (encoding_type_byte & 0b00111111) as usize;
                 let data = unsafe {
-                    let ptr = (self as *const Self as *const u8).add(1);
                     let data = std::slice::from_raw_parts(ptr, len);
                     let total_bytes = ptr.add(len).cast::<u8>().read_unaligned() as _;
                     (data, total_bytes)
@@ -534,7 +544,6 @@ impl ListpackEntry {
             ListpackEntryEncodingType::ComplexType(subencoding_type) => match subencoding_type {
                 ListpackEntrySubencodingType::SignedInteger13Bit => {
                     let data = unsafe {
-                        let ptr = (self as *const Self as *const u8).add(1);
                         let data = std::slice::from_raw_parts(ptr, 2);
                         let total_bytes = ptr.add(2).cast::<u8>().read_unaligned() as _;
                         (data, total_bytes)
@@ -543,34 +552,31 @@ impl ListpackEntry {
                 }
                 ListpackEntrySubencodingType::MediumString => {
                     let data = unsafe {
-                        let ptr = (self as *const Self as *const u8).add(1);
-                        let len = ((*ptr as usize) << 8) | (*ptr.add(1) as usize);
-                        let ptr = ptr.add(2);
+                        let len = ((encoding_type_byte & 0b00001111) as usize) << 8 | *ptr as usize;
+                        let ptr = ptr.add(1);
                         let data = std::slice::from_raw_parts(ptr, len);
-                        // TODO: either u8 or u16, in big endian.
-                        let total_bytes = ptr.add(len).cast::<u8>().read_unaligned() as _;
-                        (data, total_bytes)
+                        // One extra byte for the length of the data block.
+                        let extra_length = Self::ENCODING_TYPE_BYTE_LENGTH + 1;
+                        (data, len + extra_length)
                     };
                     Some(data)
                 }
                 ListpackEntrySubencodingType::LargeString => {
                     let data = unsafe {
-                        let ptr = (self as *const Self as *const u8).add(1);
-                        let len = ((*ptr as usize) << 24)
-                            | ((*ptr.add(1) as usize) << 16)
-                            | ((*ptr.add(2) as usize) << 8)
-                            | (*ptr.add(3) as usize);
+                        let len = ((*ptr.add(3) as usize) << 24)
+                            | ((*ptr.add(2) as usize) << 16)
+                            | ((*ptr.add(1) as usize) << 8)
+                            | (*ptr as usize);
                         let ptr = ptr.add(4);
                         let data = std::slice::from_raw_parts(ptr, len);
-                        // TODO: either u16, u24, or u32, in big endian.
-                        let total_bytes = ptr.add(len).cast::<u16>().read_unaligned() as _;
-                        (data, total_bytes)
+                        // Four extra bytes for the length of the data block.
+                        let extra_length = Self::ENCODING_TYPE_BYTE_LENGTH + 4;
+                        (data, len + extra_length)
                     };
                     Some(data)
                 }
                 ListpackEntrySubencodingType::SignedInteger16Bit => {
                     let data = unsafe {
-                        let ptr = (self as *const Self as *const u8).add(1);
                         let data = std::slice::from_raw_parts(ptr, 2);
                         let total_bytes = ptr.add(2).cast::<u8>().read_unaligned() as _;
                         (data, total_bytes)
@@ -579,7 +585,6 @@ impl ListpackEntry {
                 }
                 ListpackEntrySubencodingType::SignedInteger24Bit => {
                     let data = unsafe {
-                        let ptr = (self as *const Self as *const u8).add(1);
                         let data = std::slice::from_raw_parts(ptr, 3);
                         let total_bytes = ptr.add(3).cast::<u8>().read_unaligned() as _;
                         (data, total_bytes)
@@ -588,7 +593,6 @@ impl ListpackEntry {
                 }
                 ListpackEntrySubencodingType::SignedInteger32Bit => {
                     let data = unsafe {
-                        let ptr = (self as *const Self as *const u8).add(1);
                         let data = std::slice::from_raw_parts(ptr, 4);
                         let total_bytes = ptr.add(4).cast::<u8>().read_unaligned() as _;
                         (data, total_bytes)
@@ -597,7 +601,6 @@ impl ListpackEntry {
                 }
                 ListpackEntrySubencodingType::SignedInteger64Bit => {
                     let data = unsafe {
-                        let ptr = (self as *const Self as *const u8).add(1);
                         let data = std::slice::from_raw_parts(ptr, 8);
                         let total_bytes = ptr.add(8).cast::<u8>().read_unaligned() as _;
                         (data, total_bytes)
@@ -691,19 +694,14 @@ impl ListpackEntry {
                     let data = self
                         .get_data_raw()
                         .ok_or(crate::error::Error::MissingDataBlock)?;
-                    let len = ((data[0] as usize) << 8) | (data[1] as usize);
-                    let s = std::str::from_utf8(&data[2..len + 2]).unwrap();
+                    let s = std::str::from_utf8(data).unwrap();
                     ListpackEntryData::MediumString(s)
                 }
                 ListpackEntrySubencodingType::LargeString => {
                     let data = self
                         .get_data_raw()
                         .ok_or(crate::error::Error::MissingDataBlock)?;
-                    let len = ((data[0] as usize) << 24)
-                        | ((data[1] as usize) << 16)
-                        | ((data[2] as usize) << 8)
-                        | (data[3] as usize);
-                    let s = std::str::from_utf8(&data[4..len + 4]).unwrap();
+                    let s = std::str::from_utf8(data).unwrap();
                     ListpackEntryData::LargeString(s)
                 }
                 ListpackEntrySubencodingType::SignedInteger16Bit => {
