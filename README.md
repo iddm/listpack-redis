@@ -29,8 +29,9 @@ cargo build
 Please take a look at the [/examples](./examples) directory, where you
 may find a few examples showing the use of the crate.
 
-Additionally, you may check out the [/tests](./tests) directory to get
-familiar with some more specific use-cases.
+Additionally, you may check out the unit tests
+[/src/listpack.rs](./src/listpack.rs) directory to get familiar with
+some more specific use-cases.
 
 # LICENSE
 

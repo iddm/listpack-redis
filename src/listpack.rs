@@ -1371,6 +1371,23 @@ impl Listpack {
     }
 
     /// Returns an iterator over the elements of the listpack.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    ///
+    /// listpack.push("Hello");
+    /// listpack.push("World");
+    ///
+    /// let mut iter = listpack.iter();
+    ///
+    /// assert_eq!(iter.next().unwrap().to_string(), "Hello");
+    /// assert_eq!(iter.next().unwrap().to_string(), "World");
+    /// assert!(iter.next().is_none());
+    /// ```
     pub fn iter(&self) -> ListpackIter {
         ListpackIter {
             listpack: self,
@@ -1442,6 +1459,18 @@ impl Index<usize> for Listpack {
 
     fn index(&self, index: usize) -> &Self::Output {
         self.get(index).expect("Index out of bounds.")
+    }
+}
+
+impl IntoIterator for Listpack {
+    type Item = ListpackEntryRemoved;
+    type IntoIter = ListpackIntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        ListpackIntoIter {
+            listpack: self,
+            index: 0,
+        }
     }
 }
 
@@ -1628,6 +1657,50 @@ impl DoubleEndedIterator for ListpackIter<'_> {
         self.index += 1;
 
         Some(element)
+    }
+}
+
+/// An iterator over the elements of a listpack, which returns the
+/// elements as [`ListpackEntryRemoved`]. This iterator owns the
+/// listpack.
+#[derive(Debug)]
+pub struct ListpackIntoIter {
+    listpack: Listpack,
+    index: usize,
+}
+
+impl Iterator for ListpackIntoIter {
+    type Item = ListpackEntryRemoved;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.listpack.len() {
+            return None;
+        }
+
+        let element = self.listpack.get(self.index)?;
+
+        self.index += 1;
+
+        Some(element.into())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.index, Some(self.listpack.len()))
+    }
+}
+
+impl DoubleEndedIterator for ListpackIntoIter {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.index >= self.listpack.len() {
+            return None;
+        }
+
+        let index = self.listpack.len() - self.index - 1;
+        let element = self.listpack.get(index)?;
+
+        self.index += 1;
+
+        Some(element.into())
     }
 }
 
