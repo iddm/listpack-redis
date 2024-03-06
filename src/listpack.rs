@@ -133,6 +133,7 @@ impl Debug for Listpack {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Listpack")
             .field("ptr", &self.ptr)
+            // TODO: optimise to not use collection to vector.
             .field("elements", &self.iter().collect::<Vec<_>>())
             .finish()
     }

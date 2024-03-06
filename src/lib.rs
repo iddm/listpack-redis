@@ -1,5 +1,41 @@
 //! The listpack data structure is a compressed list of strings, and
 //! numbers.
+//!
+//! The listpack data structure is used in the Redis database to store
+//! lists of strings, and numbers. The listpack data structure is
+//! implemented in the C programming language, and this crate provides
+//! an idiomatic and safe Rust interface to the listpack data structure.
+//!
+//! For the description of the listpack data structure, refer to this
+//! [document](https://github.com/antirez/listpack/blob/master/listpack.md).
+//!
+//! # Example
+//!
+//! ```
+//! use listpack_redis::*;
+//!
+//! let mut listpack = Listpack::new();
+//! listpack.push("hello");
+//! listpack.push("world");
+//!
+//! let entry = listpack.get(0).unwrap();
+//! assert_eq!(entry.to_string(), "hello");
+//!
+//! let entry = &listpack[1];
+//! assert_eq!(entry.to_string(), "world");
+//!
+//! listpack.replace(1, "rust");
+//! let entry = &listpack[1];
+//! assert_eq!(entry.to_string(), "rust");
+//!
+//! listpack.remove(0);
+//! let entry = &listpack[0];
+//! assert_eq!(entry.to_string(), "rust");
+//!
+//! listpack.clear();
+//! assert_eq!(listpack.len(), 0);
+//! assert!(listpack.is_empty());
+//! ```
 #![deny(missing_docs)]
 
 #[allow(warnings)]
