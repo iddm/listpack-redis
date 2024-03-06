@@ -56,7 +56,7 @@
 #[allow(unused)]
 #[allow(missing_docs)]
 /// The raw bindings to the listpack redis implementation.
-pub mod bindings {
+mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
