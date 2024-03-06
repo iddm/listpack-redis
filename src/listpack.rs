@@ -2025,6 +2025,17 @@ impl Drop for ListpackDrain<'_> {
 /// assert_eq!(listpack[1].to_string(), "2");
 /// assert_eq!(listpack[2].to_string(), "3");
 /// ```
+/// It is also possible to specify different types, contrary to the
+/// [`std::convert::From`] trait:
+/// ```
+/// use listpack_redis::listpack;
+///
+/// let listpack = listpack![1, "Hello", 3];
+/// assert_eq!(listpack.len(), 3);
+/// assert_eq!(listpack[0].to_string(), "1");
+/// assert_eq!(listpack[1].to_string(), "Hello");
+/// assert_eq!(listpack[2].to_string(), "3");
+/// ```
 #[macro_export]
 macro_rules! listpack {
     ( $ ( $ x : expr ) , * ) => {
