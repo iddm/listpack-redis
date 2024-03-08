@@ -542,7 +542,7 @@ impl ListpackEntry {
                 let len = (encoding_type_byte & 0b00111111) as usize;
                 let data = unsafe {
                     let data = std::slice::from_raw_parts(ptr, len);
-                    let total_bytes = ptr.add(len).cast::<u8>().read_unaligned() as _;
+                    let total_bytes = len + Self::ENCODING_TYPE_BYTE_LENGTH + 1;
                     (data, total_bytes)
                 };
                 Some(data)
@@ -656,8 +656,9 @@ impl ListpackEntry {
     /// listpack.push("Hello");
     /// let entry = listpack.get(0).unwrap();
     /// let total_bytes = entry.total_bytes();
-    /// // Five ascii characters, plus the encoding type byte.
-    /// assert_eq!(total_bytes, 6);
+    /// // Five ascii characters, plus the encoding type byte, plus
+    /// // the total-element-length byte.
+    /// assert_eq!(total_bytes, 7);
     /// ```
     pub fn total_bytes(&self) -> usize {
         self.get_data_raw_and_total_bytes()

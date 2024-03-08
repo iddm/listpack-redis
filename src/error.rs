@@ -26,7 +26,7 @@ impl std::fmt::Display for InsertionError {
                 available_listpack_length,
             } => write!(
                 f,
-                "String is too long: {current_length} > {available_listpack_length}"
+                "Object is too long: {current_length} > {available_listpack_length}"
             ),
         }
     }
