@@ -15,6 +15,13 @@ pub enum InsertionError {
         /// The available amount of bytes available in the listpack.
         available_listpack_length: usize,
     },
+    /// An insertion error indicating that the index is out of bounds.
+    IndexOutOfBounds {
+        /// The index that caused the error.
+        index: usize,
+        /// The length of the listpack.
+        length: usize,
+    },
 }
 
 impl std::fmt::Display for InsertionError {
@@ -28,6 +35,9 @@ impl std::fmt::Display for InsertionError {
                 f,
                 "Object is too long: {current_length} > {available_listpack_length}"
             ),
+            InsertionError::IndexOutOfBounds { index, length } => {
+                write!(f, "Index out of bounds: {index} > {length}")
+            }
         }
     }
 }

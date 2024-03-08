@@ -601,23 +601,65 @@ impl Listpack {
         self.insert_internal(index, entry, bindings::LP_BEFORE)
     }
 
+    /// Inserts an element at the given index into the listpack.
+    ///
+    /// The safe version of [`Self::insert`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    ///
+    /// // Index out of bounds:
+    /// assert!(listpack.try_insert(0, "Hello, world!").is_err());
+    /// listpack.push("Hello, world!");
+    /// assert!(listpack.try_insert(0, "Hello!").is_ok());
+    ///
+    /// assert_eq!(listpack.len(), 2);
+    /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello!");
+    /// assert_eq!(listpack.get(1).unwrap().to_string(), "Hello, world!");
+    /// ```
+    pub fn try_insert<'a, T: Into<ListpackEntryInsert<'a>>>(
+        &mut self,
+        index: usize,
+        entry: T,
+    ) -> Result {
+        self.try_insert_internal(index, entry, bindings::LP_BEFORE)
+    }
+
     fn insert_internal<'a, T: Into<ListpackEntryInsert<'a>>>(
         &mut self,
         index: usize,
         entry: T,
         location: u32,
     ) {
+        self.try_insert_internal(index, entry, location)
+            .expect("Insert an element in listpack");
+    }
+
+    fn try_insert_internal<'a, T: Into<ListpackEntryInsert<'a>>>(
+        &mut self,
+        index: usize,
+        entry: T,
+        location: u32,
+    ) -> Result {
         let entry = entry.into();
 
         let referred_element_ptr =
-            NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
-                .expect("Index out of bounds.");
+            NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) }).ok_or(
+                crate::error::InsertionError::IndexOutOfBounds {
+                    index,
+                    length: self.len(),
+                },
+            )?;
 
         if let Some(e) = self.can_fit_entry(
             &entry,
             Some(ListpackEntry::ref_from_ptr(referred_element_ptr)),
         ) {
-            panic!("{e}");
+            return Err(e);
         }
 
         let ptr = NonNull::new(match entry {
@@ -646,9 +688,14 @@ impl Listpack {
                 )
             },
         })
-        .expect("Insert an element in listpack");
+        .ok_or(crate::error::InsertionError::ListpackIsFull {
+            current_length: entry.full_encoded_size(),
+            available_listpack_length: unsafe { self.header_ref().available_bytes() },
+        })?;
 
         self.ptr = ptr;
+
+        Ok(())
     }
 
     /// Checks that the passed element can be inserted into the
@@ -1729,6 +1776,32 @@ impl Listpack {
         self.insert_internal(index, entry, bindings::LP_AFTER)
     }
 
+    /// Inserts an element at the given index into the listpack, after
+    /// the specified index.
+    ///
+    /// The safe version of [`Self::insert_after`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// listpack.push("Hello, world!");
+    /// assert!(listpack.try_insert_after(0, "Hello!").is_ok());
+    ///
+    /// assert_eq!(listpack.len(), 2);
+    /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello, world!");
+    /// assert_eq!(listpack.get(1).unwrap().to_string(), "Hello!");
+    /// ```
+    pub fn try_insert_after<'a, T: Into<ListpackEntryInsert<'a>>>(
+        &mut self,
+        index: usize,
+        entry: T,
+    ) -> Result {
+        self.try_insert_internal(index, entry, bindings::LP_AFTER)
+    }
+
     /// Replaces the element at the given index with the given element.
     ///
     /// # Panics
@@ -1749,6 +1822,32 @@ impl Listpack {
     /// ```
     pub fn replace<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
         self.insert_internal(index, entry, bindings::LP_REPLACE)
+    }
+
+    /// Replaces the element at the given index with the given element.
+    ///
+    /// The safe version of [`Self::replace`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    ///
+    /// listpack.push("Hello, world!");
+    ///
+    /// assert!(listpack.try_replace(0, "Hello!").is_ok());
+    ///
+    /// assert_eq!(listpack.len(), 1);
+    /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello!");
+    /// ```
+    pub fn try_replace<'a, T: Into<ListpackEntryInsert<'a>>>(
+        &mut self,
+        index: usize,
+        entry: T,
+    ) -> Result {
+        self.try_insert_internal(index, entry, bindings::LP_REPLACE)
     }
 }
 
