@@ -9,6 +9,7 @@ use std::{
 use crate::{
     bindings,
     entry::{ListpackEntry, ListpackEntryInsert, ListpackEntryMutable, ListpackEntryRemoved},
+    error::Result,
 };
 
 /// The header of the listpack data structure. Can only be obtained
@@ -46,6 +47,7 @@ impl ListpackHeader {
     ///
     /// let listpack = Listpack::new();
     /// let header = unsafe { listpack.header_ref() };
+    /// // The header is 6 bytes long, one more byte is the terminator.
     /// assert_eq!(header.total_bytes(), 7);
     pub fn total_bytes(&self) -> usize {
         self.total_bytes as usize
@@ -67,6 +69,12 @@ impl ListpackHeader {
     /// assert_eq!(header.num_elements(), 3);
     pub fn num_elements(&self) -> usize {
         self.num_elements as usize
+    }
+
+    /// Returns the amount of bytes available for the listpack to store
+    /// new elements.
+    pub fn available_bytes(&self) -> usize {
+        (std::u32::MAX as usize) - self.total_bytes()
     }
 }
 
@@ -113,6 +121,14 @@ impl ListpackHeaderRef<'_> {
     /// See [`ListpackHeader::num_elements`].
     pub fn num_elements(&self) -> usize {
         self.0.num_elements as usize
+    }
+
+    /// Returns the amount of bytes available for the listpack to store
+    /// new elements.
+    ///
+    /// See [`ListpackHeader::available_bytes`].
+    pub fn available_bytes(&self) -> usize {
+        self.0.available_bytes()
     }
 }
 
@@ -519,26 +535,27 @@ impl Listpack {
     /// assert_eq!(listpack.len(), 1);
     /// ```
     pub fn push<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, entry: T) {
-        let entry = entry.into();
-        self.ptr = NonNull::new(match entry {
-            ListpackEntryInsert::String(s) => {
-                let string_ptr = s.as_ptr() as *mut _;
-                let len_bytes = s.len();
-                if len_bytes == 0 {
-                    return;
-                }
+        self.try_push(entry).expect("Pushed to listpack");
+        // let entry = entry.into();
+        // self.ptr = NonNull::new(match entry {
+        //     ListpackEntryInsert::String(s) => {
+        //         let string_ptr = s.as_ptr() as *mut _;
+        //         let len_bytes = s.len();
+        //         if len_bytes == 0 {
+        //             return;
+        //         }
 
-                if len_bytes > std::u32::MAX as usize {
-                    panic!("The string is too long to be stored in the listpack.");
-                }
+        //         if len_bytes > std::u32::MAX as usize {
+        //             panic!("The string is too long to be stored in the listpack.");
+        //         }
 
-                unsafe { bindings::lpAppend(self.ptr.as_ptr(), string_ptr, len_bytes as _) }
-            }
-            ListpackEntryInsert::Integer(n) => unsafe {
-                bindings::lpAppendInteger(self.ptr.as_ptr(), n)
-            },
-        })
-        .expect("Appended to listpack");
+        //         unsafe { bindings::lpAppend(self.ptr.as_ptr(), string_ptr, len_bytes as _) }
+        //     }
+        //     ListpackEntryInsert::Integer(n) => unsafe {
+        //         bindings::lpAppendInteger(self.ptr.as_ptr(), n)
+        //     },
+        // })
+        // .expect("Appended to listpack");
     }
 
     /// Inserts an element at the given index into the listpack.
@@ -631,6 +648,116 @@ impl Listpack {
         .expect("Insert an element in listpack");
 
         self.ptr = ptr;
+    }
+
+    /// Checks that the passed element can be inserted into the
+    /// listpack. In case it cannot, returns the corresponding error.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    ///
+    /// let entry = "Hello, world!".into();
+    /// let check = listpack.can_fit_insert_entry(&entry);
+    /// assert!(check.is_none());
+    ///
+    /// // The string is too long to be stored in the listpack.
+    /// let string = "a".repeat(2usize.pow(32).into());
+    /// let entry = (&string).into();
+    /// let check = listpack.can_fit_insert_entry(&entry);
+    /// assert!(check.is_some());
+    /// ```
+    pub fn can_fit_insert_entry(&self, entry: &ListpackEntryInsert) -> Option<crate::error::Error> {
+        let available_listpack_length = unsafe { self.header_ref().available_bytes() };
+
+        match entry {
+            ListpackEntryInsert::String(s) => {
+                let len_bytes = s.len();
+
+                if len_bytes == 0 {
+                    return Some(crate::error::InsertionError::StringIsEmpty.into());
+                }
+
+                if len_bytes > std::u32::MAX as usize {
+                    return Some(
+                        crate::error::InsertionError::ListpackIsFull {
+                            current_length: len_bytes,
+                            available_listpack_length,
+                        }
+                        .into(),
+                    );
+                }
+
+                let encoded_size = entry.full_encoded_size();
+                if encoded_size > available_listpack_length {
+                    return Some(
+                        crate::error::InsertionError::ListpackIsFull {
+                            current_length: encoded_size,
+                            available_listpack_length,
+                        }
+                        .into(),
+                    );
+                }
+            }
+            ListpackEntryInsert::Integer(_) => {
+                let encoded_size = entry.full_encoded_size();
+
+                if encoded_size > available_listpack_length {
+                    return Some(
+                        crate::error::InsertionError::ListpackIsFull {
+                            current_length: encoded_size,
+                            available_listpack_length,
+                        }
+                        .into(),
+                    );
+                }
+            }
+        }
+
+        None
+    }
+
+    /// A safe version of [`Self::push`]. It is a little more useful,
+    /// when the listpack grows large. As the listpack is a single
+    /// allocation, and this allocation is limited in terms of length,
+    /// by the listpack header's `total_bytes` field, it is only
+    /// possible to occupy the four bytes (`2u32.pow(32) - 1`) bytes of
+    /// memory. This method will return an [`crate::error::Error`] if
+    /// the listpack is full and the element cannot be pushed.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack = Listpack::new();
+    /// assert!(listpack.try_push("Hello, world!").is_ok());
+    /// assert_eq!(listpack.len(), 1);
+    /// ```
+    pub fn try_push<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, entry: T) -> Result {
+        let entry = entry.into();
+
+        if let Some(e) = self.can_fit_insert_entry(&entry) {
+            return Err(e);
+        }
+
+        self.ptr = NonNull::new(match entry {
+            ListpackEntryInsert::String(s) => {
+                let string_ptr = s.as_ptr() as *mut _;
+                let len_bytes = s.len();
+
+                unsafe { bindings::lpAppend(self.ptr.as_ptr(), string_ptr, len_bytes as _) }
+            }
+            ListpackEntryInsert::Integer(n) => unsafe {
+                bindings::lpAppendInteger(self.ptr.as_ptr(), n)
+            },
+        })
+        .expect("Appended to listpack");
+
+        Ok(())
     }
 
     /// Removes the element at the given index from the listpack and
@@ -2303,7 +2430,6 @@ mod tests {
         // is the same as the original one.
         let small_string = "a".repeat(63);
         let medium_string = "a".repeat(4095);
-        // TODO: figure out where this `18` comes from.
         let large_string = "a".repeat(2usize.pow(32) - 18);
         let objects = [
             ListpackEntryInsert::Integer(127),

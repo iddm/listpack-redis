@@ -848,6 +848,87 @@ pub enum ListpackEntryInsert<'a> {
     Integer(i64),
 }
 
+impl ListpackEntryInsert<'_> {
+    // TODO: probably, should be in `ListpackEntry`.
+    /// Returns the full encoded size of the entry, including:
+    /// - the encoding byte,
+    /// - the data block length.
+    /// - the total-element-length byte(s).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::ListpackEntryInsert;
+    ///
+    /// let entry = ListpackEntryInsert::String("Hello, world!");
+    /// assert_eq!(entry.full_encoded_size(), 15);
+    ///
+    /// let string = "a".repeat(2usize.pow(32).into());
+    /// let entry = ListpackEntryInsert::String(&string);
+    /// assert_eq!(entry.full_encoded_size(), 4294967306);
+    /// ```
+    pub fn full_encoded_size(&self) -> usize {
+        match self {
+            Self::String(s) => {
+                let len = s.len();
+                if len <= 63 {
+                    // 1: The length is stored in the encoding byte.
+                    // 1: The "total-element-length" byte length.
+                    len + 1 + 1
+                } else if len <= 4095 {
+                    // 2: The length is stored in the encoding byte and one
+                    // extra byte.
+                    //
+                    // 2: The "total-element-length" byte length.
+                    len + 2 + 2
+                } else {
+                    let total_element_length_byte_length = if len <= 65535 {
+                        3
+                    } else if len <= 16777215 {
+                        4
+                    } else {
+                        5
+                    };
+                    len + 5 + total_element_length_byte_length
+                }
+            }
+            Self::Integer(n) => {
+                if (0..=127).contains(n) {
+                    // 1: 7-bit integer => everything is encoded in the
+                    // encoding byte.
+                    // 1: the total-element-length of one byte.
+                    1 + 1
+                } else if (-4096..=4095).contains(n) {
+                    // 1: encoding byte with 5 bits of size.
+                    // 1: 8-bit integer (in total 13-bit integer).
+                    // 1: total-byte-length of one byte.
+                    3
+                } else if (-32768..=32767).contains(n) {
+                    // 1: encoding byte.
+                    // 2: 16-bit integer.
+                    // 1: total-byte-length of one byte.
+                    4
+                } else if (-8388608..=8388607).contains(n) {
+                    // 1: encoding byte.
+                    // 3: 24-bit integer.
+                    // 1: total-byte-length of one byte.
+                    5
+                } else if (-2147483648..=2147483647).contains(n) {
+                    // 1: encoding byte.
+                    // 4: 32-bit integer.
+                    // 1: total-byte-length of one byte.
+                    6
+                } else {
+                    // 1: encoding byte.
+                    // 8: 64-bit integer.
+                    // 1: total-byte-length of one byte.
+                    10
+                }
+            }
+        }
+    }
+}
+
 impl<'a> From<&'a str> for ListpackEntryInsert<'a> {
     fn from(value: &'a str) -> Self {
         Self::String(value)
