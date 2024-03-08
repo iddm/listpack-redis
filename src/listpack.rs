@@ -707,7 +707,7 @@ impl Listpack {
                 let encoded_size = entry.full_encoded_size();
 
                 if encoded_size > replacement_length
-                    && encoded_size - replacement_length > available_listpack_length
+                    && (encoded_size - replacement_length) > available_listpack_length
                 {
                     return Some(
                         crate::error::InsertionError::ListpackIsFull {
@@ -721,7 +721,9 @@ impl Listpack {
             ListpackEntryInsert::Integer(_) => {
                 let encoded_size = entry.full_encoded_size();
 
-                if encoded_size > available_listpack_length {
+                if encoded_size > replacement_length
+                    && (encoded_size - replacement_length) > available_listpack_length
+                {
                     return Some(
                         crate::error::InsertionError::ListpackIsFull {
                             current_length: encoded_size,
@@ -2446,17 +2448,17 @@ mod tests {
         // is the same as the original one.
         let small_string = "a".repeat(63);
         let medium_string = "a".repeat(4095);
-        let large_string = "a".repeat(2usize.pow(32) - 18);
+        let large_string = "a".repeat(2usize.pow(32) - 20);
         let objects = [
-            // ListpackEntryInsert::Integer(127),
-            // ListpackEntryInsert::String(&small_string),
-            // ListpackEntryInsert::Integer(4000),
-            // ListpackEntryInsert::String(&medium_string),
+            ListpackEntryInsert::Integer(127),
+            ListpackEntryInsert::String(&small_string),
+            ListpackEntryInsert::Integer(4000),
+            ListpackEntryInsert::String(&medium_string),
             ListpackEntryInsert::String(&large_string),
-            // ListpackEntryInsert::Integer(7800),
-            // ListpackEntryInsert::Integer(4_088_608),
-            // ListpackEntryInsert::Integer(1_047_483_648),
-            // ListpackEntryInsert::Integer(4_023_372_036_854_775_807),
+            ListpackEntryInsert::Integer(7800),
+            ListpackEntryInsert::Integer(4_088_608),
+            ListpackEntryInsert::Integer(1_047_483_648),
+            ListpackEntryInsert::Integer(4_023_372_036_854_775_807),
         ];
 
         for object in objects.iter() {

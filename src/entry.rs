@@ -551,7 +551,10 @@ impl ListpackEntry {
                 ListpackEntrySubencodingType::SignedInteger13Bit => {
                     let data = unsafe {
                         let data = std::slice::from_raw_parts(ptr, 2);
-                        let total_bytes = ptr.add(2).cast::<u8>().read_unaligned() as _;
+                        // The encoding byte + 5 bits of the integer,
+                        // the 8 bits of the integer,
+                        // the total length of the data block.
+                        let total_bytes = Self::ENCODING_TYPE_BYTE_LENGTH + 1 + 1;
                         (data, total_bytes)
                     };
                     Some(data)
@@ -584,7 +587,7 @@ impl ListpackEntry {
                 ListpackEntrySubencodingType::SignedInteger16Bit => {
                     let data = unsafe {
                         let data = std::slice::from_raw_parts(ptr, 2);
-                        let total_bytes = ptr.add(2).cast::<u8>().read_unaligned() as _;
+                        let total_bytes = Self::ENCODING_TYPE_BYTE_LENGTH + 2 + 1;
                         (data, total_bytes)
                     };
                     Some(data)
@@ -592,7 +595,7 @@ impl ListpackEntry {
                 ListpackEntrySubencodingType::SignedInteger24Bit => {
                     let data = unsafe {
                         let data = std::slice::from_raw_parts(ptr, 3);
-                        let total_bytes = ptr.add(3).cast::<u8>().read_unaligned() as _;
+                        let total_bytes = Self::ENCODING_TYPE_BYTE_LENGTH + 3 + 1;
                         (data, total_bytes)
                     };
                     Some(data)
@@ -600,7 +603,7 @@ impl ListpackEntry {
                 ListpackEntrySubencodingType::SignedInteger32Bit => {
                     let data = unsafe {
                         let data = std::slice::from_raw_parts(ptr, 4);
-                        let total_bytes = ptr.add(4).cast::<u8>().read_unaligned() as _;
+                        let total_bytes = Self::ENCODING_TYPE_BYTE_LENGTH + 4 + 1;
                         (data, total_bytes)
                     };
                     Some(data)
@@ -608,7 +611,7 @@ impl ListpackEntry {
                 ListpackEntrySubencodingType::SignedInteger64Bit => {
                     let data = unsafe {
                         let data = std::slice::from_raw_parts(ptr, 8);
-                        let total_bytes = ptr.add(8).cast::<u8>().read_unaligned() as _;
+                        let total_bytes = Self::ENCODING_TYPE_BYTE_LENGTH + 8 + 1;
                         (data, total_bytes)
                     };
                     Some(data)
