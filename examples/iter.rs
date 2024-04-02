@@ -1,7 +1,7 @@
 use listpack_redis::*;
 
 fn main() {
-    let mut listpack = Listpack::new();
+    let mut listpack: Listpack = Listpack::default();
     listpack.push("hello");
     listpack.push("world");
 

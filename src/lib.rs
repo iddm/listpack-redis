@@ -14,7 +14,7 @@
 //! ```
 //! use listpack_redis::*;
 //!
-//! let mut listpack = Listpack::new();
+//! let mut listpack: Listpack = Listpack::default();
 //! listpack.push("hello");
 //! listpack.push("world");
 //!
@@ -60,6 +60,7 @@ mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
+pub mod allocator;
 pub mod entry;
 pub mod error;
 pub mod listpack;

@@ -473,7 +473,7 @@ impl ListpackEntry {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::new();
+    /// let mut listpack: Listpack = Listpack::default();
     /// listpack.push("Hello");
     /// let entry = listpack.get(0).unwrap();
     /// let ptr = unsafe { entry.as_ptr() };
@@ -496,7 +496,7 @@ impl ListpackEntry {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::new();
+    /// let mut listpack: Listpack = Listpack::default();
     /// listpack.push("Hello");
     /// let entry = listpack.get(0).unwrap();
     /// let encoding_type = unsafe { entry.get_encoding_type_raw() };
@@ -513,7 +513,7 @@ impl ListpackEntry {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::new();
+    /// let mut listpack: Listpack = Listpack::default();
     /// listpack.push("Hello");
     /// let entry = listpack.get(0).unwrap();
     /// let encoding_type = entry.encoding_type().unwrap();
@@ -634,7 +634,7 @@ impl ListpackEntry {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::new();
+    /// let mut listpack: Listpack = Listpack::default();
     /// listpack.push("Hello");
     /// let entry = listpack.get(0).unwrap();
     /// let data = entry.get_data_raw().unwrap();
@@ -655,7 +655,7 @@ impl ListpackEntry {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::new();
+    /// let mut listpack: Listpack = Listpack::default();
     /// listpack.push("Hello");
     /// let entry = listpack.get(0).unwrap();
     /// let total_bytes = entry.total_bytes();
@@ -1108,15 +1108,19 @@ impl_listpack_entry_removed_from_number!(i8, i16, i32, i64, u8, u16, u32, u64);
 /// A mutable reference to an entry in a listpack, mainly used for
 /// modifying the entry in place using the mutable iterator.
 #[derive(Debug)]
-pub struct ListpackEntryMutable<'a> {
-    listpack: &'a mut Listpack,
+pub struct ListpackEntryMutable<'a, Allocator> {
+    listpack: &'a mut Listpack<Allocator>,
     entry: &'a ListpackEntry,
     index: usize,
 }
 
-impl<'a> ListpackEntryMutable<'a> {
+impl<'a, Allocator> ListpackEntryMutable<'a, Allocator> {
     /// Creates a new mutable listpack entry reference object.
-    pub(crate) fn new(listpack: &'a mut Listpack, entry: &'a ListpackEntry, index: usize) -> Self {
+    pub(crate) fn new(
+        listpack: &'a mut Listpack<Allocator>,
+        entry: &'a ListpackEntry,
+        index: usize,
+    ) -> Self {
         Self {
             listpack,
             entry,
@@ -1141,7 +1145,7 @@ impl<'a> ListpackEntryMutable<'a> {
     }
 }
 
-impl<'a> Deref for ListpackEntryMutable<'a> {
+impl<'a, Allocator> Deref for ListpackEntryMutable<'a, Allocator> {
     type Target = ListpackEntry;
 
     fn deref(&self) -> &Self::Target {
