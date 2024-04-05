@@ -52,6 +52,7 @@
 pub mod allocator;
 pub mod entry;
 pub mod error;
+pub mod iter;
 pub mod listpack;
 mod redis_helpers;
 

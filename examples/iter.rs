@@ -18,9 +18,10 @@ fn main() {
         println!("Window: {window:?}");
     });
 
-    listpack.drain(0..1).for_each(|removed| {
-        println!("Drained entry: {removed}");
-    });
+    // TODO: uncomment this when the drain method is implemented.
+    // listpack.drain(0..1).for_each(|removed| {
+    //     println!("Drained entry: {removed}");
+    // });
 
     assert_eq!(listpack.len(), 1);
     assert_eq!(listpack.get(0).unwrap().to_string(), "world");

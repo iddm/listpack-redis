@@ -2,6 +2,8 @@
 
 use std::{ops::Deref, ptr::NonNull};
 
+use redis_custom_allocator::CustomAllocator;
+
 use crate::{error::Result, Listpack};
 
 /// The subencoding type of a listpack entry.
@@ -1108,13 +1110,19 @@ impl_listpack_entry_removed_from_number!(i8, i16, i32, i64, u8, u16, u32, u64);
 /// A mutable reference to an entry in a listpack, mainly used for
 /// modifying the entry in place using the mutable iterator.
 #[derive(Debug)]
-pub struct ListpackEntryMutable<'a, Allocator> {
+pub struct ListpackEntryMutable<'a, Allocator>
+where
+    Allocator: CustomAllocator,
+{
     listpack: &'a mut Listpack<Allocator>,
     entry: &'a ListpackEntry,
     index: usize,
 }
 
-impl<'a, Allocator> ListpackEntryMutable<'a, Allocator> {
+impl<'a, Allocator> ListpackEntryMutable<'a, Allocator>
+where
+    Allocator: CustomAllocator,
+{
     /// Creates a new mutable listpack entry reference object.
     pub(crate) fn new(
         listpack: &'a mut Listpack<Allocator>,
@@ -1145,7 +1153,10 @@ impl<'a, Allocator> ListpackEntryMutable<'a, Allocator> {
     }
 }
 
-impl<'a, Allocator> Deref for ListpackEntryMutable<'a, Allocator> {
+impl<'a, Allocator> Deref for ListpackEntryMutable<'a, Allocator>
+where
+    Allocator: CustomAllocator,
+{
     type Target = ListpackEntry;
 
     fn deref(&self) -> &Self::Target {
