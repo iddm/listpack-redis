@@ -20,6 +20,15 @@ use crate::{
 /// this value. It is used to detect overflows in the listpack.
 const END_MARKER: u8 = 0xFF;
 
+/// A location where an element should be inserted.
+#[derive(Debug, Copy, Clone)]
+pub enum InsertLocation {
+    /// Before the element specified by the index.
+    Before,
+    /// After the element specified by the index.
+    After,
+}
+
 /// The header of the listpack data structure. Can only be obtained
 /// from an existing listpack using the [`Listpack::header_ref`] method.
 #[repr(C, packed(1))]
@@ -1585,94 +1594,98 @@ where
         });
     }
 
-    // /// Removes the elements in the specified range from the listpack
-    // /// in bulk, returning all removed elements as an iterator.
-    // ///
-    // /// See [`ListpackDrain`].
-    // ///
-    // /// # Panics
-    // ///
-    // /// Panics if the starting point is greater than the end point
-    // /// or if the end point is greater than the length of the listpack.
-    // ///
-    // /// # Example
-    // ///
-    // /// ```
-    // /// use listpack_redis::Listpack;
-    // ///
-    // /// let mut listpack: Listpack = Listpack::default();
-    // /// listpack.push("Hello, world!");
-    // /// listpack.push("Hello!");
-    // /// listpack.push("World!");
-    // /// let removed = listpack.drain(1..3).collect::<Vec<_>>();
-    // /// assert_eq!(listpack.len(), 1);
-    // /// assert_eq!(removed.len(), 2);
-    // /// assert_eq!(removed[0].get_str().unwrap(), "Hello!");
-    // /// assert_eq!(removed[1].get_str().unwrap(), "World!");
-    // /// ```
-    // ///
-    // /// Use it the same way as [`Self::clear`], if you want to remove
-    // /// all elements from the listpack:
-    // ///
-    // /// ```
-    // /// use listpack_redis::Listpack;
-    // ///
-    // /// let mut listpack: Listpack = Listpack::default();
-    // /// listpack.push("Hello, world!");
-    // /// listpack.push("Hello!");
-    // /// listpack.push("World!");
-    // /// let removed = listpack.drain(..).collect::<Vec<_>>();
-    // /// assert!(listpack.is_empty());
-    // /// assert_eq!(removed.len(), 3);
-    // /// assert_eq!(removed[0].get_str().unwrap(), "Hello, world!");
-    // /// assert_eq!(removed[1].get_str().unwrap(), "Hello!");
-    // /// assert_eq!(removed[2].get_str().unwrap(), "World!");
-    // /// ```
-    // ///
-    // /// See [std::vec::Vec::drain] for more information.
-    // pub fn drain<R>(&mut self, range: R) -> impl std::iter::Iterator<Item = ListpackEntryRemoved>
-    // where
-    //     R: RangeBounds<usize>,
-    // {
-    //     unimplemented!("Drain is not implemented.");
-    // use std::ops::Bound;
+    /// Removes the elements in the specified range from the listpack
+    /// in bulk, returning all removed elements as an iterator.
+    ///
+    /// See [`ListpackDrain`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the starting point is greater than the end point
+    /// or if the end point is greater than the length of the listpack.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello, world!");
+    /// listpack.push("Hello!");
+    /// listpack.push("World!");
+    /// let removed = listpack.drain(1..3).collect::<Vec<_>>();
+    /// assert_eq!(listpack.len(), 1);
+    /// assert_eq!(removed.len(), 2);
+    /// assert_eq!(removed[0].get_str().unwrap(), "Hello!");
+    /// assert_eq!(removed[1].get_str().unwrap(), "World!");
+    /// ```
+    ///
+    /// Use it the same way as [`Self::clear`], if you want to remove
+    /// all elements from the listpack:
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello, world!");
+    /// listpack.push("Hello!");
+    /// listpack.push("World!");
+    /// let removed = listpack.drain(..).collect::<Vec<_>>();
+    /// assert!(listpack.is_empty());
+    /// assert_eq!(removed.len(), 3);
+    /// assert_eq!(removed[0].get_str().unwrap(), "Hello, world!");
+    /// assert_eq!(removed[1].get_str().unwrap(), "Hello!");
+    /// assert_eq!(removed[2].get_str().unwrap(), "World!");
+    /// ```
+    ///
+    /// See [std::vec::Vec::drain] for more information.
+    pub fn drain<R>(&mut self, range: R) -> impl std::iter::Iterator<Item = ListpackEntryRemoved>
+    where
+        R: RangeBounds<usize>,
+    {
+        // TODO: remove this, this is only to satisfy the compiler.
+        if false {
+            return std::iter::empty();
+        }
+        unimplemented!("Drain is not implemented.");
+        // use std::ops::Bound;
 
-    // let start = match range.start_bound() {
-    //     Bound::Included(&start) => start,
-    //     Bound::Excluded(&start) => start + 1,
-    //     Bound::Unbounded => 0,
-    // };
+        // let start = match range.start_bound() {
+        //     Bound::Included(&start) => start,
+        //     Bound::Excluded(&start) => start + 1,
+        //     Bound::Unbounded => 0,
+        // };
 
-    // let end = match range.end_bound() {
-    //     Bound::Included(&end) => end + 1,
-    //     Bound::Excluded(&end) => end,
-    //     Bound::Unbounded => self.len(),
-    // };
+        // let end = match range.end_bound() {
+        //     Bound::Included(&end) => end + 1,
+        //     Bound::Excluded(&end) => end,
+        //     Bound::Unbounded => self.len(),
+        // };
 
-    // if start > end {
-    //     panic!("The start is greater than the end.")
-    // } else if end > self.len() {
-    //     panic!("The end is greater than the length of the listpack.")
-    // }
+        // if start > end {
+        //     panic!("The start is greater than the end.")
+        // } else if end > self.len() {
+        //     panic!("The end is greater than the length of the listpack.")
+        // }
 
-    // let length = end - start;
-    // let removed_elements = self
-    //     .iter()
-    //     .skip(start)
-    //     .take(length)
-    //     .map(ListpackEntryRemoved::from)
-    //     .collect::<Vec<_>>();
-    // let ptr =
-    //     unsafe { bindings::lpDeleteRange(self.allocation.as_ptr(), start as _, length as _) };
+        // let length = end - start;
+        // let removed_elements = self
+        //     .iter()
+        //     .skip(start)
+        //     .take(length)
+        //     .map(ListpackEntryRemoved::from)
+        //     .collect::<Vec<_>>();
+        // let ptr =
+        //     unsafe { bindings::lpDeleteRange(self.allocation.as_ptr(), start as _, length as _) };
 
-    // if let Some(ptr) = NonNull::new(ptr) {
-    //     self.allocation = ptr;
-    // } else {
-    //     panic!("The range is out of bounds.");
-    // }
+        // if let Some(ptr) = NonNull::new(ptr) {
+        //     self.allocation = ptr;
+        // } else {
+        //     panic!("The range is out of bounds.");
+        // }
 
-    // removed_elements.into_iter()
-    // }
+        // removed_elements.into_iter()
+    }
 
     /// Appends all the elements of a slice to the listpack.
     ///

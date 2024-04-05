@@ -297,27 +297,25 @@ where
     }
 }
 
-// TODO: uncomment back
-// /// Removes the specified range from the vector in bulk, returning all
-// /// removed elements as an iterator. If the iterator is dropped before
-// /// being fully consumed, it drops the remaining removed elements.
-// ///
-// /// The returned iterator keeps a mutable borrow on the vector to
-// /// optimize its implementation.
-// ///
-// /// # Example
-// ///
-// /// ```
-// /// use listpack_redis::Listpack;
-// ///
-// /// let mut listpack: Listpack = Listpack::default();
-// /// listpack.push("Hello");
-// /// listpack.push("World");
-// /// listpack.push("!");
-// /// let removed = listpack.drain(..).collect::<Vec<_>>();
-// /// assert!(listpack.is_empty());
-// /// assert_eq!(removed.len(), 3);
-/// DOCUMENT ME
+/// Removes the specified range from the vector in bulk, returning all
+/// removed elements as an iterator. If the iterator is dropped before
+/// being fully consumed, it drops the remaining removed elements.
+///
+/// The returned iterator keeps a mutable borrow on the vector to
+/// optimize its implementation.
+///
+/// # Example
+///
+/// ```
+/// use listpack_redis::Listpack;
+///
+/// let mut listpack: Listpack = Listpack::default();
+/// listpack.push("Hello");
+/// listpack.push("World");
+/// listpack.push("!");
+/// let removed = listpack.drain(..).collect::<Vec<_>>();
+/// assert!(listpack.is_empty());
+/// assert_eq!(removed.len(), 3);
 
 #[derive(Debug)]
 pub struct ListpackDrain<'a, Allocator>
