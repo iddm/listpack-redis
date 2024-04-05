@@ -2,6 +2,8 @@
 
 use redis_custom_allocator::CustomAllocator;
 
+use std::fmt::Debug;
+
 /// The default [`crate::listpack::Listpack`] allocator.
 #[derive(Default, Debug, Copy, Clone)]
 pub struct DefaultAllocator;
@@ -38,3 +40,18 @@ impl CustomAllocator for DefaultAllocator {
         }
     }
 }
+
+// /// The allocator requirements for the listpack allocator.
+// pub trait ListpackAllocator<AllocatorError: Debug>:
+//     CustomAllocator<Error = AllocatorError> + Default + Debug + Clone
+// {
+// }
+
+/// The allocator requirements for the listpack allocator.
+pub trait ListpackAllocator: CustomAllocator + Default + Debug + Clone
+where
+    <Self as CustomAllocator>::Error: Debug,
+{
+}
+
+impl ListpackAllocator for DefaultAllocator {}

@@ -214,7 +214,7 @@ dependencies = [
 [[package]]
 name = "redis-custom-allocator"
 version = "0.1.0"
-source = "git+https://github.com/iddm/redis-custom-allocator#166daa493aca5fc954863b1c8c2046b4d580c02d"
+source = "git+https://github.com/iddm/redis-custom-allocator#acce431dd95578a9e51b722f3ea14c271952b968"
 
 [[package]]
 name = "regex"
@@ -272,9 +272,9 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "syn"
-version = "2.0.57"
+version = "2.0.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11a6ae1e52eb25aab8f3fb9fca13be982a373b8f1157ca14b897a825ba4a2d35"
+checksum = "44cfb93f38070beee36b3fef7d4f5a16f27751d94b187b666a5cc5e9b0d30687"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -27,15 +27,15 @@ pub enum InsertionError {
 impl std::fmt::Display for InsertionError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            InsertionError::StringIsEmpty => write!(f, "Provided string is empty."),
-            InsertionError::ListpackIsFull {
+            Self::StringIsEmpty => write!(f, "Provided string is empty."),
+            Self::ListpackIsFull {
                 current_length,
                 available_listpack_length,
             } => write!(
                 f,
                 "Object is too long: {current_length} > {available_listpack_length}"
             ),
-            InsertionError::IndexOutOfBounds { index, length } => {
+            Self::IndexOutOfBounds { index, length } => {
                 write!(f, "Index out of bounds: {index} > {length}")
             }
         }
@@ -43,6 +43,31 @@ impl std::fmt::Display for InsertionError {
 }
 
 impl std::error::Error for InsertionError {}
+
+/// An error happening during the allocation of a listpack or its values.
+#[derive(Debug, Copy, Clone)]
+pub enum AllocationError {
+    /// An attempt to allocate a listpack with a size bigger than the
+    /// header can hold (all in bytes).
+    ListpackIsTooBig {
+        /// The size of the listpack that caused the error.
+        size: usize,
+        /// The maximum size of the listpack.
+        max_size: usize,
+    },
+}
+
+impl std::fmt::Display for AllocationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::ListpackIsTooBig { size, max_size } => {
+                write!(f, "Listpack is too big: {size} > {max_size}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AllocationError {}
 
 /// The error type for the listpack crate.
 #[derive(Debug, Copy, Clone)]
@@ -65,8 +90,18 @@ pub enum Error {
     /// An error indicating that the listpack's entry contains an
     /// invalid string inside the data block.
     InvalidStringEncodingInsideDataBlock(Utf8Error),
+    /// When the end marker is missing from the listpack.
+    MissingEndMarker,
+    /// An error related to the allocation of memory.
+    Allocation(AllocationError),
     /// An error related to the insertion into the listpack.
     Insertion(InsertionError),
+}
+
+impl From<AllocationError> for Error {
+    fn from(e: AllocationError) -> Self {
+        Error::Allocation(e)
+    }
 }
 
 impl From<InsertionError> for Error {
@@ -78,17 +113,19 @@ impl From<InsertionError> for Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Error::UnknownEncodingType { encoding_byte } => {
+            Self::UnknownEncodingType { encoding_byte } => {
                 write!(f, "Unknown encoding byte: {encoding_byte:b}")
             }
-            Error::UnsupportedNumberDataTypeBitWidth { bit_width } => {
+            Self::UnsupportedNumberDataTypeBitWidth { bit_width } => {
                 write!(f, "Unsupported number data type bit width: {bit_width}")
             }
-            Error::MissingDataBlock => write!(f, "Missing data block"),
-            Error::InvalidStringEncodingInsideDataBlock(e) => {
+            Self::MissingDataBlock => write!(f, "Missing data block"),
+            Self::InvalidStringEncodingInsideDataBlock(e) => {
                 write!(f, "Invalid string inside data block: {e}")
             }
-            Error::Insertion(e) => write!(f, "Insertion error: {e}"),
+            Self::MissingEndMarker => write!(f, "Missing end marker"),
+            Self::Allocation(e) => write!(f, "Allocation error: {e}"),
+            Self::Insertion(e) => write!(f, "Insertion error: {e}"),
         }
     }
 }
@@ -96,4 +133,4 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// The result type for the listpack crate.
-pub type Result<T = ()> = std::result::Result<T, Error>;
+pub type Result<T = (), E = Error> = std::result::Result<T, E>;

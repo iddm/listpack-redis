@@ -1,15 +1,18 @@
 //! The listpack interface.
 
 use std::{
+    alloc::Layout,
     fmt::{Debug, Write},
     ops::{Index, RangeBounds},
     ptr::NonNull,
 };
 
+use redis_custom_allocator::{CustomAllocator, MemoryConsumption};
+
 use crate::{
-    bindings,
+    allocator::ListpackAllocator,
     entry::{ListpackEntry, ListpackEntryInsert, ListpackEntryMutable, ListpackEntryRemoved},
-    error::Result,
+    error::{AllocationError, Result},
 };
 
 /// The last byte of the allocator for the listpack should always be
@@ -42,6 +45,13 @@ pub struct ListpackHeader {
 }
 
 impl ListpackHeader {
+    /// The maximum number of bytes the listpack header may hold.
+    const MAXIMUM_TOTAL_BYTES: usize = std::mem::size_of_val(&Self::total_bytes) * 8;
+    /// The maximum number of bytes allowed to be used by the elements.
+    const MAXIMUM_ELEMENT_BYTES: usize = Self::MAXIMUM_TOTAL_BYTES
+        + std::mem::size_of_val(&END_MARKER)
+        - std::mem::size_of::<Self>();
+
     /// Returns the total amount of bytes representing the listpack.
     ///
     /// # Example
@@ -78,7 +88,7 @@ impl ListpackHeader {
     /// Returns the amount of bytes available for the listpack to store
     /// new elements.
     pub fn available_bytes(&self) -> usize {
-        (std::u32::MAX as usize) - self.total_bytes()
+        Self::MAXIMUM_TOTAL_BYTES - self.total_bytes()
     }
 }
 
@@ -120,6 +130,14 @@ impl ListpackHeaderRef<'_> {
         self.0.total_bytes as usize
     }
 
+    /// Returns the number of bytes the elements occupy in the listpack,
+    /// that is available right after the header.
+    pub fn element_bytes(&self) -> usize {
+        self.total_bytes()
+            - std::mem::size_of::<ListpackHeader>()
+            - std::mem::size_of_val(&END_MARKER)
+    }
+
     /// Returns the total number of elements the listpack holds.
     ///
     /// See [`ListpackHeader::num_elements`].
@@ -136,28 +154,107 @@ impl ListpackHeaderRef<'_> {
     }
 }
 
+#[derive(Debug, Copy, Clone)]
+struct HeaderPointer(NonNull<[u8]>, Layout);
+
+impl HeaderPointer {
+    /// Finds out the layout of the listpack by looking for the end
+    /// marker.
+    fn from_ptr(ptr: NonNull<[u8]>) -> Result<Self> {
+        // TODO: check that we could just check the last byte to be the
+        // end marker, instead of scanning the whole listpack.
+        unsafe { ptr.as_ref() }
+            .iter()
+            .enumerate()
+            .find_map(|(i, &b)| if b == END_MARKER { Some(i) } else { None })
+            .map(|end_index| {
+                // An impossible panic scenario, since all the
+                // requirements for calling this function are met.
+                let layout =
+                    Layout::from_size_align(end_index, 1).expect("Could not create layout");
+
+                Self(ptr, layout)
+            })
+            .ok_or(crate::error::Error::MissingEndMarker)
+    }
+
+    fn ptr(&self) -> NonNull<u8> {
+        self.0.cast()
+    }
+
+    fn layout(&self) -> Layout {
+        self.1
+    }
+}
+
+/// Represents the capacity of the listpack. The capacity is the number
+/// of bytes the listpack is allowed to use for storing elements,
+/// excluding the extra memory costs related to the header and the end
+/// marker, or any other data stored but unrelated to the elements.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct ListpackCapacity(usize);
+
+impl ListpackCapacity {
+    const ZERO: Self = Self(0);
+}
+
+impl TryFrom<usize> for ListpackCapacity {
+    type Error = crate::error::Error;
+
+    fn try_from(value: usize) -> Result<Self> {
+        if value > ListpackHeader::MAXIMUM_ELEMENT_BYTES {
+            return Err(AllocationError::ListpackIsTooBig {
+                size: value,
+                max_size: ListpackHeader::MAXIMUM_TOTAL_BYTES,
+            }
+            .into());
+        }
+
+        Ok(Self(value))
+    }
+}
+
+// /// A short-lived object to be used by [`crate::listpack::Listpack`] to
+// /// allocate memory. It is a little more convenient to use than the
+// /// [`crate::allocator::DefaultAllocator`] because it provides a
+// /// slightly more ergonomic interface.
+// #[repr(transparent)]
+// pub struct ListpackAllocatorImpl<'a, Allocator>(&'a Allocator);
+
+// impl<'a, Allocator> ListpackAllocatorImpl<'a, Allocator> {
+//     /// Create a new [`ListpackAllocator`] from a reference to an allocator.
+//     pub fn new(allocator: &'a Allocator) -> Self {
+//         Self(allocator)
+//     }
+// }
+
 /// The listpack data structure.
 pub struct Listpack<Allocator = crate::allocator::DefaultAllocator> {
-    /// A pointer to the listpack object in C.
-    ptr: NonNull<u8>,
+    allocation: HeaderPointer,
     allocator: Allocator,
 }
 
 impl<Allocator> Default for Listpack<Allocator>
 where
-    Allocator: Default,
+    Allocator: ListpackAllocator,
+    <Allocator as CustomAllocator>::Error: Debug,
 {
     fn default() -> Self {
         Self::with_capacity(0)
     }
 }
 
-impl<Allocator> Debug for Listpack<Allocator> {
+impl<Allocator> Debug for Listpack<Allocator>
+where
+    Allocator: Debug,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Listpack")
-            .field("ptr", &self.ptr)
+            .field("allocation", &self.allocation)
             // TODO: optimise to not use collection to vector.
             .field("elements", &self.iter().collect::<Vec<_>>())
+            .field("allocator", &self.allocator)
             .finish()
     }
 }
@@ -178,23 +275,39 @@ impl<Allocator> std::fmt::Display for Listpack<Allocator> {
     }
 }
 
-impl<Allocator> Drop for Listpack<Allocator> {
+impl<Allocator> Drop for Listpack<Allocator>
+where
+    Allocator: CustomAllocator, // Allocator: ListpackAllocator,
+                                // <Allocator as CustomAllocator>::Error: Debug,
+{
     fn drop(&mut self) {
-        unsafe { bindings::lpFree(self.ptr.as_ptr()) }
+        unsafe {
+            self.allocator
+                .deallocate(self.allocation.ptr(), self.allocation.layout())
+        }
     }
 }
 
 impl<Allocator> Clone for Listpack<Allocator>
 where
-    Allocator: Clone,
+    Allocator: ListpackAllocator,
+    <Allocator as CustomAllocator>::Error: Debug,
 {
     fn clone(&self) -> Self {
-        let ptr = unsafe { bindings::lpDup(self.ptr.as_ptr()) };
+        let mut cloned = Self::with_capacity_and_allocator(
+            self.get_header_ref().element_bytes(),
+            self.allocator.clone(),
+        );
 
-        Self {
-            ptr: NonNull::new(ptr).expect("The listpack clones fine."),
-            allocator: self.allocator.clone(),
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.as_ptr(),
+                cloned.as_mut_ptr(),
+                self.allocation.layout().size(),
+            );
         }
+
+        cloned
     }
 }
 
@@ -259,7 +372,8 @@ impl<'a, T, Allocator> From<&'a [T]> for Listpack<Allocator>
 where
     &'a T: Into<ListpackEntryInsert<'a>>,
     ListpackEntryInsert<'a>: std::convert::From<&'a T>,
-    Allocator: Default,
+    Allocator: ListpackAllocator,
+    <Allocator as CustomAllocator>::Error: Debug,
 {
     fn from(slice: &'a [T]) -> Self {
         let mut listpack = Listpack::with_capacity(slice.len());
@@ -275,7 +389,8 @@ impl<'a, T, const N: usize, Allocator> From<&'a [T; N]> for Listpack<Allocator>
 where
     &'a T: Into<ListpackEntryInsert<'a>>,
     ListpackEntryInsert<'a>: std::convert::From<&'a T>,
-    Allocator: Default,
+    Allocator: ListpackAllocator,
+    <Allocator as CustomAllocator>::Error: Debug,
 {
     fn from(slice: &'a [T; N]) -> Self {
         let mut listpack: Listpack<Allocator> = Listpack::with_capacity(slice.len());
@@ -289,7 +404,8 @@ where
 
 impl<Allocator> Listpack<Allocator>
 where
-    Allocator: Clone,
+    Allocator: ListpackAllocator,
+    <Allocator as CustomAllocator>::Error: Debug,
 {
     /// Splits the listpack into two at the given index. Returns a new
     /// listpack containing the elements from `at` to the end, and
@@ -333,17 +449,6 @@ where
     }
 }
 
-impl<Allocator> Listpack<Allocator>
-where
-    Allocator: Default,
-{
-    /// Creates a new listpack with the given capacity. A shorthand for
-    /// `Listpack::with_capacity_and_allocator(capacity, Allocator::default())`.
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self::with_capacity_and_allocator(capacity, Allocator::default())
-    }
-}
-
 /// Allocator-related methods.
 impl<Allocator> Listpack<Allocator> {
     /// Returns the allocator of the listpack.
@@ -357,7 +462,27 @@ impl<Allocator> Listpack<Allocator> {
     }
 }
 
-impl<Allocator> Listpack<Allocator> {
+impl<Allocator> Listpack<Allocator>
+where
+    Allocator: ListpackAllocator,
+    <Allocator as CustomAllocator>::Error: Debug,
+    // crate::error::Error: From<<Allocator as CustomAllocator>::Error>,
+{
+    /// Creates a new listpack with the given capacity. A shorthand for
+    /// `Listpack::with_capacity_and_allocator(capacity, Allocator::default())`.
+    pub fn with_capacity<T>(capacity: T) -> Self
+    where
+        T: TryInto<ListpackCapacity>,
+    {
+        Self::with_capacity_and_allocator(capacity, Allocator::default())
+    }
+}
+
+impl<Allocator, AllocatorError> Listpack<Allocator>
+where
+    Allocator: CustomAllocator<Error = AllocatorError>,
+    AllocatorError: Debug,
+{
     /// Returns a new listpack.
     ///
     /// # Example
@@ -371,10 +496,51 @@ impl<Allocator> Listpack<Allocator> {
     /// assert!(listpack.is_empty());
     /// ```
     pub fn new(allocator: Allocator) -> Self {
-        Self::with_capacity_and_allocator(0, allocator)
+        Self::with_capacity_and_allocator(ListpackCapacity::ZERO, allocator)
     }
 
-    /// Creates a new listpack with the given capacity.
+    fn allocate_header_for_capacity(
+        allocator: &Allocator,
+        capacity: ListpackCapacity,
+    ) -> Result<HeaderPointer, AllocatorError> {
+        let bytes_to_allocate = capacity.0;
+
+        // This is an impossible situation, as the maximum size of the
+        // is already checked in the `ListpackCapacity::try_from`.
+        let total_bytes: u32 = capacity
+            .0
+            .try_into()
+            .expect("The bytes to allocate fits into the header.");
+
+        // Another impossible scenario, as we have fully satisfy the
+        // requirements for this function to avoid returning an error.
+        let layout = std::alloc::Layout::from_size_align(bytes_to_allocate, 1)
+            .expect("Could not create layout");
+
+        let mut ptr = allocator.allocate(layout)?;
+
+        let mut header_ptr = ptr.cast().as_ptr() as *mut ListpackHeader;
+
+        unsafe {
+            *header_ptr = ListpackHeader {
+                total_bytes,
+                num_elements: 0,
+            };
+        }
+
+        Ok(HeaderPointer(ptr, layout))
+    }
+
+    /// Creates a new listpack with the given capacity (the number of
+    /// bytes). There is no notion of "capacity" in the listpack, as it
+    /// is a single allocation and all the elements may vary in size.
+    ///
+    /// The allocated amount will be the given capacity plus the size
+    /// of the listpack header and the end marker.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the capacity is too big to be stored in the listpack.
     ///
     /// # Example
     ///
@@ -384,14 +550,27 @@ impl<Allocator> Listpack<Allocator> {
     /// let listpack: Listpack = Listpack::with_capacity(10);
     /// assert!(listpack.is_empty());
     /// ```
-    pub fn with_capacity_and_allocator(capacity: usize, allocator: Allocator) -> Self {
+    pub fn with_capacity_and_allocator<T>(capacity: T, allocator: Allocator) -> Self
+    where
+        T: TryInto<ListpackCapacity>,
+    {
+        let capacity = match capacity.try_into() {
+            Ok(capacity) => capacity,
+            Err(e) => panic!("Couldn't convert the provided capacity to  listpack capacity"),
+        };
+
+        // TODO: provide the error back to the user.
+        let allocation = Self::allocate_header_for_capacity(&allocator, capacity)
+            .expect("Allocated header successfully.");
+
         Self {
-            ptr: NonNull::new(unsafe { bindings::lpNew(capacity) })
-                .expect("could not create listpack"),
+            allocation,
             allocator,
         }
     }
+}
 
+impl<Allocator> Listpack<Allocator> {
     /// Creates a new listpack from the given raw pointer.
     ///
     /// # Safety
@@ -420,8 +599,13 @@ impl<Allocator> Listpack<Allocator> {
     /// // double-free.
     /// std::mem::forget(old);
     /// ```
-    pub unsafe fn from_raw_parts(ptr: NonNull<u8>, allocator: Allocator) -> Self {
-        Self { ptr, allocator }
+    pub unsafe fn from_raw_parts(ptr: NonNull<[u8]>, allocator: Allocator) -> Self {
+        let allocation = HeaderPointer::from_ptr(ptr).expect("The listpack is valid.");
+
+        Self {
+            allocation,
+            allocator,
+        }
     }
 
     /// An unsafe way to obtain an immutable reference to the listpack
@@ -447,7 +631,7 @@ impl<Allocator> Listpack<Allocator> {
     pub unsafe fn header_ref(&self) -> ListpackHeaderRef {
         // &*(self.ptr.as_ptr() as *const ListpackHeader)
         ListpackHeaderRef(
-            (self.ptr.as_ptr() as *const ListpackHeader)
+            (self.as_ptr() as *const ListpackHeader)
                 .as_ref()
                 .expect("Header is valid"),
         )
@@ -465,7 +649,7 @@ impl<Allocator> Listpack<Allocator> {
     /// assert_eq!(listpack.len(), 1);
     /// ```
     pub fn len(&self) -> usize {
-        unsafe { bindings::lpLength(self.ptr.as_ptr()) as usize }
+        self.get_header_ref().num_elements()
     }
 
     /// Returns the length of the listpack, describing how many elements
@@ -514,12 +698,15 @@ impl<Allocator> Listpack<Allocator> {
     // /// See [`Listpack::get_storage_bytes`] and
     // /// [`Listpack::get_total_bytes`] for more information.
     pub fn shrink_to_fit(&mut self) -> bool {
-        if let Some(ptr) = NonNull::new(unsafe { bindings::lpShrinkToFit(self.ptr.as_ptr()) }) {
-            self.ptr = ptr;
-            true
-        } else {
-            false
-        }
+        unimplemented!("Shrink to fit is not implemented.")
+        // if let Some(ptr) =
+        //     NonNull::new(unsafe { bindings::lpShrinkToFit(self.allocation.as_ptr()) })
+        // {
+        //     self.allocation = ptr;
+        //     true
+        // } else {
+        //     false
+        // }
     }
 
     /// Truncates the listpack, keeping only the first `len` elements.
@@ -538,17 +725,19 @@ impl<Allocator> Listpack<Allocator> {
     /// listpack.truncate(1);
     /// assert_eq!(listpack.len(), 1);
     pub fn truncate(&mut self, len: usize) {
-        if len > self.len() {
-            return;
-        }
+        unimplemented!("Truncate is not implemented.")
+        // if len > self.len() {
+        //     return;
+        // }
 
-        let start = len;
-        let length = self.len() - len;
-        let ptr = unsafe { bindings::lpDeleteRange(self.ptr.as_ptr(), start as _, length as _) };
+        // let start = len;
+        // let length = self.len() - len;
+        // let ptr =
+        //     unsafe { bindings::lpDeleteRange(self.allocation.as_ptr(), start as _, length as _) };
 
-        if let Some(ptr) = NonNull::new(ptr) {
-            self.ptr = ptr;
-        }
+        // if let Some(ptr) = NonNull::new(ptr) {
+        //     self.allocation = ptr;
+        // }
     }
 
     /// Returns a raw pointer to the listpack. The returned pointer is
@@ -564,7 +753,7 @@ impl<Allocator> Listpack<Allocator> {
     /// assert!(!ptr.is_null());
     /// ```
     pub fn as_ptr(&self) -> *const u8 {
-        self.ptr.as_ptr()
+        self.allocation.0.as_ptr().cast()
     }
 
     /// Returns a mutable raw pointer to the listpack. The returned
@@ -580,7 +769,7 @@ impl<Allocator> Listpack<Allocator> {
     /// assert!(!ptr.is_null());
     /// ```
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.ptr.as_ptr()
+        self.allocation.0.as_ptr().cast()
     }
 
     /// Clears the entire listpack. Same as calling [`Self::truncate()`]
@@ -683,7 +872,8 @@ impl<Allocator> Listpack<Allocator> {
     /// assert_eq!(listpack.get(3).unwrap().to_string(), "3");
     /// ```
     pub fn insert<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
-        self.insert_internal(index, entry, bindings::LP_BEFORE)
+        unimplemented!("Insert is not implemented.")
+        // self.insert_internal(index, entry, bindings::LP_BEFORE)
     }
 
     /// Inserts an element at the given index into the listpack.
@@ -711,7 +901,8 @@ impl<Allocator> Listpack<Allocator> {
         index: usize,
         entry: T,
     ) -> Result {
-        self.try_insert_internal(index, entry, bindings::LP_BEFORE)
+        unimplemented!("Try insert is not implemented.")
+        // self.try_insert_internal(index, entry, bindings::LP_BEFORE)
     }
 
     fn insert_internal<'a, T: Into<ListpackEntryInsert<'a>>>(
@@ -730,57 +921,58 @@ impl<Allocator> Listpack<Allocator> {
         entry: T,
         location: u32,
     ) -> Result {
-        let entry = entry.into();
+        unimplemented!("Try insert internal is not implemented.")
+        // let entry = entry.into();
 
-        let referred_element_ptr =
-            NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) }).ok_or(
-                crate::error::InsertionError::IndexOutOfBounds {
-                    index,
-                    length: self.len(),
-                },
-            )?;
+        // let referred_element_ptr =
+        //     NonNull::new(unsafe { bindings::lpSeek(self.allocation.as_ptr(), index as _) }).ok_or(
+        //         crate::error::InsertionError::IndexOutOfBounds {
+        //             index,
+        //             length: self.len(),
+        //         },
+        //     )?;
 
-        if let Some(e) = self.can_fit_entry(
-            &entry,
-            Some(ListpackEntry::ref_from_ptr(referred_element_ptr)),
-        ) {
-            return Err(e);
-        }
+        // if let Some(e) = self.can_fit_entry(
+        //     &entry,
+        //     Some(ListpackEntry::ref_from_ptr(referred_element_ptr)),
+        // ) {
+        //     return Err(e);
+        // }
 
-        let ptr = NonNull::new(match entry {
-            ListpackEntryInsert::String(s) => {
-                let string_ptr = s.as_ptr() as *mut _;
-                let len_bytes = s.len();
+        // let ptr = NonNull::new(match entry {
+        //     ListpackEntryInsert::String(s) => {
+        //         let string_ptr = s.as_ptr() as *mut _;
+        //         let len_bytes = s.len();
 
-                unsafe {
-                    bindings::lpInsertString(
-                        self.ptr.as_ptr(),
-                        string_ptr,
-                        len_bytes as _,
-                        referred_element_ptr.as_ptr(),
-                        location as _,
-                        std::ptr::null_mut(),
-                    )
-                }
-            }
-            ListpackEntryInsert::Integer(n) => unsafe {
-                bindings::lpInsertInteger(
-                    self.ptr.as_ptr(),
-                    n,
-                    referred_element_ptr.as_ptr(),
-                    location as _,
-                    std::ptr::null_mut(),
-                )
-            },
-        })
-        .ok_or(crate::error::InsertionError::ListpackIsFull {
-            current_length: entry.full_encoded_size(),
-            available_listpack_length: unsafe { self.header_ref().available_bytes() },
-        })?;
+        //         unsafe {
+        //             bindings::lpInsertString(
+        //                 self.allocation.as_ptr(),
+        //                 string_ptr,
+        //                 len_bytes as _,
+        //                 referred_element_ptr.as_ptr(),
+        //                 location as _,
+        //                 std::ptr::null_mut(),
+        //             )
+        //         }
+        //     }
+        //     ListpackEntryInsert::Integer(n) => unsafe {
+        //         bindings::lpInsertInteger(
+        //             self.allocation.as_ptr(),
+        //             n,
+        //             referred_element_ptr.as_ptr(),
+        //             location as _,
+        //             std::ptr::null_mut(),
+        //         )
+        //     },
+        // })
+        // .ok_or(crate::error::InsertionError::ListpackIsFull {
+        //     current_length: entry.full_encoded_size(),
+        //     available_listpack_length: unsafe { self.header_ref().available_bytes() },
+        // })?;
 
-        self.ptr = ptr;
+        // self.allocation = ptr;
 
-        Ok(())
+        // Ok(())
     }
 
     /// Checks that the passed element can be inserted into the
@@ -888,26 +1080,27 @@ impl<Allocator> Listpack<Allocator> {
     /// assert_eq!(listpack.len(), 1);
     /// ```
     pub fn try_push<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, entry: T) -> Result {
-        let entry = entry.into();
+        unimplemented!("Try push is not implemented.")
+        // let entry = entry.into();
 
-        if let Some(e) = self.can_fit_entry(&entry, None) {
-            return Err(e);
-        }
+        // if let Some(e) = self.can_fit_entry(&entry, None) {
+        //     return Err(e);
+        // }
 
-        self.ptr = NonNull::new(match entry {
-            ListpackEntryInsert::String(s) => {
-                let string_ptr = s.as_ptr() as *mut _;
-                let len_bytes = s.len();
+        // self.allocation = NonNull::new(match entry {
+        //     ListpackEntryInsert::String(s) => {
+        //         let string_ptr = s.as_ptr() as *mut _;
+        //         let len_bytes = s.len();
 
-                unsafe { bindings::lpAppend(self.ptr.as_ptr(), string_ptr, len_bytes as _) }
-            }
-            ListpackEntryInsert::Integer(n) => unsafe {
-                bindings::lpAppendInteger(self.ptr.as_ptr(), n)
-            },
-        })
-        .expect("Appended to listpack");
+        //         unsafe { bindings::lpAppend(self.allocation.as_ptr(), string_ptr, len_bytes as _) }
+        //     }
+        //     ListpackEntryInsert::Integer(n) => unsafe {
+        //         bindings::lpAppendInteger(self.allocation.as_ptr(), n)
+        //     },
+        // })
+        // .expect("Appended to listpack");
 
-        Ok(())
+        // Ok(())
     }
 
     /// Removes the element at the given index from the listpack and
@@ -1057,42 +1250,44 @@ impl<Allocator> Listpack<Allocator> {
     where
         R: RangeBounds<usize>,
     {
-        use std::ops::Bound;
+        unimplemented!("Drain is not implemented.")
+        // use std::ops::Bound;
 
-        let start = match range.start_bound() {
-            Bound::Included(&start) => start,
-            Bound::Excluded(&start) => start + 1,
-            Bound::Unbounded => 0,
-        };
+        // let start = match range.start_bound() {
+        //     Bound::Included(&start) => start,
+        //     Bound::Excluded(&start) => start + 1,
+        //     Bound::Unbounded => 0,
+        // };
 
-        let end = match range.end_bound() {
-            Bound::Included(&end) => end + 1,
-            Bound::Excluded(&end) => end,
-            Bound::Unbounded => self.len(),
-        };
+        // let end = match range.end_bound() {
+        //     Bound::Included(&end) => end + 1,
+        //     Bound::Excluded(&end) => end,
+        //     Bound::Unbounded => self.len(),
+        // };
 
-        if start > end {
-            panic!("The start is greater than the end.")
-        } else if end > self.len() {
-            panic!("The end is greater than the length of the listpack.")
-        }
+        // if start > end {
+        //     panic!("The start is greater than the end.")
+        // } else if end > self.len() {
+        //     panic!("The end is greater than the length of the listpack.")
+        // }
 
-        let length = end - start;
-        let removed_elements = self
-            .iter()
-            .skip(start)
-            .take(length)
-            .map(ListpackEntryRemoved::from)
-            .collect::<Vec<_>>();
-        let ptr = unsafe { bindings::lpDeleteRange(self.ptr.as_ptr(), start as _, length as _) };
+        // let length = end - start;
+        // let removed_elements = self
+        //     .iter()
+        //     .skip(start)
+        //     .take(length)
+        //     .map(ListpackEntryRemoved::from)
+        //     .collect::<Vec<_>>();
+        // let ptr =
+        //     unsafe { bindings::lpDeleteRange(self.allocation.as_ptr(), start as _, length as _) };
 
-        if let Some(ptr) = NonNull::new(ptr) {
-            self.ptr = ptr;
-        } else {
-            panic!("The range is out of bounds.");
-        }
+        // if let Some(ptr) = NonNull::new(ptr) {
+        //     self.allocation = ptr;
+        // } else {
+        //     panic!("The range is out of bounds.");
+        // }
 
-        removed_elements.into_iter()
+        // removed_elements.into_iter()
     }
 
     /// Appends all the elements of a slice to the listpack.
@@ -1379,17 +1574,18 @@ impl<Allocator> Listpack<Allocator> {
     /// assert_eq!(removed.get_str().unwrap(), "Hello, world!");
     /// ```
     pub fn pop(&mut self) -> Option<ListpackEntryRemoved> {
-        let ptr = NonNull::new(unsafe { bindings::lpLast(self.ptr.as_ptr()) });
+        unimplemented!("Pop is not implemented.")
+        // let ptr = NonNull::new(unsafe { bindings::lpLast(self.allocation.as_ptr()) });
 
-        if let Some(ptr) = ptr {
-            let cloned = ListpackEntryRemoved::from(ptr);
-            self.ptr = NonNull::new(unsafe {
-                bindings::lpDelete(self.ptr.as_ptr(), ptr.as_ptr(), std::ptr::null_mut())
-            })?;
-            Some(cloned)
-        } else {
-            None
-        }
+        // if let Some(ptr) = ptr {
+        //     let cloned = ListpackEntryRemoved::from(ptr);
+        //     self.allocation = NonNull::new(unsafe {
+        //         bindings::lpDelete(self.allocation.as_ptr(), ptr.as_ptr(), std::ptr::null_mut())
+        //     })?;
+        //     Some(cloned)
+        // } else {
+        //     None
+        // }
     }
 
     // Commented out, as there is no such method in listpack C API as
@@ -1717,8 +1913,15 @@ impl<Allocator> IntoIterator for Listpack<Allocator> {
 impl<Allocator> Listpack<Allocator> {
     /// Returns a pointer to the listpack's entry at the given index.
     fn get_internal_entry_ptr(&self, index: usize) -> Option<NonNull<u8>> {
-        NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
+        unimplemented!("Get internal entry pointer is not implemented.")
+        // NonNull::new(unsafe { bindings::lpSeek(self.allocation.as_ptr(), index as _) })
     }
+
+    /// Returns a pointer to the listpack's header.
+    fn get_header_ref<'a>(&'a self) -> ListpackHeaderRef<'a> {
+        unsafe { self.header_ref() }
+    }
+
     /// Returns the amount of bytes used by the listpack to store the
     /// elements.
     ///
@@ -1737,7 +1940,7 @@ impl<Allocator> Listpack<Allocator> {
     /// assert_eq!(listpack.get_storage_bytes(), 22);
     /// ```
     pub fn get_storage_bytes(&self) -> usize {
-        unsafe { bindings::lpBytes(self.ptr.as_ptr()) }
+        self.get_header_ref().total_bytes()
     }
 
     // Commented out, as listpack C API doesn't provide a method to
@@ -1783,17 +1986,19 @@ impl<Allocator> Listpack<Allocator> {
     /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello, world!");
     /// ```
     pub fn remove_range(&mut self, start: usize, length: usize) {
-        if start + length > self.len() {
-            panic!("The range is out of bounds.");
-        }
+        unimplemented!("Remove range is not implemented.")
+        // if start + length > self.len() {
+        //     panic!("The range is out of bounds.");
+        // }
 
-        let ptr = unsafe { bindings::lpDeleteRange(self.ptr.as_ptr(), start as _, length as _) };
+        // let ptr =
+        //     unsafe { bindings::lpDeleteRange(self.allocation.as_ptr(), start as _, length as _) };
 
-        if let Some(ptr) = NonNull::new(ptr) {
-            self.ptr = ptr;
-        } else {
-            panic!("The delete range failed.");
-        }
+        // if let Some(ptr) = NonNull::new(ptr) {
+        //     self.allocation = ptr;
+        // } else {
+        //     panic!("The delete range failed.");
+        // }
     }
 
     /// Inserts an element at the given index into the listpack, after
@@ -1817,7 +2022,8 @@ impl<Allocator> Listpack<Allocator> {
     /// assert_eq!(listpack.get(1).unwrap().to_string(), "Hello!");
     /// ```
     pub fn insert_after<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
-        self.insert_internal(index, entry, bindings::LP_AFTER)
+        unimplemented!("Insert after is not implemented.")
+        // self.insert_internal(index, entry, bindings::LP_AFTER)
     }
 
     /// Inserts an element at the given index into the listpack, after
@@ -1843,7 +2049,8 @@ impl<Allocator> Listpack<Allocator> {
         index: usize,
         entry: T,
     ) -> Result {
-        self.try_insert_internal(index, entry, bindings::LP_AFTER)
+        unimplemented!("Try insert after is not implemented.")
+        // self.try_insert_internal(index, entry, bindings::LP_AFTER)
     }
 
     /// Replaces the element at the given index with the given element.
@@ -1865,7 +2072,8 @@ impl<Allocator> Listpack<Allocator> {
     /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello!");
     /// ```
     pub fn replace<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
-        self.insert_internal(index, entry, bindings::LP_REPLACE)
+        unimplemented!("Replace is not implemented.")
+        // self.insert_internal(index, entry, bindings::LP_REPLACE)
     }
 
     /// Replaces the element at the given index with the given element.
@@ -1891,7 +2099,8 @@ impl<Allocator> Listpack<Allocator> {
         index: usize,
         entry: T,
     ) -> Result {
-        self.try_insert_internal(index, entry, bindings::LP_REPLACE)
+        unimplemented!("Try replace is not implemented.")
+        // self.try_insert_internal(index, entry, bindings::LP_REPLACE)
     }
 }
 
@@ -2135,7 +2344,10 @@ pub struct ListpackChunks<'a, Allocator> {
     index: usize,
 }
 
-impl<'a, Allocator> Iterator for ListpackChunks<'a, Allocator> {
+impl<'a, Allocator> Iterator for ListpackChunks<'a, Allocator>
+where
+    Allocator: CustomAllocator,
+{
     type Item = Vec<&'a ListpackEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -2183,7 +2395,10 @@ pub struct ListpackDrain<'a, Allocator> {
     end: usize,
 }
 
-impl<'a, Allocator> Iterator for ListpackDrain<'a, Allocator> {
+impl<'a, Allocator> Iterator for ListpackDrain<'a, Allocator>
+where
+    Allocator: CustomAllocator,
+{
     type Item = ListpackEntryRemoved;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -2198,7 +2413,10 @@ impl<'a, Allocator> Iterator for ListpackDrain<'a, Allocator> {
     }
 }
 
-impl<'a, Allocator> DoubleEndedIterator for ListpackDrain<'a, Allocator> {
+impl<'a, Allocator> DoubleEndedIterator for ListpackDrain<'a, Allocator>
+where
+    Allocator: CustomAllocator,
+{
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.offset >= self.end - self.start || self.offset + self.start >= self.listpack.len() {
             return None;
@@ -2213,19 +2431,20 @@ impl<'a, Allocator> DoubleEndedIterator for ListpackDrain<'a, Allocator> {
 
 impl<Allocator> Drop for ListpackDrain<'_, Allocator> {
     fn drop(&mut self) {
-        let ptr = unsafe {
-            bindings::lpDeleteRange(
-                self.listpack.ptr.as_ptr(),
-                (self.start + self.offset) as _,
-                (self.end - self.start - self.offset) as _,
-            )
-        };
+        unimplemented!("Drop is not implemented.")
+        // let ptr = unsafe {
+        //     bindings::lpDeleteRange(
+        //         self.listpack.allocation.as_ptr(),
+        //         (self.start + self.offset) as _,
+        //         (self.end - self.start - self.offset) as _,
+        //     )
+        // };
 
-        if let Some(ptr) = NonNull::new(ptr) {
-            self.listpack.ptr = ptr;
-        } else {
-            panic!("The range is out of bounds.");
-        }
+        // if let Some(ptr) = NonNull::new(ptr) {
+        //     self.listpack.allocation = ptr;
+        // } else {
+        //     panic!("The range is out of bounds.");
+        // }
     }
 }
 
