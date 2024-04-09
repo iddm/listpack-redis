@@ -422,7 +422,7 @@ where
         unsafe {
             std::ptr::copy_nonoverlapping(
                 self.as_ptr(),
-                cloned.as_mut_ptr(),
+                cloned.as_mut_ptr().cast(),
                 self.allocation.layout().size(),
             );
         }
@@ -611,13 +611,20 @@ where
     /// let ptr = listpack.as_mut_ptr();
     /// assert!(!ptr.is_null());
     /// ```
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.allocation.0.as_ptr().cast()
+    pub fn as_mut_ptr(&mut self) -> *mut [u8] {
+        self.allocation.0.as_ptr()
     }
 
     /// Returns a mutable reference to the listpack header.
     pub fn get_header_mut(&mut self) -> &mut ListpackHeader {
-        unsafe { self.as_mut_ptr().cast::<ListpackHeader>().as_mut().unwrap() }
+        unsafe {
+            self.allocation
+                .0
+                .as_ptr()
+                .cast::<ListpackHeader>()
+                .as_mut()
+                .unwrap()
+        }
     }
 
     /// Returns the number of elements of this listpack.
@@ -2209,6 +2216,7 @@ where
 
     /// Validates the listpack by iterating over its memory and
     /// checking that the entries are correctly formatted.
+    #[allow(unused)]
     fn validate(&self) -> Result {
         if self.is_empty() {
             return Ok(());
