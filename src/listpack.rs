@@ -129,6 +129,12 @@ impl ListpackHeader {
 
     /// Returns the amount of bytes available for the listpack to store
     /// new elements.
+    ///
+    /// # Note
+    ///
+    /// This is with regards to the maximum possible value
+    /// a listpack can hold in general, not of the current particular
+    /// listpack.
     pub fn available_bytes(&self) -> usize {
         Self::MAXIMUM_TOTAL_BYTES - self.total_bytes()
     }
@@ -501,11 +507,25 @@ where
     <Allocator as CustomAllocator>::Error: Debug,
 {
     fn from(slice: &'a [T]) -> Self {
-        let mut listpack = Listpack::with_capacity(slice.len());
-        for item in slice {
-            let item: ListpackEntryInsert<'a> = ListpackEntryInsert::from(item);
-            listpack.push(item);
+        let items = slice
+            .into_iter()
+            .map(ListpackEntryInsert::from)
+            .collect::<Vec<_>>();
+        let elements_size: usize = items
+            .iter()
+            .map(ListpackEntryInsert::full_encoded_size)
+            .sum();
+        let listpack = Listpack::with_capacity(elements_size);
+        let mut ptr = listpack.allocation.data_start_ptr();
+
+        for item in items {
+            let encoded = item.encode().expect("Encoded value");
+            unsafe {
+                std::ptr::copy_nonoverlapping(ptr, encoded.as_ptr().cast_mut(), encoded.len());
+            }
+            ptr = unsafe { ptr.add(encoded.len()) };
         }
+
         listpack
     }
 }
@@ -771,7 +791,7 @@ where
                     return Err(crate::error::InsertionError::StringIsEmpty.into());
                 }
 
-                if len_bytes > std::u32::MAX as usize {
+                if len_bytes > available_listpack_length as usize {
                     return Err(crate::error::InsertionError::ListpackIsFull {
                         current_length: len_bytes,
                         available_listpack_length,
@@ -1192,11 +1212,10 @@ impl<Allocator> Listpack<Allocator>
 where
     Allocator: ListpackAllocator,
     <Allocator as CustomAllocator>::Error: Debug,
-    // crate::error::Error: From<<Allocator as CustomAllocator>::Error>,
 {
     /// Creates a new listpack with the given capacity. A shorthand for
     /// `Listpack::with_capacity_and_allocator(capacity, Allocator::default())`.
-    pub fn with_capacity<T>(capacity: T) -> Self
+    fn with_capacity<T>(capacity: T) -> Self
     where
         T: TryInto<ListpackCapacity>,
     {
@@ -1238,7 +1257,7 @@ where
             .try_into()
             .expect("The bytes to allocate fits into the header.");
 
-        // Another impossible scenario, as we have fully satisfy the
+        // Another impossible scenario, as we have fully satisfied the
         // requirements for this function to avoid returning an error.
         let layout = std::alloc::Layout::from_size_align(bytes_to_allocate, 1)
             .expect("Could not create layout");
@@ -1254,12 +1273,21 @@ where
             };
         }
 
-        Ok(ListpackAllocationPointer(ptr, layout))
+        let mut pointer = ListpackAllocationPointer(ptr, layout);
+
+        pointer.set_end_marker();
+
+        Ok(pointer)
     }
 
     /// Creates a new listpack with the given capacity (the number of
     /// bytes). There is no notion of "capacity" in the listpack, as it
-    /// is a single allocation and all the elements may vary in size.
+    /// is a single allocation and all the elements may vary in size,
+    /// and the main purpose of the data structure is to be compressed.
+    ///
+    /// However, in certain use-cases it is useful to pre-allocate the
+    /// memory for the listpack, so that the listpack doesn't have to
+    /// reallocate the memory every time a new element is added.
     ///
     /// The allocated amount will be the given capacity plus the size
     /// of the listpack header and the end marker.
@@ -1276,13 +1304,13 @@ where
     /// let listpack: Listpack = Listpack::with_capacity(10);
     /// assert!(listpack.is_empty());
     /// ```
-    pub fn with_capacity_and_allocator<T>(capacity: T, allocator: Allocator) -> Self
+    fn with_capacity_and_allocator<T>(capacity: T, allocator: Allocator) -> Self
     where
         T: TryInto<ListpackCapacity>,
     {
         let capacity = match capacity.try_into() {
             Ok(capacity) => capacity,
-            Err(e) => panic!("Couldn't convert the provided capacity to  listpack capacity"),
+            Err(_) => panic!("Couldn't convert the provided capacity to listpack capacity"),
         };
 
         // TODO: provide the error back to the user.
@@ -2305,7 +2333,7 @@ where
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack: Listpack = Listpack::with_capacity(10);
+    /// let mut listpack: Listpack = Listpack::default();
     /// assert_eq!(listpack.get_storage_bytes(), 7);
     /// listpack.push("Hello, world!");
     /// assert_eq!(listpack.get_storage_bytes(), 22);
