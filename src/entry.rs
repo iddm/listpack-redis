@@ -2,9 +2,13 @@
 
 use std::{ops::Deref, ptr::NonNull};
 
+use libc::strspn;
 use redis_custom_allocator::CustomAllocator;
 
 use crate::{error::Result, Listpack};
+
+const SMALL_STRING_MAXIMUM_LENGTH: usize = 63;
+const MEDIUM_STRING_MAXIMUM_LENGTH: usize = 4095;
 
 /// The encoded presentation of the object as a byte array.
 pub trait Encode {
@@ -445,38 +449,178 @@ impl<'a> Encode for ListpackEntryData<'a> {
     /// block, and is encoded as a variable-length integer from right
     /// to left.
     fn encode(&self) -> Result<Vec<u8>> {
-        let mut data = self.encoding_type().encode()?;
+        let encoding_type_byte: u8 = self.encoding_type().into();
 
         // TODO: can be optimised without an allocation to a vec, but
         // rather going through the bytes of the target object instead.
-        let mut total_element_length = match self {
+        Ok(match self {
             // The small unsigned integer is embedded into the encoding
             // byte itself, so appending only the total-element-length
             // byte which equals to two: the encoding byte and the
             // total-element-length byte itself.
-            Self::SmallUnsignedInteger(u) => vec![2],
-            Self::SignedInteger13Bit(i) | Self::SignedInteger16Bit(i) => {
-                let mut data = i.to_be_bytes().to_vec();
-                encode_total_element_length(data.len() + 1)?
+            Self::SmallUnsignedInteger(u) => vec![u & 0b01111111, 2],
+            Self::SignedInteger13Bit(i) => {
+                let mut block = vec![
+                    // encoding_type_byte | ((i >> 11) as u8 & 0b00011111)
+                    encoding_type_byte | ((i >> 8) as u8),
+                    (*i as u8),
+                ];
+
+                let mut length = encode_total_element_length(block.len())?;
+                block.append(&mut length);
+                block
+            }
+            Self::SignedInteger16Bit(i) => {
+                let mut block = vec![encoding_type_byte];
+
+                let mut data = i.to_le_bytes().to_vec();
+                block.append(&mut data);
+
+                let mut length = encode_total_element_length(block.len())?;
+                block.append(&mut length);
+                block
             }
             Self::SignedInteger24Bit(i) | Self::SignedInteger32Bit(i) => {
-                let mut data = i.to_be_bytes().to_vec();
-                encode_total_element_length(data.len() + 1)?
+                let mut block = vec![encoding_type_byte];
+
+                let mut data = i.to_le_bytes().to_vec();
+                block.append(&mut data);
+
+                let mut length = encode_total_element_length(block.len())?;
+                block.append(&mut length);
+                block
             }
             Self::SignedInteger64Bit(i) => {
-                let mut data = i.to_be_bytes().to_vec();
-                encode_total_element_length(data.len() + 1)?
+                let mut block = vec![encoding_type_byte];
+
+                let mut data = i.to_le_bytes().to_vec();
+                block.append(&mut data);
+
+                let mut length = encode_total_element_length(block.len())?;
+                block.append(&mut length);
+                block
             }
-            Self::SmallString(s) | Self::MediumString(s) | Self::LargeString(s) => {
+            // The length of the small string is embedded into the
+            // encoding byte itself.
+            Self::SmallString(s) => {
+                let string_length = s.len();
+
+                if string_length > SMALL_STRING_MAXIMUM_LENGTH {
+                    return Err(crate::error::Error::ObjectIsTooBigForEncoding {
+                        size: string_length,
+                        max_size: SMALL_STRING_MAXIMUM_LENGTH,
+                    });
+                }
+
+                let mut block = vec![
+                    // encoding_type_byte | ((i >> 11) as u8 & 0b00011111)
+                    encoding_type_byte | (string_length as u8),
+                ];
+
                 let mut data = s.as_bytes().to_vec();
-                encode_total_element_length(data.len() + 1)?
+                block.append(&mut data);
+
+                let mut length = encode_total_element_length(block.len())?;
+                block.append(&mut length);
+                block
             }
-        };
+            Self::MediumString(s) => {
+                let string_length = s.len();
 
-        data.append(&mut total_element_length);
+                if string_length > MEDIUM_STRING_MAXIMUM_LENGTH {
+                    return Err(crate::error::Error::ObjectIsTooBigForEncoding {
+                        size: string_length,
+                        max_size: MEDIUM_STRING_MAXIMUM_LENGTH,
+                    });
+                }
 
-        Ok(data)
+                let mut block = vec![
+                    // encoding_type_byte | ((i >> 11) as u8 & 0b00011111)
+                    encoding_type_byte | ((string_length >> 8) as u8),
+                    (string_length as u8),
+                ];
+
+                let mut data = s.as_bytes().to_vec();
+                block.append(&mut data);
+
+                let mut length = encode_total_element_length(block.len())?;
+                block.append(&mut length);
+                block
+            }
+            Self::LargeString(s) => {
+                let string_length = s.len();
+
+                if string_length > std::u32::MAX as usize {
+                    return Err(crate::error::Error::ObjectIsTooBigForEncoding {
+                        size: string_length,
+                        max_size: std::u32::MAX as usize,
+                    });
+                }
+
+                let string_length = string_length as u32;
+
+                let mut block = vec![encoding_type_byte];
+                block.append(&mut string_length.to_le_bytes().to_vec());
+
+                let mut data = s.as_bytes().to_vec();
+                block.append(&mut data);
+
+                let mut length = encode_total_element_length(block.len())?;
+                block.append(&mut length);
+                block
+            }
+        })
     }
+    // fn encode(&self) -> Result<Vec<u8>> {
+    //     let mut data = self.encoding_type().encode()?;
+
+    //     // TODO: can be optimised without an allocation to a vec, but
+    //     // rather going through the bytes of the target object instead.
+    //     let mut data_with_total_element_length = match self {
+    //         // The small unsigned integer is embedded into the encoding
+    //         // byte itself, so appending only the total-element-length
+    //         // byte which equals to two: the encoding byte and the
+    //         // total-element-length byte itself.
+    //         Self::SmallUnsignedInteger(u) => vec![*u, 2],
+    //         Self::SignedInteger13Bit(i) | Self::SignedInteger16Bit(i) => {
+    //             let mut data = i.to_be_bytes().to_vec();
+    //             let mut length = encode_total_element_length(data.len() + 1)?;
+    //             data.append(&mut length);
+    //             data
+    //         }
+    //         Self::SignedInteger24Bit(i) | Self::SignedInteger32Bit(i) => {
+    //             let mut data = i.to_be_bytes().to_vec();
+    //             let mut length = encode_total_element_length(data.len() + 1)?;
+    //             data.append(&mut length);
+    //             data
+    //         }
+    //         Self::SignedInteger64Bit(i) => {
+    //             let mut data = i.to_be_bytes().to_vec();
+    //             let mut length = encode_total_element_length(data.len() + 1)?;
+    //             data.append(&mut length);
+    //             data
+    //         }
+    //         // The length of the small string is embedded into the
+    //         // encoding byte itself.
+    //         Self::SmallString(s) => {
+    //             let mut data =
+    //             let mut data = s.as_bytes().to_vec();
+    //             let mut length = encode_total_element_length(data.len() + 1)?;
+    //             data.append(&mut length);
+    //             data
+    //         }
+    //         Self::MediumString(s) | Self::LargeString(s) => {
+    //             let mut data = s.as_bytes().to_vec();
+    //             let mut length = encode_total_element_length(data.len() + 1)?;
+    //             data.append(&mut length);
+    //             data
+    //         }
+    //     };
+
+    //     data.append(&mut data_with_total_element_length);
+
+    //     Ok(data)
+    // }
 }
 
 impl From<ListpackEntryData<'_>> for ListpackEntryEncodingType {
@@ -600,9 +744,9 @@ impl_listpack_entry_data_from_number!(i8, i16, i32, i64, u8, u16, u32, u64);
 impl<'a> From<&'a str> for ListpackEntryData<'a> {
     fn from(s: &'a str) -> Self {
         let len = s.len();
-        if len <= 63 {
+        if len <= SMALL_STRING_MAXIMUM_LENGTH {
             Self::SmallString(s)
-        } else if len <= 4095 {
+        } else if len <= MEDIUM_STRING_MAXIMUM_LENGTH {
             Self::MediumString(s)
         } else {
             Self::LargeString(s)
@@ -1048,11 +1192,11 @@ impl ListpackEntryInsert<'_> {
         match self {
             Self::String(s) => {
                 let len = s.len();
-                if len <= 63 {
+                if len <= SMALL_STRING_MAXIMUM_LENGTH {
                     // 1: The length is stored in the encoding byte.
                     // 1: The "total-element-length" byte length.
                     len + 1 + 1
-                } else if len <= 4095 {
+                } else if len <= MEDIUM_STRING_MAXIMUM_LENGTH {
                     // 2: The length is stored in the encoding byte and one
                     // extra byte.
                     //
@@ -1401,6 +1545,89 @@ mod tests {
             );
 
             // TODO: more test coverage for all the other lengths.
+        }
+
+        #[test]
+        fn entry_u7() {
+            let entry = ListpackEntryInsert::Integer(15);
+            let encoded = entry.encode().unwrap();
+            let decoded = ListpackEntry::ref_from_slice(encoded.as_slice());
+            assert_eq!(decoded.data().unwrap().get_u7().unwrap(), 15);
+        }
+
+        #[test]
+        fn entry_i13() {
+            let entry = ListpackEntryInsert::Integer(4095);
+            let encoded = entry.encode().unwrap();
+            let decoded = ListpackEntry::ref_from_slice(encoded.as_slice());
+            assert_eq!(decoded.data().unwrap().get_i13().unwrap(), 4095);
+        }
+
+        #[test]
+        fn entry_i16() {
+            let entry = ListpackEntryInsert::Integer(10000);
+            let encoded = entry.encode().unwrap();
+            let decoded = ListpackEntry::ref_from_slice(encoded.as_slice());
+            assert_eq!(decoded.data().unwrap().get_i16().unwrap(), 10000);
+        }
+
+        #[test]
+        fn entry_i24() {
+            let entry = ListpackEntryInsert::Integer(8388607);
+            let encoded = entry.encode().unwrap();
+            let decoded = ListpackEntry::ref_from_slice(encoded.as_slice());
+            assert_eq!(decoded.data().unwrap().get_i24().unwrap(), 8388607);
+        }
+
+        #[test]
+        fn entry_i32() {
+            let entry = ListpackEntryInsert::Integer(2147483647);
+            let encoded = entry.encode().unwrap();
+            let decoded = ListpackEntry::ref_from_slice(encoded.as_slice());
+            assert_eq!(decoded.data().unwrap().get_i32().unwrap(), 2147483647);
+        }
+
+        #[test]
+        fn entry_i64() {
+            let entry = ListpackEntryInsert::Integer(2147483648);
+            let encoded = entry.encode().unwrap();
+            let decoded = ListpackEntry::ref_from_slice(encoded.as_slice());
+            assert_eq!(decoded.data().unwrap().get_i64().unwrap(), 2147483648);
+        }
+
+        #[test]
+        fn entry_small_string() {
+            let entry = ListpackEntryInsert::String("Hello, world!");
+            let encoded = entry.encode().unwrap();
+            let decoded = ListpackEntry::ref_from_slice(encoded.as_slice());
+            assert_eq!(
+                decoded.data().unwrap().get_small_str().unwrap(),
+                "Hello, world!"
+            );
+        }
+
+        #[test]
+        fn entry_medium_string() {
+            let medium_string = "a".repeat(MEDIUM_STRING_MAXIMUM_LENGTH - 1);
+            let entry = ListpackEntryInsert::String(&medium_string);
+            let encoded = entry.encode().unwrap();
+            let decoded = ListpackEntry::ref_from_slice(encoded.as_slice());
+            assert_eq!(
+                decoded.data().unwrap().get_medium_str().unwrap(),
+                medium_string,
+            );
+        }
+
+        #[test]
+        fn entry_large_string() {
+            let large_string = "a".repeat(MEDIUM_STRING_MAXIMUM_LENGTH + 1);
+            let entry = ListpackEntryInsert::String(&large_string);
+            let encoded = entry.encode().unwrap();
+            let decoded = ListpackEntry::ref_from_slice(encoded.as_slice());
+            assert_eq!(
+                decoded.data().unwrap().get_large_str().unwrap(),
+                large_string,
+            );
         }
     }
 }
