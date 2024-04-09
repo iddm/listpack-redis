@@ -28,7 +28,9 @@ pub enum ListpackEntrySubencodingType {
     /// the following 13 bits are the integer itself.
     SignedInteger13Bit = 0b11000000,
     /// A string with length up to `4095` bytes: the higher four bits
-    /// are `1110`, the lower four bytes are the length of the string.
+    /// are `1110`, the lower four bytes are the highest integer part of
+    /// the length of the string, with the next byte being the lowest 8
+    /// bits of the length.
     MediumString = 0b11100000,
     /// A large string with up to `2^32 - 1` bytes: the higher four bits
     /// are `1111`, the lower four bytes are always zero, designating
@@ -571,56 +573,6 @@ impl<'a> Encode for ListpackEntryData<'a> {
             }
         })
     }
-    // fn encode(&self) -> Result<Vec<u8>> {
-    //     let mut data = self.encoding_type().encode()?;
-
-    //     // TODO: can be optimised without an allocation to a vec, but
-    //     // rather going through the bytes of the target object instead.
-    //     let mut data_with_total_element_length = match self {
-    //         // The small unsigned integer is embedded into the encoding
-    //         // byte itself, so appending only the total-element-length
-    //         // byte which equals to two: the encoding byte and the
-    //         // total-element-length byte itself.
-    //         Self::SmallUnsignedInteger(u) => vec![*u, 2],
-    //         Self::SignedInteger13Bit(i) | Self::SignedInteger16Bit(i) => {
-    //             let mut data = i.to_be_bytes().to_vec();
-    //             let mut length = encode_total_element_length(data.len() + 1)?;
-    //             data.append(&mut length);
-    //             data
-    //         }
-    //         Self::SignedInteger24Bit(i) | Self::SignedInteger32Bit(i) => {
-    //             let mut data = i.to_be_bytes().to_vec();
-    //             let mut length = encode_total_element_length(data.len() + 1)?;
-    //             data.append(&mut length);
-    //             data
-    //         }
-    //         Self::SignedInteger64Bit(i) => {
-    //             let mut data = i.to_be_bytes().to_vec();
-    //             let mut length = encode_total_element_length(data.len() + 1)?;
-    //             data.append(&mut length);
-    //             data
-    //         }
-    //         // The length of the small string is embedded into the
-    //         // encoding byte itself.
-    //         Self::SmallString(s) => {
-    //             let mut data =
-    //             let mut data = s.as_bytes().to_vec();
-    //             let mut length = encode_total_element_length(data.len() + 1)?;
-    //             data.append(&mut length);
-    //             data
-    //         }
-    //         Self::MediumString(s) | Self::LargeString(s) => {
-    //             let mut data = s.as_bytes().to_vec();
-    //             let mut length = encode_total_element_length(data.len() + 1)?;
-    //             data.append(&mut length);
-    //             data
-    //         }
-    //     };
-
-    //     data.append(&mut data_with_total_element_length);
-
-    //     Ok(data)
-    // }
 }
 
 impl From<ListpackEntryData<'_>> for ListpackEntryEncodingType {
