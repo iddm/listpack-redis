@@ -55,6 +55,11 @@ pub enum AllocationError {
         /// The maximum size of the listpack.
         max_size: usize,
     },
+    /// An error indicating that the listpack failed to grow in size.
+    FailedToGrow {
+        /// The size to which the listpack had to grow.
+        size: usize,
+    },
 }
 
 impl std::fmt::Display for AllocationError {
@@ -63,6 +68,7 @@ impl std::fmt::Display for AllocationError {
             Self::ListpackIsTooBig { size, max_size } => {
                 write!(f, "Listpack is too big: {size} > {max_size}")
             }
+            Self::FailedToGrow { size } => write!(f, "Failed to grow to size: {size}"),
         }
     }
 }
@@ -83,6 +89,13 @@ pub enum Error {
     UnsupportedNumberDataTypeBitWidth {
         /// The bit width of the number that caused the error.
         bit_width: u8,
+    },
+    /// An error indicating that the object is too big to be encoded.
+    ObjectIsTooBigForEncoding {
+        /// The size of the object that caused the error.
+        size: usize,
+        /// The maximum size of the object that can be encoded.
+        max_size: usize,
     },
     /// An error indicating that the listpack's entry is missing a data
     /// block.
@@ -118,6 +131,9 @@ impl std::fmt::Display for Error {
             }
             Self::UnsupportedNumberDataTypeBitWidth { bit_width } => {
                 write!(f, "Unsupported number data type bit width: {bit_width}")
+            }
+            Self::ObjectIsTooBigForEncoding { size, max_size } => {
+                write!(f, "Object is too big for encoding: {size} > {max_size}")
             }
             Self::MissingDataBlock => write!(f, "Missing data block"),
             Self::InvalidStringEncodingInsideDataBlock(e) => {

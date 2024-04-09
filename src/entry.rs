@@ -6,6 +6,12 @@ use redis_custom_allocator::CustomAllocator;
 
 use crate::{error::Result, Listpack};
 
+/// The encoded presentation of the object as a byte array.
+pub trait Encode {
+    /// Return a byte representation of the object.
+    fn encode(&self) -> Result<Vec<u8>>;
+}
+
 /// The subencoding type of a listpack entry.
 /// The subencoding is the encoding of a listpack entry, which is
 /// more complex than the simple encoding types, meaning it can't fit
@@ -42,6 +48,12 @@ pub enum ListpackEntrySubencodingType {
     /// the following four bits are `0100`. The following eight bytes of
     /// the data block represent a 64 bits signed integer.
     SignedInteger64Bit = 0b11110100,
+}
+
+impl Encode for ListpackEntrySubencodingType {
+    fn encode(&self) -> Result<Vec<u8>> {
+        Ok(vec![*self as u8])
+    }
 }
 
 impl TryFrom<u8> for ListpackEntrySubencodingType {
@@ -84,6 +96,13 @@ pub enum ListpackEntryEncodingType {
     /// of a complex type, which may only be known after parsing the
     /// following lower bits of the encoding type.
     ComplexType(ListpackEntrySubencodingType),
+}
+
+impl Encode for ListpackEntryEncodingType {
+    fn encode(&self) -> Result<Vec<u8>> {
+        // Ok(vec![*self as u8])
+        Ok(vec![u8::from(*self)])
+    }
 }
 
 impl TryFrom<u8> for ListpackEntryEncodingType {
@@ -322,6 +341,144 @@ impl ListpackEntryData<'_> {
     }
 }
 
+/// The encoded number of bytes of the total element length, which spans
+/// across several bytes, depending on the length of the data block.
+///
+/// The value does not include the total-element-length byte(s) itself.
+fn encode_total_element_length(length: usize) -> Result<Vec<u8>> {
+    Ok(match length {
+        // 1. If it fits into a 7-bit integer, store it as a single byte.
+        // 2. If it doesn't fit into 7 bits, but fits into 14 bits, store
+        //   it as a two-byte integer, with the first byte having the
+        // highest bit set to zero and the highest 7 bits of the value,
+        // and the second byte having the highest bit set to 1 and the
+        // lowest 7 bits of the value.
+        // 3. If it doesn't fit into 14 bits, but fits into 21 bits, store
+        //  it as a three-byte integer, with the first byte having the
+        //  highest bit set to 0 and the lowest 7 bits to the highest 7
+        //  bits of the value, the second byte having the highest bit set
+        //  to 1 and the further lowest 7 bits of the value, and the
+        // third byte having the highest bit set to 1 and the lowest 7
+        // bits of the value.
+        // 4. If it doesn't fit into 21 bits, but fits into 28 bits,
+        // store it as a four-byte integer, with the first byte having
+        // the highest bit set to 0 and the lowest 7 bits to the highest
+        // 7 bits of the value, the second byte having the highest bit
+        // set to 1 and the further lowest 7 bits of the value, the third
+        // byte having the highest bit set to 1 and the further lowest 7
+        // bits of the value, and the fourth byte having the highest bit
+        // set to 1 and the lowest 7 bits of the value.
+        // 5. If it doesn't fit into 28 bits, but fits into 35 bits, store
+        // it as a five-byte integer, with the first byte having the
+        // highest bit set to 0 and the lowest 7 bits to the highest 7
+        // bits of the value, the second byte having the highest bit set
+        // to 1 and the further lowest 7 bits of the value, the third
+        // byte having the highest bit set to 1 and the further lowest 7
+        // bits of the value, the fourth byte having the highest bit set
+        // to 1 and the further lowest 7 bits of the value, and the fifth
+        // byte having the highest bit set to 1 and the lowest 7 bits of
+        // the value.
+        0..=128 => vec![length as u8],
+        129..=16384 => {
+            let mut data = vec![(length >> 7) as u8, (length & 0b01111111) as u8];
+            data[0] |= 0b10000000;
+            data
+        }
+        16385..=2097152 => {
+            let mut data = vec![
+                (length >> 14) as u8,
+                ((length >> 7) & 0b01111111) as u8,
+                (length & 0b01111111) as u8,
+            ];
+            data[0] |= 0b10000000;
+            data[1] |= 0b10000000;
+            data
+        }
+        2097153..=268435456 => {
+            let mut data = vec![
+                (length >> 21) as u8,
+                ((length >> 14) & 0b01111111) as u8,
+                ((length >> 7) & 0b01111111) as u8,
+                (length & 0b01111111) as u8,
+            ];
+            data[0] |= 0b10000000;
+            data[1] |= 0b10000000;
+            data[2] |= 0b10000000;
+            data
+        }
+        268435457..=34359738368 => {
+            let mut data = vec![
+                (length >> 28) as u8,
+                ((length >> 21) & 0b01111111) as u8,
+                ((length >> 14) & 0b01111111) as u8,
+                ((length >> 7) & 0b01111111) as u8,
+                (length & 0b01111111) as u8,
+            ];
+            data[0] |= 0b10000000;
+            data[1] |= 0b10000000;
+            data[2] |= 0b10000000;
+            data[3] |= 0b10000000;
+            data
+        }
+        _ => {
+            return Err(crate::error::Error::ObjectIsTooBigForEncoding {
+                size: length,
+                max_size: 34359738368,
+            })
+        }
+    })
+}
+
+impl<'a> Encode for ListpackEntryData<'a> {
+    /// The encoding of the data block is as follows:
+    ///
+    /// 1. If the data block is a small unsigned integer, the encoding
+    ///   byte is the integer itself.
+    /// 2. If the data block is a small string, the encoding byte is the
+    ///  length of the string, and the following bytes are the string
+    /// itself.
+    /// 3. If the data block is a complex type, the encoding byte is the
+    /// type of the complex type, and the following bytes are the data
+    /// block itself.
+    ///
+    /// The total-element-length byte(s) is(are) located behind the data
+    /// block, and is encoded as a variable-length integer from right
+    /// to left.
+    fn encode(&self) -> Result<Vec<u8>> {
+        let mut data = self.encoding_type().encode()?;
+
+        // TODO: can be optimised without an allocation to a vec, but
+        // rather going through the bytes of the target object instead.
+        let mut total_element_length = match self {
+            // The small unsigned integer is embedded into the encoding
+            // byte itself, so appending only the total-element-length
+            // byte which equals to two: the encoding byte and the
+            // total-element-length byte itself.
+            Self::SmallUnsignedInteger(u) => vec![2],
+            Self::SignedInteger13Bit(i) | Self::SignedInteger16Bit(i) => {
+                let mut data = i.to_be_bytes().to_vec();
+                encode_total_element_length(data.len() + 1)?
+            }
+            Self::SignedInteger24Bit(i) | Self::SignedInteger32Bit(i) => {
+                let mut data = i.to_be_bytes().to_vec();
+                encode_total_element_length(data.len() + 1)?
+            }
+            Self::SignedInteger64Bit(i) => {
+                let mut data = i.to_be_bytes().to_vec();
+                encode_total_element_length(data.len() + 1)?
+            }
+            Self::SmallString(s) | Self::MediumString(s) | Self::LargeString(s) => {
+                let mut data = s.as_bytes().to_vec();
+                encode_total_element_length(data.len() + 1)?
+            }
+        };
+
+        data.append(&mut total_element_length);
+
+        Ok(data)
+    }
+}
+
 impl From<ListpackEntryData<'_>> for ListpackEntryEncodingType {
     fn from(data: ListpackEntryData) -> Self {
         data.encoding_type()
@@ -459,11 +616,20 @@ impl<'a> From<&'a String> for ListpackEntryData<'a> {
     }
 }
 
+impl<'a> From<ListpackEntryInsert<'a>> for ListpackEntryData<'a> {
+    fn from(insert: ListpackEntryInsert<'a>) -> Self {
+        match insert {
+            ListpackEntryInsert::String(s) => Self::from(s),
+            ListpackEntryInsert::Integer(i) => Self::from(i),
+        }
+    }
+}
+
 /// The raw representation of a listpack entry. This is a transparent,
 /// zero-sized object, which designates a reference to the actual
 /// listpack entry.
 #[repr(transparent)]
-pub struct ListpackEntry(());
+pub struct ListpackEntry;
 
 impl ListpackEntry {
     const ENCODING_TYPE_BYTE_LENGTH: usize = std::mem::size_of::<u8>();
@@ -645,7 +811,8 @@ impl ListpackEntry {
         self.get_data_raw_and_total_bytes().map(|(data, _)| data)
     }
 
-    /// Returns the number of bytes used to represent the entry.
+    /// Returns the number of bytes used to represent the entry,
+    /// including the encoding byte and the total element length byte(s).
     ///
     /// # Note
     ///
@@ -761,6 +928,10 @@ impl ListpackEntry {
     /// Returns a reference from a pointer.
     pub(crate) fn ref_from_ptr<'a>(ptr: NonNull<u8>) -> &'a ListpackEntry {
         unsafe { ptr.cast().as_ref() }
+    }
+
+    pub(crate) fn ref_from_slice<'a>(slice: &'a [u8]) -> &'a ListpackEntry {
+        unsafe { &*(slice.as_ptr() as *const ListpackEntry) }
     }
 
     // /// Returns a mutable reference from a pointer.
@@ -932,6 +1103,49 @@ impl ListpackEntryInsert<'_> {
                 }
             }
         }
+    }
+
+    // fn encode_encoding_byte(&self) -> u8 {
+    //     match self {
+    //         Self::String(s) => {
+    //             let len = s.len();
+    //             if len <= 63 {
+    //                 0b10000000 | len as u8
+    //             } else if len <= 4095 {
+    //                 0b01000000 | ((len >> 8) & 0b00001111) as u8
+    //             } else {
+    //                 let total_element_length_byte_length = if len <= 65535 {
+    //                     3
+    //                 } else if len <= 16777215 {
+    //                     4
+    //                 } else {
+    //                     5
+    //                 };
+    //                 0b11000000 | total_element_length_byte_length as u8
+    //             }
+    //         }
+    //         Self::Integer(n) => {
+    //             if (0..=127).contains(n) {
+    //                 0b00000000 | *n as u8
+    //             } else if (-4096..=4095).contains(n) {
+    //                 0b10000000 | (((*n >> 8) & 0b00011111) as u8)
+    //             } else if (-32768..=32767).contains(n) {
+    //                 0b11000000
+    //             } else if (-8388608..=8388607).contains(n) {
+    //                 0b11100000
+    //             } else if (-2147483648..=2147483647).contains(n) {
+    //                 0b11110000
+    //             } else {
+    //                 0b11111111
+    //             }
+    //         }
+    //     }
+    // }
+}
+
+impl<'a> Encode for ListpackEntryInsert<'a> {
+    fn encode(&self) -> Result<Vec<u8>> {
+        ListpackEntryData::from(*self).encode()
     }
 }
 
@@ -1161,5 +1375,21 @@ where
 
     fn deref(&self) -> &Self::Target {
         self.entry
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod encoding {
+        use super::*;
+
+        #[test]
+        fn total_element_length() {
+            assert_eq!(encode_total_element_length(0), vec![0]);
+            // TODO: a failing test to not forget.
+            assert_eq!(encode_total_element_length(1), vec![0]);
+        }
     }
 }

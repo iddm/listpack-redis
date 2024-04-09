@@ -3,7 +3,7 @@
 use std::{
     alloc::Layout,
     fmt::{Debug, Write},
-    ops::{Index, RangeBounds},
+    ops::{Deref, DerefMut, Index, RangeBounds},
     ptr::NonNull,
 };
 
@@ -11,7 +11,9 @@ use redis_custom_allocator::{CustomAllocator, MemoryConsumption};
 
 use crate::{
     allocator::ListpackAllocator,
-    entry::{ListpackEntry, ListpackEntryInsert, ListpackEntryMutable, ListpackEntryRemoved},
+    entry::{
+        Encode, ListpackEntry, ListpackEntryInsert, ListpackEntryMutable, ListpackEntryRemoved,
+    },
     error::{AllocationError, Result},
     iter::{ListpackChunks, ListpackIntoIter, ListpackIter, ListpackWindows},
 };
@@ -109,6 +111,16 @@ impl ListpackHeader {
     pub fn available_bytes(&self) -> usize {
         Self::MAXIMUM_TOTAL_BYTES - self.total_bytes()
     }
+
+    /// Sets the new total amount of bytes representing the listpack.
+    pub fn set_total_bytes(&mut self, total_bytes: u32) {
+        self.total_bytes = total_bytes as u32;
+    }
+
+    /// Sets the new total number of elements the listpack holds.
+    pub fn set_num_elements(&mut self, num_elements: u16) {
+        self.num_elements = num_elements as u16;
+    }
 }
 
 /// A reference to the header of the listpack data structure.
@@ -173,10 +185,12 @@ impl ListpackHeaderRef<'_> {
     }
 }
 
+/// A pointer to the allocation of the listpack. It will contain the
+/// header, the data block (including the elements), and the end marker.
 #[derive(Debug, Copy, Clone)]
-struct HeaderPointer(NonNull<[u8]>, Layout);
+struct ListpackAllocationPointer(NonNull<[u8]>, Layout);
 
-impl HeaderPointer {
+impl ListpackAllocationPointer {
     /// Finds out the layout of the listpack by looking for the end
     /// marker.
     fn from_ptr(ptr: NonNull<[u8]>) -> Result<Self> {
@@ -203,6 +217,71 @@ impl HeaderPointer {
 
     fn layout(&self) -> Layout {
         self.1
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { self.0.as_ref() }
+    }
+
+    /// Returns a pointer to the beginning of the data.
+    fn data_start_ptr(&self) -> *const u8 {
+        unsafe {
+            self.ptr()
+                .as_ptr()
+                .add(std::mem::size_of::<ListpackHeader>())
+        }
+    }
+
+    fn data_start_slice(&self) -> &[u8] {
+        unsafe { &self.0.as_ref()[std::mem::size_of::<ListpackHeader>()..] }
+    }
+
+    /// Returns a pointer pointing to the end marker.
+    fn data_end_ptr(&self) -> *const u8 {
+        unsafe { self.ptr().as_ptr().add(self.layout().size() - 1) }
+    }
+
+    /// Sets the last byte of the listpack to the end marker.
+    fn set_end_marker(&mut self) {
+        unsafe {
+            *self.data_end_ptr().cast_mut() = END_MARKER;
+        }
+    }
+
+    fn get_header(&self) -> &ListpackHeader {
+        // unsafe { self.ptr().as_ptr().cast().as_ref().unwrap() }
+
+        unsafe {
+            self.ptr()
+                .as_ptr()
+                .cast::<ListpackHeader>()
+                .as_ref()
+                .unwrap()
+        }
+    }
+
+    fn get_header_mut(&mut self) -> &mut ListpackHeader {
+        unsafe {
+            self.ptr()
+                .as_ptr()
+                .cast::<ListpackHeader>()
+                .as_mut()
+                .unwrap()
+        }
+    }
+}
+
+impl Deref for ListpackAllocationPointer {
+    type Target = ListpackHeader;
+
+    fn deref(&self) -> &Self::Target {
+        self.get_header()
+    }
+}
+
+impl DerefMut for ListpackAllocationPointer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.get_header_mut()
     }
 }
 
@@ -240,7 +319,7 @@ impl TryFrom<usize> for ListpackCapacity {
 
 /// The listpack data structure.
 pub struct Listpack<Allocator: CustomAllocator = crate::allocator::DefaultAllocator> {
-    allocation: HeaderPointer,
+    allocation: ListpackAllocationPointer,
     allocator: Allocator,
 }
 
@@ -507,6 +586,11 @@ where
         self.allocation.0.as_ptr().cast()
     }
 
+    /// Returns a mutable reference to the listpack header.
+    pub fn get_header_mut(&mut self) -> &mut ListpackHeader {
+        unsafe { self.as_mut_ptr().cast::<ListpackHeader>().as_mut().unwrap() }
+    }
+
     /// Returns the number of elements of this listpack.
     ///
     /// # Example
@@ -596,7 +680,7 @@ where
     /// std::mem::forget(old);
     /// ```
     pub unsafe fn from_raw_parts(ptr: NonNull<[u8]>, allocator: Allocator) -> Self {
-        let allocation = HeaderPointer::from_ptr(ptr).expect("The listpack is valid.");
+        let allocation = ListpackAllocationPointer::from_ptr(ptr).expect("The listpack is valid.");
 
         Self {
             allocation,
@@ -1108,7 +1192,7 @@ where
     fn allocate_header_for_capacity(
         allocator: &Allocator,
         capacity: ListpackCapacity,
-    ) -> Result<HeaderPointer, AllocatorError> {
+    ) -> Result<ListpackAllocationPointer, AllocatorError> {
         let bytes_to_allocate = capacity.0;
 
         // This is an impossible situation, as the maximum size of the
@@ -1134,7 +1218,7 @@ where
             };
         }
 
-        Ok(HeaderPointer(ptr, layout))
+        Ok(ListpackAllocationPointer(ptr, layout))
     }
 
     /// Creates a new listpack with the given capacity (the number of
@@ -1180,6 +1264,42 @@ impl<Allocator> Listpack<Allocator>
 where
     Allocator: CustomAllocator,
 {
+    /// Reallocates the pointer to a new place in memory, growing the
+    /// size of the data block.
+    ///
+    /// # Note
+    ///
+    /// After calling this function, the block contains two end markers:
+    /// one at the end of the old block and one at the end of the new
+    /// block (for the safety).
+    fn grow(&mut self, new_layout: Layout) -> Result<(), <Allocator as CustomAllocator>::Error> {
+        let old_layout = self.allocation.layout();
+        unsafe {
+            self.allocation.0 = self.allocator.grow(
+                self.allocation.ptr().cast(),
+                self.allocation.layout(),
+                new_layout,
+            )?;
+        }
+        self.allocation.1 = new_layout;
+        self.get_header_mut()
+            .set_total_bytes(new_layout.size() as u32);
+        self.allocation.set_end_marker();
+
+        Ok(())
+    }
+
+    /// Grows the capacity of the listpack by `additional_bytes`.
+    fn grow_by(
+        &mut self,
+        additional_bytes: usize,
+    ) -> Result<(), <Allocator as CustomAllocator>::Error> {
+        let new_layout =
+            Layout::from_size_align(self.allocation.layout().size() + additional_bytes, 1)
+                .expect("Created layout");
+        self.grow(new_layout)
+    }
+
     /// Shrinks the capacity of the listpack to fit the number of
     /// elements.
     ///
@@ -1401,23 +1521,28 @@ where
         entry: T,
         location: u32,
     ) -> Result {
-        unimplemented!("Try insert internal is not implemented.")
-        // let entry = entry.into();
+        let entry = entry.into();
 
-        // let referred_element_ptr =
-        //     NonNull::new(unsafe { bindings::lpSeek(self.allocation.as_ptr(), index as _) }).ok_or(
-        //         crate::error::InsertionError::IndexOutOfBounds {
-        //             index,
-        //             length: self.len(),
-        //         },
-        //     )?;
+        let referred_element_ptr = self.get_internal_entry_ptr(index).ok_or(
+            crate::error::InsertionError::IndexOutOfBounds {
+                index,
+                length: self.len(),
+            },
+        )?;
 
-        // if let Some(e) = self.can_fit_entry(
-        //     &entry,
-        //     Some(ListpackEntry::ref_from_ptr(referred_element_ptr)),
-        // ) {
-        //     return Err(e);
-        // }
+        if let Some(e) = self.can_fit_entry(
+            &entry,
+            Some(ListpackEntry::ref_from_ptr(referred_element_ptr)),
+        ) {
+            return Err(e);
+        }
+
+        let size_to_grow = entry.full_encoded_size();
+
+        self.grow_by(size_to_grow)
+            .map_err(|_| AllocationError::FailedToGrow { size: size_to_grow })?;
+
+        let encoded_value = entry.encode();
 
         // let ptr = NonNull::new(match entry {
         //     ListpackEntryInsert::String(s) => {
@@ -1452,7 +1577,7 @@ where
 
         // self.allocation = ptr;
 
-        // Ok(())
+        Ok(())
     }
 
     /// A safe version of [`Self::push`]. It is a little more useful,
@@ -1993,10 +2118,60 @@ impl<Allocator> Listpack<Allocator>
 where
     Allocator: CustomAllocator,
 {
+    fn get_internal_entry_ptr_from_start(&self, index: usize) -> Option<NonNull<u8>> {
+        unimplemented!()
+        // if self.is_empty() {
+        //     return None;
+        // }
+
+        // let mut current = 0;
+
+        // let mut data = self.allocation.data_start_slice();
+        // let mut offset = 0;
+
+        // while current < index {
+        //     if *data[offset] == END_MARKER {
+        //         return None;
+        //     }
+
+        //     let entry = ListpackEntry::ref_from_slice(data);
+        //     data = data[entry.total_bytes()..].try_into().unwrap();
+        // }
+
+        // Some(unsafe { NonNull::new_unchecked(data) })
+    }
+
+    // TODO: implement this.
+    fn get_internal_entry_ptr_from_end(&self, index: usize) -> Option<NonNull<u8>> {
+        unimplemented!("Get internal entry pointer from end is not implemented.")
+        //     if self.is_empty() {
+        //         return None;
+        //     }
+
+        //     let mut current = self.len() - 1;
+
+        //     let mut data = self.allocation.data_end_ptr();
+
+        //     while current < index {
+        //         if data.is_null() || unsafe { *data } == END_MARKER {
+        //             return None;
+        //         }
+
+        //         let entry = ListpackEntry::ref_from_ptr(unsafe { NonNull::new_unchecked(data) });
+        //         data = unsafe { data.offset(entry.total_bytes()) };
+        //     }
+
+        //     Some(unsafe { NonNull::new_unchecked(data) })
+    }
+
     /// Returns a pointer to the listpack's entry at the given index.
     fn get_internal_entry_ptr(&self, index: usize) -> Option<NonNull<u8>> {
-        unimplemented!("Get internal entry pointer is not implemented.")
-        // NonNull::new(unsafe { bindings::lpSeek(self.allocation.as_ptr(), index as _) })
+        // TODO:
+        // check that the index is at the beginning or close to the end,
+        // and search for the entry from the beginning or the end
+        // respectively.
+
+        self.get_internal_entry_ptr_from_start(index)
     }
 
     /// Returns a pointer to the listpack's header.
