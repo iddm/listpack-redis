@@ -378,35 +378,35 @@ fn encode_total_element_length(length: usize) -> Result<Vec<u8>> {
         // to 1 and the further lowest 7 bits of the value, and the fifth
         // byte having the highest bit set to 1 and the lowest 7 bits of
         // the value.
-        0..=128 => vec![length as u8],
-        129..=16384 => {
+        0..=127 => vec![length as u8],
+        128..=16383 => {
             let mut data = vec![(length >> 7) as u8, (length & 0b01111111) as u8];
-            data[0] |= 0b10000000;
+            data[1] |= 0b10000000;
             data
         }
-        16385..=2097152 => {
+        16384..=2097151 => {
             let mut data = vec![
                 (length >> 14) as u8,
                 ((length >> 7) & 0b01111111) as u8,
                 (length & 0b01111111) as u8,
             ];
-            data[0] |= 0b10000000;
             data[1] |= 0b10000000;
+            data[2] |= 0b10000000;
             data
         }
-        2097153..=268435456 => {
+        2097152..=268435455 => {
             let mut data = vec![
                 (length >> 21) as u8,
                 ((length >> 14) & 0b01111111) as u8,
                 ((length >> 7) & 0b01111111) as u8,
                 (length & 0b01111111) as u8,
             ];
-            data[0] |= 0b10000000;
             data[1] |= 0b10000000;
             data[2] |= 0b10000000;
+            data[3] |= 0b10000000;
             data
         }
-        268435457..=34359738368 => {
+        268435456..=34359738367 => {
             let mut data = vec![
                 (length >> 28) as u8,
                 ((length >> 21) & 0b01111111) as u8,
@@ -414,16 +414,16 @@ fn encode_total_element_length(length: usize) -> Result<Vec<u8>> {
                 ((length >> 7) & 0b01111111) as u8,
                 (length & 0b01111111) as u8,
             ];
-            data[0] |= 0b10000000;
             data[1] |= 0b10000000;
             data[2] |= 0b10000000;
             data[3] |= 0b10000000;
+            data[4] |= 0b10000000;
             data
         }
         _ => {
             return Err(crate::error::Error::ObjectIsTooBigForEncoding {
                 size: length,
-                max_size: 34359738368,
+                max_size: 34359738367,
             })
         }
     })
@@ -1387,9 +1387,20 @@ mod tests {
 
         #[test]
         fn total_element_length() {
-            assert_eq!(encode_total_element_length(0), vec![0]);
-            // TODO: a failing test to not forget.
-            assert_eq!(encode_total_element_length(1), vec![0]);
+            assert_eq!(encode_total_element_length(0).unwrap(), vec![0]);
+            assert_eq!(encode_total_element_length(1).unwrap(), vec![1]);
+            assert_eq!(
+                encode_total_element_length(128).unwrap(),
+                // 1, 128
+                vec![0b00000001, 0b10000000]
+            );
+            assert_eq!(
+                encode_total_element_length(500).unwrap(),
+                // 3, 244
+                vec![0b00000011, 0b11110100]
+            );
+
+            // TODO: more test coverage for all the other lengths.
         }
     }
 }
