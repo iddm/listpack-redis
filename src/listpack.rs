@@ -133,6 +133,14 @@ impl ListpackHeader {
         Self::MAXIMUM_TOTAL_BYTES - self.total_bytes()
     }
 
+    /// Returns the number of bytes the elements occupy in the listpack,
+    /// that is available right after the header.
+    pub fn element_bytes(&self) -> usize {
+        self.total_bytes()
+            - std::mem::size_of::<ListpackHeader>()
+            - std::mem::size_of_val(&END_MARKER)
+    }
+
     /// Sets the new total amount of bytes representing the listpack.
     pub fn set_total_bytes(&mut self, total_bytes: u32) {
         self.total_bytes = total_bytes as u32;
@@ -646,10 +654,6 @@ where
     /// An unsafe way to obtain an immutable reference to the listpack
     /// header.
     ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the header is valid.
-    ///
     /// # Panics
     ///
     /// Panics if the header is not valid.
@@ -659,17 +663,21 @@ where
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let listpack: Listpack = Listpack::default();
-    /// let header = unsafe { listpack.header_ref() };
+    /// let mut listpack: Listpack = Listpack::default();
+    /// let header = unsafe { listpack.get_header_ref() };
     /// assert_eq!(header.num_elements(), 0);
+    ///
+    /// listpack.push(1);
+    /// let header = unsafe { listpack.get_header_ref() };
+    /// assert_eq!(header.num_elements(), 1);
     /// ```
-    pub unsafe fn header_ref(&self) -> ListpackHeaderRef {
+    pub fn get_header_ref(&self) -> &ListpackHeader {
         // &*(self.ptr.as_ptr() as *const ListpackHeader)
-        ListpackHeaderRef(
+        unsafe {
             (self.as_ptr() as *const ListpackHeader)
                 .as_ref()
-                .expect("Header is valid"),
-        )
+                .expect("Header is valid")
+        }
     }
 
     /// Creates a new listpack from the given raw pointer.
@@ -743,7 +751,7 @@ where
         entry: &ListpackEntryInsert,
         entry_to_replace: Option<&ListpackEntry>,
     ) -> Result<usize> {
-        let available_listpack_length = unsafe { self.header_ref().available_bytes() };
+        let available_listpack_length = unsafe { self.get_header_ref().available_bytes() };
         let object_to_replace_size = entry_to_replace
             .map(|e| e.total_bytes())
             .unwrap_or_default();
@@ -1294,7 +1302,6 @@ where
     /// one at the end of the old block and one at the end of the new
     /// block (for the safety).
     fn grow(&mut self, new_layout: Layout) -> Result<(), <Allocator as CustomAllocator>::Error> {
-        let old_layout = self.allocation.layout();
         unsafe {
             self.allocation.0 = self.allocator.grow(
                 self.allocation.ptr().cast(),
@@ -1431,26 +1438,6 @@ where
     /// ```
     pub fn push<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, entry: T) {
         self.try_push(entry).expect("Pushed to listpack");
-        // let entry = entry.into();
-        // self.ptr = NonNull::new(match entry {
-        //     ListpackEntryInsert::String(s) => {
-        //         let string_ptr = s.as_ptr() as *mut _;
-        //         let len_bytes = s.len();
-        //         if len_bytes == 0 {
-        //             return;
-        //         }
-
-        //         if len_bytes > std::u32::MAX as usize {
-        //             panic!("The string is too long to be stored in the listpack.");
-        //         }
-
-        //         unsafe { bindings::lpAppend(self.ptr.as_ptr(), string_ptr, len_bytes as _) }
-        //     }
-        //     ListpackEntryInsert::Integer(n) => unsafe {
-        //         bindings::lpAppendInteger(self.ptr.as_ptr(), n)
-        //     },
-        // })
-        // .expect("Appended to listpack");
     }
 
     /// Inserts an element at the given index into the listpack.
@@ -1493,8 +1480,7 @@ where
     /// assert_eq!(listpack.get(3).unwrap().to_string(), "3");
     /// ```
     pub fn insert<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
-        unimplemented!("Insert is not implemented.")
-        // self.insert_internal(index, entry, bindings::LP_BEFORE)
+        self.insert_with_placement_internal(InsertionPlacement::Before(index), entry)
     }
 
     /// Inserts an element at the given index into the listpack.
@@ -1525,7 +1511,7 @@ where
         self.try_insert_with_placement_internal(InsertionPlacement::Before(index), entry)
     }
 
-    fn insert_internal_with_placement<'a, T: Into<ListpackEntryInsert<'a>>>(
+    fn insert_with_placement_internal<'a, T: Into<ListpackEntryInsert<'a>>>(
         &mut self,
         placement: InsertionPlacement,
         entry: T,
@@ -1572,10 +1558,26 @@ where
 
         let element_to_replace = placement.to_replace().map(|_| referred_element);
 
+        let length_to_relocate = {
+            let referred_element_ptr = referred_element.as_ptr();
+            let end_ptr = self.allocation.data_end_ptr();
+            unsafe { end_ptr.offset_from(referred_element_ptr) as usize }
+        };
+
         let size_to_grow = self.can_fit_entry(&entry, element_to_replace)?;
 
         self.grow_by(size_to_grow)
             .map_err(|_| AllocationError::FailedToGrow { size: size_to_grow })?;
+
+        // Lets obtain a new reference to the element after the
+        // reallocation.
+        let referred_element =
+            ListpackEntry::ref_from_ptr(self.get_internal_entry_ptr(index).ok_or(
+                crate::error::InsertionError::IndexOutOfBounds {
+                    index,
+                    length: self.len(),
+                },
+            )?);
 
         let encoded_value = entry.encode()?;
 
@@ -1587,12 +1589,13 @@ where
                 // 2. Insert the new element at the location of the
                 // referred element.
                 let referred_element_ptr = referred_element.as_ptr();
+
                 unsafe {
                     // Shift the elements to the right.
-                    std::ptr::copy_nonoverlapping(
+                    std::ptr::copy(
                         referred_element_ptr,
                         referred_element_ptr.add(encoded_value.len()).cast_mut(),
-                        referred_element.total_bytes(),
+                        length_to_relocate,
                     );
 
                     std::ptr::copy_nonoverlapping(
@@ -1610,32 +1613,31 @@ where
                 // memory, by the size of the new element.
                 // 2. Insert the new element at the location after that
                 // of the referred element.
-                let referred_element_ptr = {
-                    let mut ptr = referred_element.as_ptr();
 
-                    // Skip the referred element.
-                    unsafe {
-                        ptr.add(referred_element.total_bytes());
-                    }
+                // If this is the last element, it should point to
+                // the end marker (the old one, before the
+                // reallocation).
 
-                    // If this is the last element, it should point to
-                    // the end marker (the old one, before the
-                    // reallocation).
-
-                    ptr
+                // Skip the referred element.
+                let next_after_referred_element_ptr = unsafe {
+                    referred_element
+                        .as_ptr()
+                        .add(referred_element.total_bytes())
                 };
 
                 unsafe {
                     // Shift the elements to the right.
                     std::ptr::copy_nonoverlapping(
-                        referred_element_ptr,
-                        referred_element_ptr.add(encoded_value.len()).cast_mut(),
-                        referred_element.total_bytes(),
+                        next_after_referred_element_ptr,
+                        next_after_referred_element_ptr
+                            .add(encoded_value.len())
+                            .cast_mut(),
+                        length_to_relocate - referred_element.total_bytes(),
                     );
 
                     std::ptr::copy_nonoverlapping(
                         encoded_value.as_ptr(),
-                        referred_element_ptr.cast_mut(),
+                        next_after_referred_element_ptr.cast_mut(),
                         encoded_value.len(),
                     );
                 }
@@ -1656,60 +1658,6 @@ where
                 };
             }
         }
-
-        // let referred_element_ptr = self.get_internal_entry_ptr(index).ok_or(
-        //     crate::error::InsertionError::IndexOutOfBounds {
-        //         index,
-        //         length: self.len(),
-        //     },
-        // )?;
-
-        // if let Some(e) = self.can_fit_entry(
-        //     &entry,
-        //     placement.to_replace().map(Some(ListpackEntry::ref_from_ptr(referred_element_ptr)),
-        // ) {
-        //     return Err(e);
-        // }
-
-        // let size_to_grow = entry.full_encoded_size();
-
-        // self.grow_by(size_to_grow)
-        //     .map_err(|_| AllocationError::FailedToGrow { size: size_to_grow })?;
-
-        // let encoded_value = entry.encode();
-
-        // let ptr = NonNull::new(match entry {
-        //     ListpackEntryInsert::String(s) => {
-        //         let string_ptr = s.as_ptr() as *mut _;
-        //         let len_bytes = s.len();
-
-        //         unsafe {
-        //             bindings::lpInsertString(
-        //                 self.allocation.as_ptr(),
-        //                 string_ptr,
-        //                 len_bytes as _,
-        //                 referred_element_ptr.as_ptr(),
-        //                 location as _,
-        //                 std::ptr::null_mut(),
-        //             )
-        //         }
-        //     }
-        //     ListpackEntryInsert::Integer(n) => unsafe {
-        //         bindings::lpInsertInteger(
-        //             self.allocation.as_ptr(),
-        //             n,
-        //             referred_element_ptr.as_ptr(),
-        //             location as _,
-        //             std::ptr::null_mut(),
-        //         )
-        //     },
-        // })
-        // .ok_or(crate::error::InsertionError::ListpackIsFull {
-        //     current_length: entry.full_encoded_size(),
-        //     available_listpack_length: unsafe { self.header_ref().available_bytes() },
-        // })?;
-
-        // self.allocation = ptr;
 
         Ok(())
     }
@@ -1734,7 +1682,12 @@ where
     pub fn try_push<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, entry: T) -> Result {
         let entry = entry.into();
         let size_to_grow = self.can_fit_entry(&entry, None)?;
-        let old_end_offset = self.allocation.0.len() - 1;
+        // let old_end_offset = self.allocation.0.len() - 1;
+        let old_end_offset = unsafe {
+            self.allocation
+                .data_end_ptr()
+                .offset_from(self.allocation.ptr().as_ptr().cast()) as usize
+        };
 
         self.grow_by(size_to_grow)
             .map_err(|_| AllocationError::FailedToGrow { size: size_to_grow })?;
@@ -2254,6 +2207,33 @@ where
             .set_num_elements(num_elements as u16 + 1);
     }
 
+    /// Validates the listpack by iterating over its memory and
+    /// checking that the entries are correctly formatted.
+    fn validate(&self) -> Result {
+        if self.is_empty() {
+            return Ok(());
+        }
+
+        let mut current = 0;
+        let mut data = self.allocation.data_start_slice();
+
+        while current < self.len() {
+            if data[0] == END_MARKER {
+                return Err(crate::error::Error::UnexpectedEndMarker);
+            }
+
+            let entry = ListpackEntry::ref_from_slice(data);
+            data = &data[entry.total_bytes()..];
+            current += 1;
+        }
+
+        if data[0] != END_MARKER {
+            return Err(crate::error::Error::MissingEndMarker);
+        }
+
+        Ok(())
+    }
+
     fn get_internal_entry_ptr_from_start(&self, index: usize) -> Option<NonNull<u8>> {
         if self.is_empty() || index >= self.len() {
             return None;
@@ -2307,11 +2287,6 @@ where
         // respectively.
 
         self.get_internal_entry_ptr_from_start(index)
-    }
-
-    /// Returns a pointer to the listpack's header.
-    fn get_header_ref<'a>(&'a self) -> ListpackHeaderRef<'a> {
-        unsafe { self.header_ref() }
     }
 
     /// Returns the amount of bytes used by the listpack to store the
@@ -2414,8 +2389,7 @@ where
     /// assert_eq!(listpack.get(1).unwrap().to_string(), "Hello!");
     /// ```
     pub fn insert_after<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
-        unimplemented!("Insert after is not implemented.")
-        // self.insert_internal(index, entry, bindings::LP_AFTER)
+        self.insert_with_placement_internal(InsertionPlacement::After(index), entry)
     }
 
     /// Inserts an element at the given index into the listpack, after
@@ -2463,8 +2437,7 @@ where
     /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello!");
     /// ```
     pub fn replace<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
-        unimplemented!("Replace is not implemented.")
-        // self.insert_internal(index, entry, bindings::LP_REPLACE)
+        self.try_replace(index, entry).expect("Replaced an element")
     }
 
     /// Replaces the element at the given index with the given element.
@@ -2490,8 +2463,7 @@ where
         index: usize,
         entry: T,
     ) -> Result {
-        unimplemented!("Try replace is not implemented.")
-        // self.try_insert_internal(index, entry, bindings::LP_REPLACE)
+        self.try_insert_with_placement_internal(InsertionPlacement::Replace(index), entry)
     }
 }
 
@@ -2564,29 +2536,29 @@ mod tests {
         let mut listpack: Listpack = Listpack::default();
 
         unsafe {
-            assert_eq!(listpack.header_ref().total_bytes(), 7);
-            assert_eq!(listpack.header_ref().num_elements(), 0);
+            assert_eq!(listpack.get_header_ref().total_bytes(), 7);
+            assert_eq!(listpack.get_header_ref().num_elements(), 0);
         }
 
         listpack.push("Hello");
 
         unsafe {
-            assert_eq!(listpack.header_ref().total_bytes(), 14);
-            assert_eq!(listpack.header_ref().num_elements(), 1);
+            assert_eq!(listpack.get_header_ref().total_bytes(), 14);
+            assert_eq!(listpack.get_header_ref().num_elements(), 1);
         }
 
         listpack.push("World");
 
         unsafe {
-            assert_eq!(listpack.header_ref().total_bytes(), 21);
-            assert_eq!(listpack.header_ref().num_elements(), 2);
+            assert_eq!(listpack.get_header_ref().total_bytes(), 21);
+            assert_eq!(listpack.get_header_ref().num_elements(), 2);
         }
 
         listpack.clear();
 
         unsafe {
-            assert_eq!(listpack.header_ref().total_bytes(), 7);
-            assert_eq!(listpack.header_ref().num_elements(), 0);
+            assert_eq!(listpack.get_header_ref().total_bytes(), 7);
+            assert_eq!(listpack.get_header_ref().num_elements(), 0);
         }
     }
 
@@ -2686,6 +2658,31 @@ mod tests {
             "World"
         );
         assert_eq!(listpack.get(2), None);
+    }
+
+    #[test]
+    fn insert_before() {
+        let mut listpack: Listpack = Listpack::default();
+        listpack.push("Hello, world!");
+        listpack.insert(0, "Hello!");
+        assert_eq!(listpack.len(), 2);
+        assert_eq!(listpack.get(0).unwrap().to_string(), "Hello!");
+        assert_eq!(listpack.get(1).unwrap().to_string(), "Hello, world!");
+
+        let mut listpack: Listpack = Listpack::default();
+        listpack.push(1);
+        listpack.validate().unwrap();
+        listpack.push(2);
+        listpack.validate().unwrap();
+        listpack.push(3);
+        listpack.validate().unwrap();
+
+        listpack.insert(1, 4);
+        assert_eq!(listpack.len(), 4);
+        assert_eq!(listpack.get(0).unwrap().to_string(), "1");
+        assert_eq!(listpack.get(1).unwrap().to_string(), "4");
+        assert_eq!(listpack.get(2).unwrap().to_string(), "2");
+        assert_eq!(listpack.get(3).unwrap().to_string(), "3");
     }
 
     #[test]

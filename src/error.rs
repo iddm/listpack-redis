@@ -105,6 +105,8 @@ pub enum Error {
     InvalidStringEncodingInsideDataBlock(Utf8Error),
     /// When the end marker is missing from the listpack.
     MissingEndMarker,
+    /// When the end marker is met earlier than expected.
+    UnexpectedEndMarker,
     /// An error related to the allocation of memory.
     Allocation(AllocationError),
     /// An error related to the insertion into the listpack.
@@ -139,6 +141,7 @@ impl std::fmt::Display for Error {
             Self::InvalidStringEncodingInsideDataBlock(e) => {
                 write!(f, "Invalid string inside data block: {e}")
             }
+            Self::UnexpectedEndMarker => write!(f, "Unexpected end marker"),
             Self::MissingEndMarker => write!(f, "Missing end marker"),
             Self::Allocation(e) => write!(f, "Allocation error: {e}"),
             Self::Insertion(e) => write!(f, "Insertion error: {e}"),

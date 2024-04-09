@@ -2,7 +2,6 @@
 
 use std::{ops::Deref, ptr::NonNull};
 
-use libc::strspn;
 use redis_custom_allocator::CustomAllocator;
 
 use crate::{error::Result, Listpack};
@@ -801,7 +800,9 @@ impl ListpackEntry {
         let ptr = unsafe { (self as *const Self as *const u8).add(1) };
 
         match encoding_type {
-            ListpackEntryEncodingType::SmallUnsignedInteger => None,
+            ListpackEntryEncodingType::SmallUnsignedInteger => {
+                Some((unsafe { std::slice::from_raw_parts(ptr, 1) }, 2))
+            }
             ListpackEntryEncodingType::SmallString => {
                 let len = (encoding_type_byte & 0b00111111) as usize;
                 let data = unsafe {
@@ -1080,27 +1081,31 @@ impl PartialEq<ListpackEntryInsert<'_>> for &ListpackEntry {
 
 impl Eq for ListpackEntry {}
 
-impl Drop for ListpackEntry {
-    fn drop(&mut self) {
-        let total_size = self.total_bytes();
+// impl Drop for ListpackEntry {
+//     fn drop(&mut self) {
+//         let total_size = self.total_bytes();
 
-        unsafe {
-            std::alloc::dealloc(
-                self.as_mut_ptr(),
-                std::alloc::Layout::from_size_align_unchecked(
-                    total_size,
-                    std::mem::align_of::<u8>(),
-                ),
-            )
-        }
-    }
-}
+//         unsafe {
+//             std::alloc::dealloc(
+//                 self.as_mut_ptr(),
+//                 std::alloc::Layout::from_size_align_unchecked(
+//                     total_size,
+//                     std::mem::align_of::<u8>(),
+//                 ),
+//             )
+//         }
+//     }
+// }
 
 impl std::fmt::Debug for ListpackEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let data = self.data().map_err(|_| std::fmt::Error)?;
 
-        write!(f, "{data:?}")
+        f.debug_struct("ListpackEntry")
+            .field("encoding_type_raw", &self.get_encoding_type_raw())
+            .field("data", &data)
+            .field("total_element_length", &self.total_bytes())
+            .finish()
     }
 }
 
