@@ -24,6 +24,39 @@ pub enum InsertionError {
     },
 }
 
+/// An error happening during the deletion from listpack.
+#[derive(Debug, Copy, Clone)]
+pub enum DeletionError {
+    /// An error indicating that the index is out of bounds.
+    IndexOutOfBounds {
+        /// The start index that caused the error.
+        start_index: usize,
+        /// The number of elements to delete.
+        delete_count: usize,
+        /// The length of the listpack.
+        length: usize,
+    },
+}
+
+impl std::fmt::Display for DeletionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::IndexOutOfBounds {
+                start_index,
+                delete_count,
+                length,
+            } => {
+                write!(
+                    f,
+                    "Index out of bounds: {start_index} + {delete_count} > {length}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for DeletionError {}
+
 impl std::fmt::Display for InsertionError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
@@ -119,6 +152,8 @@ pub enum Error {
     Allocation(AllocationError),
     /// An error related to the insertion into the listpack.
     Insertion(InsertionError),
+    /// An error related to the deletion from the listpack.
+    Deletion(DeletionError),
 }
 
 impl From<AllocationError> for Error {
@@ -130,6 +165,12 @@ impl From<AllocationError> for Error {
 impl From<InsertionError> for Error {
     fn from(e: InsertionError) -> Self {
         Error::Insertion(e)
+    }
+}
+
+impl From<DeletionError> for Error {
+    fn from(e: DeletionError) -> Self {
+        Error::Deletion(e)
     }
 }
 
@@ -153,6 +194,7 @@ impl std::fmt::Display for Error {
             Self::MissingEndMarker => write!(f, "Missing end marker"),
             Self::Allocation(e) => write!(f, "Allocation error: {e}"),
             Self::Insertion(e) => write!(f, "Insertion error: {e}"),
+            Self::Deletion(e) => write!(f, "Deletion error: {e}"),
         }
     }
 }
