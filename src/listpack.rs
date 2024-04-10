@@ -202,12 +202,12 @@ impl ListpackHeader {
 
     /// Sets the new total amount of bytes representing the listpack.
     pub fn set_total_bytes(&mut self, total_bytes: u32) {
-        self.total_bytes = total_bytes as u32;
+        self.total_bytes = total_bytes;
     }
 
     /// Sets the new total number of elements the listpack holds.
     pub fn set_num_elements(&mut self, num_elements: u16) {
-        self.num_elements = num_elements as u16;
+        self.num_elements = num_elements;
     }
 }
 
@@ -2301,15 +2301,8 @@ where
     Allocator: CustomAllocator,
 {
     fn increment_num_elements(&mut self) {
-        let num_elements = self.get_header_ref().num_elements();
-        self.get_header_mut()
-            .set_num_elements(num_elements as u16 + 1);
-    }
-
-    fn decrement_num_elements(&mut self) {
-        let num_elements = self.get_header_ref().num_elements();
-        self.get_header_mut()
-            .set_num_elements(num_elements as u16 - 1);
+        let num_elements = self.get_header_ref().num_elements() as u16;
+        self.set_num_elements(num_elements + 1);
     }
 
     fn set_num_elements(&mut self, num_elements: u16) {

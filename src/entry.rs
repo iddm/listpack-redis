@@ -1027,7 +1027,7 @@ impl ListpackEntry {
         unsafe { ptr.cast().as_ref() }
     }
 
-    pub(crate) fn ref_from_slice<'a>(slice: &'a [u8]) -> &'a ListpackEntry {
+    pub(crate) fn ref_from_slice(slice: &[u8]) -> &ListpackEntry {
         unsafe { &*(slice.as_ptr() as *const ListpackEntry) }
     }
 
