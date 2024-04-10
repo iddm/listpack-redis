@@ -52,6 +52,59 @@ impl InsertionPlacement {
         }
     }
 }
+
+/// The fitting requirement for the listpack, after a test for an entry
+/// to be inserted. See [`Listpack::can_fit_entry`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum FittingRequirement {
+    /// The listpack must be extended by the given amount of bytes.
+    Grow(usize),
+    /// The listpack must be shrinked by the given amount of bytes.
+    Shrink(usize),
+    /// The listpack does not need to be changed.
+    NoChange,
+}
+
+impl FittingRequirement {
+    /// Returns the number of bytes regardless of the requirement.
+    #[allow(unused)]
+    fn get_size(&self) -> usize {
+        match self {
+            Self::Grow(size) => *size,
+            Self::Shrink(size) => *size,
+            Self::NoChange => 0,
+        }
+    }
+
+    fn from_difference(needed: usize, available: usize) -> Self {
+        match needed.cmp(&available) {
+            std::cmp::Ordering::Greater => Self::Grow(needed - available),
+            std::cmp::Ordering::Less => Self::Shrink(available - needed),
+            std::cmp::Ordering::Equal => Self::NoChange,
+        }
+    }
+}
+
+impl From<isize> for FittingRequirement {
+    fn from(size: isize) -> Self {
+        match size.cmp(&0) {
+            std::cmp::Ordering::Greater => Self::Grow(size as usize),
+            std::cmp::Ordering::Less => Self::Shrink(size.unsigned_abs()),
+            std::cmp::Ordering::Equal => Self::NoChange,
+        }
+    }
+}
+
+impl From<usize> for FittingRequirement {
+    fn from(size: usize) -> Self {
+        match size.cmp(&0) {
+            std::cmp::Ordering::Greater => Self::Grow(size),
+            std::cmp::Ordering::Equal => Self::NoChange,
+            _ => unreachable!(),
+        }
+    }
+}
+
 /// The header of the listpack data structure. Can only be obtained
 /// from an existing listpack using the [`Listpack::header_ref`] method.
 #[repr(C, packed(1))]
@@ -303,6 +356,18 @@ impl ListpackAllocationPointer {
                 .as_mut()
                 .unwrap()
         }
+    }
+
+    /// Sets a new layout.
+    ///
+    /// # Safety
+    ///
+    /// The user of this function must ensure that the layout is
+    /// correct.
+    unsafe fn set_layout(&mut self, layout: Layout) {
+        self.1 = layout;
+        self.get_header_mut().set_total_bytes(layout.size() as u32);
+        self.set_end_marker();
     }
 }
 
@@ -754,7 +819,10 @@ where
     ///
     /// When it is possible to fit an entry passed, the amount of bytes
     /// required to store the entry is returned. By this amount of bytes
-    /// the listpack must be extended prior to the insertion.
+    /// the listpack must be extended prior to the insertion. Otherwise,
+    /// if the element to be replaced is bigger than the new one, the
+    /// listpack does not need to be extended and needs to be shrinked,
+    /// by the amount of bytes returned (negative).
     ///
     /// # Example
     ///
@@ -777,8 +845,8 @@ where
         &self,
         entry: &ListpackEntryInsert,
         entry_to_replace: Option<&ListpackEntry>,
-    ) -> Result<usize> {
-        let available_listpack_length = unsafe { self.get_header_ref().available_bytes() };
+    ) -> Result<FittingRequirement> {
+        let available_listpack_length = self.get_header_ref().available_bytes();
         let object_to_replace_size = entry_to_replace
             .map(|e| e.total_bytes())
             .unwrap_or_default();
@@ -811,7 +879,10 @@ where
                     .into());
                 }
 
-                Ok(encoded_size - object_to_replace_size)
+                Ok(FittingRequirement::from_difference(
+                    encoded_size,
+                    object_to_replace_size,
+                ))
             }
             ListpackEntryInsert::Integer(_) => {
                 let encoded_size = entry.full_encoded_size();
@@ -826,7 +897,10 @@ where
                     .into());
                 }
 
-                Ok(encoded_size - object_to_replace_size)
+                Ok(FittingRequirement::from_difference(
+                    encoded_size,
+                    object_to_replace_size,
+                ))
             }
         }
     }
@@ -1343,11 +1417,9 @@ where
                 self.allocation.layout(),
                 new_layout,
             )?;
+
+            self.allocation.set_layout(new_layout);
         }
-        self.allocation.1 = new_layout;
-        self.get_header_mut()
-            .set_total_bytes(new_layout.size() as u32);
-        self.allocation.set_end_marker();
 
         Ok(())
     }
@@ -1363,45 +1435,26 @@ where
         self.grow(new_layout)
     }
 
-    /// Shrinks the capacity of the listpack to fit the number of
-    /// elements.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the listpack was shrunk, `false` if it wasn't.
-    // Commented out, as this method seems redundant: it seems that
-    // `shrink_to_fit` is called automatically when the listpack is
-    // modified (at least always when something is deleted).
-    // ///
-    // /// # Example
-    // ///
-    // /// ```
-    // /// use listpack_redis::Listpack;
-    // ///
-    // /// let mut listpack = Listpack::with_capacity(10);
-    // /// assert_eq!(listpack.get_storage_bytes(), 7);
-    // /// listpack.push("Hello, world!");
-    // /// assert_eq!(listpack.get_storage_bytes(), 22);
-    // /// listpack.push("Hello!");
-    // /// assert_eq!(listpack.get_storage_bytes(), 30);
-    // /// assert!(listpack.shrink_to_fit());
-    // /// assert_eq!(listpack.get_storage_bytes(), 22);
-    // /// let _ = listpack.pop();
-    // /// assert_eq!(listpack.get_storage_bytes(), 20);
-    // /// ```
-    // ///
-    // /// See [`Listpack::get_storage_bytes`] and
-    // /// [`Listpack::get_total_bytes`] for more information.
-    pub fn shrink_to_fit(&mut self) -> bool {
-        unimplemented!("Shrink to fit is not implemented.")
-        // if let Some(ptr) =
-        //     NonNull::new(unsafe { bindings::lpShrinkToFit(self.allocation.as_ptr()) })
-        // {
-        //     self.allocation = ptr;
-        //     true
-        // } else {
-        //     false
-        // }
+    /// Shrinks the listpack by `bytes_to_shrink`.
+    fn shrink_by(
+        &mut self,
+        bytes_to_shrink: usize,
+    ) -> Result<(), <Allocator as CustomAllocator>::Error> {
+        let new_layout =
+            Layout::from_size_align(self.allocation.layout().size() - bytes_to_shrink, 1)
+                .expect("Created layout");
+
+        unsafe {
+            self.allocation.0 = self.get_allocator().shrink(
+                self.allocation.ptr().cast(),
+                self.allocation.layout(),
+                new_layout,
+            )?;
+
+            self.allocation.set_layout(new_layout);
+        }
+
+        Ok(())
     }
 
     /// Truncates the listpack, keeping only the first `len` elements.
@@ -1583,6 +1636,8 @@ where
             .into());
         }
 
+        let encoded_value = entry.encode()?;
+
         let referred_element =
             ListpackEntry::ref_from_ptr(self.get_internal_entry_ptr(index).ok_or(
                 crate::error::InsertionError::IndexOutOfBounds {
@@ -1599,10 +1654,44 @@ where
             unsafe { end_ptr.offset_from(referred_element_ptr) as usize }
         };
 
-        let size_to_grow = self.can_fit_entry(&entry, element_to_replace)?;
+        let fitting_requirement = self.can_fit_entry(&entry, element_to_replace)?;
 
-        self.grow_by(size_to_grow)
-            .map_err(|_| AllocationError::FailedToGrow { size: size_to_grow })?;
+        match fitting_requirement {
+            FittingRequirement::NoChange => {}
+            FittingRequirement::Grow(size) => {
+                self.grow_by(size)
+                    .map_err(|_| AllocationError::FailedToGrow { size })?;
+            }
+            FittingRequirement::Shrink(size) => {
+                // The downsizing can only happen in the case of a replace.
+                // That means the new element is smaller than the one it
+                // replaces. The element to replace is the referred element.
+                // We can reposition the elements to the right of the
+                // referred element to the left by the size of the new
+                // element, so that the shrinking can happen.
+
+                let next_after_referred_element_ptr = unsafe {
+                    referred_element
+                        .as_ptr()
+                        .add(referred_element.total_bytes())
+                };
+
+                unsafe {
+                    std::ptr::copy(
+                        next_after_referred_element_ptr,
+                        referred_element
+                            .as_ptr()
+                            .cast_mut()
+                            .add(encoded_value.len()),
+                        // TODO: don't think this is right.
+                        length_to_relocate - referred_element.total_bytes() + encoded_value.len(),
+                    );
+                }
+
+                self.shrink_by(size)
+                    .map_err(|_| AllocationError::FailedToShrink { size })?;
+            }
+        }
 
         // Lets obtain a new reference to the element after the
         // reallocation.
@@ -1613,8 +1702,6 @@ where
                     length: self.len(),
                 },
             )?);
-
-        let encoded_value = entry.encode()?;
 
         match placement {
             InsertionPlacement::Before(_) => {
@@ -1679,19 +1766,13 @@ where
 
                 self.increment_num_elements();
             }
-            InsertionPlacement::Replace(_) => {
-                // 1. Replace the referred element with the new element.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        encoded_value.as_ptr(),
-                        referred_element.as_ptr().cast_mut(),
-                        encoded_value.len(),
-                    );
-                    // referred_element
-                    //     .as_mut_ptr()
-                    //     .copy_from_nonoverlapping(encoded_value.as_ptr(), encoded_value.len())
-                };
-            }
+            InsertionPlacement::Replace(_) => unsafe {
+                std::ptr::copy_nonoverlapping(
+                    encoded_value.as_ptr(),
+                    referred_element.as_ptr().cast_mut(),
+                    encoded_value.len(),
+                );
+            },
         }
 
         Ok(())
@@ -1716,7 +1797,7 @@ where
     /// ```
     pub fn try_push<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, entry: T) -> Result {
         let entry = entry.into();
-        let size_to_grow = self.can_fit_entry(&entry, None)?;
+        let fitting_requirement = self.can_fit_entry(&entry, None)?;
         // let old_end_offset = self.allocation.0.len() - 1;
         let old_end_offset = unsafe {
             self.allocation
@@ -1724,8 +1805,16 @@ where
                 .offset_from(self.allocation.ptr().as_ptr().cast()) as usize
         };
 
-        self.grow_by(size_to_grow)
-            .map_err(|_| AllocationError::FailedToGrow { size: size_to_grow })?;
+        match fitting_requirement {
+            FittingRequirement::NoChange => {}
+            FittingRequirement::Grow(size) => {
+                self.grow_by(size)
+                    .map_err(|_| AllocationError::FailedToGrow { size })?;
+            }
+            FittingRequirement::Shrink(_) => {
+                unreachable!("The listpack is growing, not shrinking.");
+            }
+        }
 
         let encoded_value = entry.encode()?;
 
@@ -2470,7 +2559,9 @@ where
     /// listpack.push("Hello, world!");
     /// listpack.replace(0, "Hello!");
     /// assert_eq!(listpack.len(), 1);
+    /// assert_eq!(listpack.get_storage_bytes(), 15);
     /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello!");
+    /// assert_eq!(listpack.get_storage_bytes(), 15);
     /// ```
     pub fn replace<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
         self.try_replace(index, entry).expect("Replaced an element")
@@ -2719,6 +2810,21 @@ mod tests {
         assert_eq!(listpack.get(1).unwrap().to_string(), "4");
         assert_eq!(listpack.get(2).unwrap().to_string(), "2");
         assert_eq!(listpack.get(3).unwrap().to_string(), "3");
+    }
+
+    #[test]
+    fn replace() {
+        let mut listpack: Listpack = Listpack::default();
+        assert_eq!(listpack.memory_consumption(), 39);
+        listpack.validate().unwrap();
+        listpack.push("Hello, world!");
+        listpack.validate().unwrap();
+        assert_eq!(listpack.memory_consumption(), 54);
+        assert_eq!(listpack.len(), 1);
+        listpack.replace(0, "Hello!");
+        assert_eq!(listpack.memory_consumption(), 47);
+        assert_eq!(listpack.len(), 1);
+        listpack.validate().unwrap();
     }
 
     #[test]

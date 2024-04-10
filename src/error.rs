@@ -60,6 +60,11 @@ pub enum AllocationError {
         /// The size to which the listpack had to grow.
         size: usize,
     },
+    /// An error indicating that the listpack failed to shrink in size.
+    FailedToShrink {
+        /// The size to which the listpack had to shrink.
+        size: usize,
+    },
 }
 
 impl std::fmt::Display for AllocationError {
@@ -67,6 +72,9 @@ impl std::fmt::Display for AllocationError {
         match self {
             Self::ListpackIsTooBig { size, max_size } => {
                 write!(f, "Listpack is too big: {size} > {max_size}")
+            }
+            Self::FailedToShrink { size } => {
+                write!(f, "Failed to shrink to size: {size}")
             }
             Self::FailedToGrow { size } => write!(f, "Failed to grow to size: {size}"),
         }
