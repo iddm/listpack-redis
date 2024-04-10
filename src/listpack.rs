@@ -871,61 +871,33 @@ where
         entry: &ListpackEntryInsert,
         entry_to_replace: Option<&ListpackEntry>,
     ) -> Result<FittingRequirement> {
-        let available_listpack_length = self.get_header_ref().available_bytes();
         let object_to_replace_size = entry_to_replace
             .map(|e| e.total_bytes())
             .unwrap_or_default();
 
-        match entry {
-            ListpackEntryInsert::String(s) => {
-                let encoded_size = entry.full_encoded_size();
+        let available_listpack_length =
+            self.get_header_ref().available_bytes() + object_to_replace_size;
 
-                if s.is_empty() {
-                    return Err(crate::error::InsertionError::StringIsEmpty.into());
-                }
+        let encoded_size = entry.full_encoded_size();
 
-                if encoded_size > available_listpack_length {
-                    return Err(crate::error::InsertionError::ListpackIsFull {
-                        current_length: encoded_size,
-                        available_listpack_length,
-                    }
-                    .into());
-                }
-
-                if encoded_size > object_to_replace_size
-                    && (encoded_size - object_to_replace_size) > available_listpack_length
-                {
-                    return Err(crate::error::InsertionError::ListpackIsFull {
-                        current_length: encoded_size,
-                        available_listpack_length,
-                    }
-                    .into());
-                }
-
-                Ok(FittingRequirement::from_difference(
-                    encoded_size,
-                    object_to_replace_size,
-                ))
+        if encoded_size > available_listpack_length {
+            return Err(crate::error::InsertionError::ListpackIsFull {
+                current_length: encoded_size,
+                available_listpack_length,
             }
-            ListpackEntryInsert::Integer(_) => {
-                let encoded_size = entry.full_encoded_size();
+            .into());
+        }
 
-                if encoded_size > object_to_replace_size
-                    && (encoded_size - object_to_replace_size) > available_listpack_length
-                {
-                    return Err(crate::error::InsertionError::ListpackIsFull {
-                        current_length: encoded_size,
-                        available_listpack_length,
-                    }
-                    .into());
-                }
-
-                Ok(FittingRequirement::from_difference(
-                    encoded_size,
-                    object_to_replace_size,
-                ))
+        if let ListpackEntryInsert::String(s) = entry {
+            if s.is_empty() {
+                return Err(crate::error::InsertionError::StringIsEmpty.into());
             }
         }
+
+        Ok(FittingRequirement::from_difference(
+            encoded_size,
+            object_to_replace_size,
+        ))
     }
 
     /// Returns the first element of the listpack, or [`None`] if it is
@@ -3069,7 +3041,7 @@ mod tests {
             ListpackEntryInsert::Integer(4_023_372_036_854_775_807),
         ];
 
-        for object in objects.iter() {
+        for object in &objects {
             listpack.replace(0, *object);
             let entry = listpack.get(0).unwrap();
             let data = entry.data().unwrap();
