@@ -878,21 +878,19 @@ where
 
         match entry {
             ListpackEntryInsert::String(s) => {
-                let len_bytes = s.len();
+                let encoded_size = entry.full_encoded_size();
 
-                if len_bytes == 0 {
+                if s.is_empty() {
                     return Err(crate::error::InsertionError::StringIsEmpty.into());
                 }
 
-                if len_bytes > available_listpack_length as usize {
+                if encoded_size > available_listpack_length {
                     return Err(crate::error::InsertionError::ListpackIsFull {
-                        current_length: len_bytes,
+                        current_length: encoded_size,
                         available_listpack_length,
                     }
                     .into());
                 }
-
-                let encoded_size = entry.full_encoded_size();
 
                 if encoded_size > object_to_replace_size
                     && (encoded_size - object_to_replace_size) > available_listpack_length
@@ -1696,6 +1694,8 @@ where
                         .add(referred_element.total_bytes())
                 };
 
+                let count_to_copy = length_to_relocate - referred_element.total_bytes();
+
                 unsafe {
                     std::ptr::copy(
                         next_after_referred_element_ptr,
@@ -1703,8 +1703,7 @@ where
                             .as_ptr()
                             .cast_mut()
                             .add(encoded_value.len()),
-                        // TODO: don't think this is right.
-                        length_to_relocate - referred_element.total_bytes() + encoded_value.len(),
+                        count_to_copy,
                     );
                 }
 
