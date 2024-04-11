@@ -1156,7 +1156,6 @@ pub enum ListpackEntryInsert<'a> {
 }
 
 impl ListpackEntryInsert<'_> {
-    // TODO: probably, should be in `ListpackEntry`.
     /// Returns the full encoded size of the entry, including:
     /// - the encoding byte,
     /// - the data block length.
