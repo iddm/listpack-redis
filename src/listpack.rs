@@ -181,19 +181,16 @@ impl ListpackHeader {
     }
 
     /// Returns the amount of bytes available for the listpack to store
-    /// new elements.
-    ///
-    /// # Note
-    ///
-    /// This is with regards to the maximum possible value
-    /// a listpack can hold in general, not of the current particular
-    /// listpack.
+    /// new elements. This is the maximum size of the allocation minus
+    /// the size of the header and the end marker and the existing
+    /// elements.
     pub fn available_bytes(&self) -> usize {
         Self::MAXIMUM_TOTAL_BYTES - self.total_bytes()
     }
 
     /// Returns the number of bytes the elements occupy in the listpack,
-    /// that is available right after the header.
+    /// that is available right after the header. This is the number of
+    /// bytes in the allocation without the header and the end marker.
     pub fn element_bytes(&self) -> usize {
         self.total_bytes()
             - std::mem::size_of::<ListpackHeader>()
@@ -282,21 +279,27 @@ impl ListpackAllocationPointer {
     /// Finds out the layout of the listpack by looking for the end
     /// marker.
     fn from_ptr(ptr: NonNull<[u8]>) -> Result<Self> {
-        // TODO: check that we could just check the last byte to be the
-        // end marker, instead of scanning the whole listpack.
-        unsafe { ptr.as_ref() }
-            .iter()
-            .enumerate()
-            .find_map(|(i, &b)| if b == END_MARKER { Some(i) } else { None })
-            .map(|end_index| {
-                // An impossible panic scenario, since all the
-                // requirements for calling this function are met.
-                let layout =
-                    Layout::from_size_align(end_index, 1).expect("Could not create layout");
+        let layout = Layout::from_size_align(ptr.len(), 1).expect("Could not create layout");
 
-                Self(ptr, layout)
-            })
-            .ok_or(crate::error::Error::MissingEndMarker)
+        if unsafe { ptr.as_ref() }.last() != Some(&END_MARKER) {
+            return Err(crate::error::Error::MissingEndMarker);
+        }
+
+        Ok(Self(ptr, layout))
+
+        // unsafe { ptr.as_ref() }
+        //     .iter()
+        //     .enumerate()
+        //     .find_map(|(i, &b)| if b == END_MARKER { Some(i) } else { None })
+        //     .map(|end_index| {
+        //         // An impossible panic scenario, since all the
+        //         // requirements for calling this function are met.
+        //         let layout =
+        //             Layout::from_size_align(end_index, 1).expect("Could not create layout");
+
+        //         Self(ptr, layout)
+        //     })
+        //     .ok_or(crate::error::Error::MissingEndMarker)
     }
 
     fn ptr(&self) -> NonNull<u8> {
@@ -1628,13 +1631,21 @@ where
 
         let encoded_value = entry.encode()?;
 
-        let referred_element =
-            ListpackEntry::ref_from_ptr(self.get_internal_entry_ptr(index).ok_or(
-                crate::error::InsertionError::IndexOutOfBounds {
-                    index,
-                    length: self.len(),
-                },
-            )?);
+        let referred_element_ptr = self.get_internal_entry_ptr(index).ok_or(
+            crate::error::InsertionError::IndexOutOfBounds {
+                index,
+                length: self.len(),
+            },
+        )?;
+
+        let referred_element = ListpackEntry::ref_from_ptr(referred_element_ptr);
+
+        let referred_element_offset = unsafe {
+            referred_element_ptr
+                .as_ptr()
+                .offset_from(self.allocation.data_start_ptr()) as usize
+        };
+        let referred_element_length = referred_element.total_bytes();
 
         let element_to_replace = placement.to_replace().map(|_| referred_element);
 
@@ -1653,12 +1664,13 @@ where
                     .map_err(|_| AllocationError::FailedToGrow { size })?;
             }
             FittingRequirement::Shrink(size) => {
-                // The downsizing can only happen in the case of a replace.
-                // That means the new element is smaller than the one it
-                // replaces. The element to replace is the referred element.
-                // We can reposition the elements to the right of the
-                // referred element to the left by the size of the new
-                // element, so that the shrinking can happen.
+                // The downsizing can only happen in the case of a
+                // replace. That means the new element is smaller than
+                // the one it replaces. The element to replace is the
+                // referred element. We can reposition the elements to
+                // the right of the referred element to the left by the
+                // size of the new element, so that the shrinking can
+                // happen.
 
                 let next_after_referred_element_ptr = unsafe {
                     referred_element
@@ -1666,17 +1678,21 @@ where
                         .add(referred_element.total_bytes())
                 };
 
-                let count_to_copy = length_to_relocate - referred_element.total_bytes();
+                // Excluse the referred element from the length to
+                // relocate.
+                let length_to_relocate = length_to_relocate - referred_element.total_bytes();
 
-                unsafe {
-                    std::ptr::copy(
-                        next_after_referred_element_ptr,
-                        referred_element
-                            .as_ptr()
-                            .cast_mut()
-                            .add(encoded_value.len()),
-                        count_to_copy,
-                    );
+                if length_to_relocate > 0 {
+                    unsafe {
+                        std::ptr::copy(
+                            next_after_referred_element_ptr,
+                            referred_element
+                                .as_ptr()
+                                .cast_mut()
+                                .add(encoded_value.len()),
+                            length_to_relocate,
+                        );
+                    }
                 }
 
                 self.shrink_by(size)
@@ -1685,14 +1701,18 @@ where
         }
 
         // Lets obtain a new reference to the element after the
-        // reallocation.
-        let referred_element =
-            ListpackEntry::ref_from_ptr(self.get_internal_entry_ptr(index).ok_or(
-                crate::error::InsertionError::IndexOutOfBounds {
-                    index,
-                    length: self.len(),
-                },
-            )?);
+        // reallocation. If the element was to be replaced, it might
+        // be partially destroyed by the reallocation. So, we can't
+        // work with it here, but we can work with its pointer.
+        let referred_element_ptr = unsafe {
+            NonNull::new_unchecked(
+                self.allocation
+                    .data_start_ptr()
+                    .cast_mut()
+                    .add(referred_element_offset),
+            )
+        }
+        .as_ptr();
 
         match placement {
             InsertionPlacement::Before(_) => {
@@ -1701,19 +1721,18 @@ where
                 // memory) by the size of the new element.
                 // 2. Insert the new element at the location of the
                 // referred element.
-                let referred_element_ptr = referred_element.as_ptr();
 
                 unsafe {
                     // Shift the elements to the right.
                     std::ptr::copy(
                         referred_element_ptr,
-                        referred_element_ptr.add(encoded_value.len()).cast_mut(),
+                        referred_element_ptr.add(encoded_value.len()),
                         length_to_relocate,
                     );
 
                     std::ptr::copy_nonoverlapping(
                         encoded_value.as_ptr(),
-                        referred_element_ptr.cast_mut(),
+                        referred_element_ptr,
                         encoded_value.len(),
                     );
                 }
@@ -1732,25 +1751,20 @@ where
                 // reallocation).
 
                 // Skip the referred element.
-                let next_after_referred_element_ptr = unsafe {
-                    referred_element
-                        .as_ptr()
-                        .add(referred_element.total_bytes())
-                };
+                let next_after_referred_element_ptr =
+                    unsafe { referred_element_ptr.add(referred_element.total_bytes()) };
 
                 unsafe {
                     // Shift the elements to the right.
                     std::ptr::copy_nonoverlapping(
                         next_after_referred_element_ptr,
-                        next_after_referred_element_ptr
-                            .add(encoded_value.len())
-                            .cast_mut(),
-                        length_to_relocate - referred_element.total_bytes(),
+                        next_after_referred_element_ptr.add(encoded_value.len()),
+                        length_to_relocate - referred_element_length,
                     );
 
                     std::ptr::copy_nonoverlapping(
                         encoded_value.as_ptr(),
-                        next_after_referred_element_ptr.cast_mut(),
+                        next_after_referred_element_ptr,
                         encoded_value.len(),
                     );
                 }
@@ -1760,7 +1774,7 @@ where
             InsertionPlacement::Replace(_) => unsafe {
                 std::ptr::copy_nonoverlapping(
                     encoded_value.as_ptr(),
-                    referred_element.as_ptr().cast_mut(),
+                    referred_element_ptr,
                     encoded_value.len(),
                 );
             },
@@ -1789,7 +1803,6 @@ where
     pub fn try_push<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, entry: T) -> Result {
         let entry = entry.into();
         let fitting_requirement = self.can_fit_entry(&entry, None)?;
-        // let old_end_offset = self.allocation.0.len() - 1;
         let old_end_offset = unsafe {
             self.allocation
                 .data_end_ptr()
@@ -2337,6 +2350,36 @@ where
         Ok(())
     }
 
+    fn read_element_length_from_the_end(ptr: *const u8) -> usize {
+        let mut data = ptr;
+        let mut bytes = [0u8; 5];
+        let mut current = bytes.len() - 1;
+
+        loop {
+            let byte = unsafe { *data };
+            bytes[current] = byte;
+
+            if byte & 0b1000_0000 == 0 {
+                break;
+            }
+
+            current -= 1;
+
+            data = unsafe { data.sub(1) };
+        }
+
+        // Concatenate all the bytes from the left-to-right, ignoring
+        // the most significant bit.
+        let mut length = 0;
+
+        for byte in bytes[current..].iter() {
+            length = (length << 7) | (byte & 0b0111_1111) as usize;
+        }
+
+        // length + bytes.len() - 1 - current
+        length + bytes.len() - current
+    }
+
     fn get_internal_entry_ptr_from_start(&self, index: usize) -> Option<NonNull<u8>> {
         if self.is_empty() || index >= self.len() {
             return None;
@@ -2359,37 +2402,42 @@ where
         Some(unsafe { NonNull::new_unchecked(data.as_ptr().cast_mut()) })
     }
 
-    // TODO: implement this.
     fn get_internal_entry_ptr_from_end(&self, index: usize) -> Option<NonNull<u8>> {
-        unimplemented!("Get internal entry pointer from end is not implemented.")
-        //     if self.is_empty() {
-        //         return None;
-        //     }
+        if self.is_empty() || index >= self.len() {
+            return None;
+        }
 
-        //     let mut current = self.len() - 1;
+        let mut current = self.len();
+        // Point to the last byte of the last's element total element
+        // length.
+        let mut data = self.allocation.data_end_ptr();
 
-        //     let mut data = self.allocation.data_end_ptr();
+        while current > index {
+            let element_length = Self::read_element_length_from_the_end(unsafe { data.sub(1) });
+            data = unsafe { data.sub(element_length) };
 
-        //     while current < index {
-        //         if data.is_null() || unsafe { *data } == END_MARKER {
-        //             return None;
-        //         }
+            if current == 0 {
+                return None;
+            }
 
-        //         let entry = ListpackEntry::ref_from_ptr(unsafe { NonNull::new_unchecked(data) });
-        //         data = unsafe { data.offset(entry.total_bytes()) };
-        //     }
+            current -= 1;
+        }
 
-        //     Some(unsafe { NonNull::new_unchecked(data) })
+        Some(unsafe { NonNull::new_unchecked(data.cast_mut()) })
     }
 
     /// Returns a pointer to the listpack's entry at the given index.
     fn get_internal_entry_ptr(&self, index: usize) -> Option<NonNull<u8>> {
-        // TODO:
-        // check that the index is at the beginning or close to the end,
+        // Check that the index is at the beginning or close to the end,
         // and search for the entry from the beginning or the end
-        // respectively.
+        // respectively. This will reduce the number of iterations
+        // needed to find the entry.
 
-        self.get_internal_entry_ptr_from_start(index)
+        if index < self.len() / 2 {
+            self.get_internal_entry_ptr_from_start(index)
+        } else {
+            self.get_internal_entry_ptr_from_end(index)
+        }
     }
 
     /// Returns the amount of bytes used by the listpack to store the
@@ -2859,6 +2907,29 @@ mod tests {
         assert_eq!(listpack.get(2), None);
     }
 
+    // These two ways of doing the same must have the same results.
+    // The only difference between those is how the elements are
+    // located.
+    #[test]
+    fn get_reversed() {
+        let listpack = create_hello_world_listpack();
+
+        assert_eq!(
+            listpack.get_internal_entry_ptr_from_start(0),
+            listpack.get_internal_entry_ptr_from_end(0)
+        );
+
+        assert_eq!(
+            listpack.get_internal_entry_ptr_from_start(1),
+            listpack.get_internal_entry_ptr_from_end(1)
+        );
+
+        assert_eq!(
+            listpack.get_internal_entry_ptr_from_start(2),
+            listpack.get_internal_entry_ptr_from_end(2)
+        );
+    }
+
     #[test]
     fn insert_before() {
         let mut listpack: Listpack = Listpack::default();
@@ -2882,6 +2953,18 @@ mod tests {
         assert_eq!(listpack.get(1).unwrap().to_string(), "4");
         assert_eq!(listpack.get(2).unwrap().to_string(), "2");
         assert_eq!(listpack.get(3).unwrap().to_string(), "3");
+    }
+
+    #[test]
+    fn insert_after() {
+        let mut listpack: Listpack = Listpack::default();
+
+        listpack.push("Hello, world!");
+        listpack.insert_after(0, "Hello!");
+
+        assert_eq!(listpack.len(), 2);
+        assert_eq!(listpack.get(0).unwrap().to_string(), "Hello, world!");
+        assert_eq!(listpack.get(1).unwrap().to_string(), "Hello!");
     }
 
     #[test]
@@ -2988,16 +3071,15 @@ mod tests {
 
         for (length, expected_length) in [
             (5, 7),
-            (2usize.pow(7), 130),
-            (2usize.pow(12), 4101),
-            (2usize.pow(20), 1048581),
+            (2usize.pow(7), 132),
+            (2usize.pow(12), 4103),
+            (2usize.pow(20), 1048584),
         ] {
-            // A single ASCII-character repeated (2^7 + 1) times, to test
-            // the 14-bit encoding (2 bytes for the length).
             let string = "a".repeat(length);
             listpack.replace(0, &string);
 
             let entry = listpack.get(0).unwrap();
+            dbg!(entry);
             let total_bytes = entry.total_bytes();
             assert_eq!(total_bytes, expected_length);
             assert_eq!(entry.to_string(), string);
@@ -3010,6 +3092,17 @@ mod tests {
 
         let listpack: Listpack = Listpack::from(&["Hello", "World"]);
         assert_eq!(listpack, &array);
+    }
+
+    #[test]
+    fn from() {
+        let listpack1: Listpack = Listpack::from(&["Hello"]);
+        let mut listpack2: Listpack = Listpack::default();
+        listpack2.push("Hello");
+
+        assert_eq!(listpack1.len(), listpack2.len());
+        assert_eq!(listpack1[0].to_string(), "Hello");
+        assert_eq!(listpack2[0].to_string(), "Hello");
     }
 
     #[test]
@@ -3040,12 +3133,39 @@ mod tests {
             let data = entry.data().unwrap();
             match object {
                 ListpackEntryInsert::Integer(integer) => {
-                    assert_eq!(data.get_integer().unwrap(), *integer);
+                    assert_eq!(
+                        data.get_integer().unwrap(),
+                        *integer,
+                        "with object: {object:?}"
+                    );
                 }
                 ListpackEntryInsert::String(string) => {
-                    assert_eq!(data.get_str().unwrap(), *string);
+                    assert_eq!(data.get_str().unwrap(), *string, "with object: {object:?}");
                 }
             }
         }
+    }
+
+    #[test]
+    fn calculate_element_length_from_the_end() {
+        let entry = ListpackEntryInsert::from("Hello");
+        let encoded = entry.encode().unwrap();
+        let ptr = unsafe { encoded.as_ptr().add(encoded.len() - 1) };
+        let length = Listpack::<DefaultAllocator>::read_element_length_from_the_end(ptr);
+
+        // - 1 byte for the total element length of the small string.
+        // So it occupies actually one byte for the encoding byte and
+        // five for the string itself.
+        assert_eq!(length, encoded.len());
+
+        let string = "a".repeat(2usize.pow(12));
+        let entry = ListpackEntryInsert::from(&string);
+        let encoded = entry.encode().unwrap();
+        let ptr = unsafe { encoded.as_ptr().add(encoded.len() - 1) };
+        let length = Listpack::<DefaultAllocator>::read_element_length_from_the_end(ptr);
+
+        // A large string occupies one byte for the encoding, then four
+        // next bytes for the string length, and then the string itself.
+        assert_eq!(length, encoded.len());
     }
 }

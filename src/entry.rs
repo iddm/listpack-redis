@@ -353,18 +353,21 @@ impl ListpackEntryData<'_> {
 fn encode_total_element_length(length: usize) -> Result<Vec<u8>> {
     Ok(match length {
         // 1. If it fits into a 7-bit integer, store it as a single byte.
+        //
         // 2. If it doesn't fit into 7 bits, but fits into 14 bits, store
-        //   it as a two-byte integer, with the first byte having the
+        // it as a two-byte integer, with the first byte having the
         // highest bit set to zero and the highest 7 bits of the value,
         // and the second byte having the highest bit set to 1 and the
         // lowest 7 bits of the value.
+        //
         // 3. If it doesn't fit into 14 bits, but fits into 21 bits, store
-        //  it as a three-byte integer, with the first byte having the
-        //  highest bit set to 0 and the lowest 7 bits to the highest 7
-        //  bits of the value, the second byte having the highest bit set
-        //  to 1 and the further lowest 7 bits of the value, and the
+        // it as a three-byte integer, with the first byte having the
+        // highest bit set to 0 and the lowest 7 bits to the highest 7
+        // bits of the value, the second byte having the highest bit set
+        // to 1 and the further lowest 7 bits of the value, and the
         // third byte having the highest bit set to 1 and the lowest 7
         // bits of the value.
+        //
         // 4. If it doesn't fit into 21 bits, but fits into 28 bits,
         // store it as a four-byte integer, with the first byte having
         // the highest bit set to 0 and the lowest 7 bits to the highest
@@ -373,6 +376,7 @@ fn encode_total_element_length(length: usize) -> Result<Vec<u8>> {
         // byte having the highest bit set to 1 and the further lowest 7
         // bits of the value, and the fourth byte having the highest bit
         // set to 1 and the lowest 7 bits of the value.
+        //
         // 5. If it doesn't fit into 28 bits, but fits into 35 bits, store
         // it as a five-byte integer, with the first byte having the
         // highest bit set to 0 and the lowest 7 bits to the highest 7
@@ -434,6 +438,28 @@ fn encode_total_element_length(length: usize) -> Result<Vec<u8>> {
     })
 }
 
+/// Returns the number of bytes the `total-element-length` part of the
+/// element should occupy.
+fn calculate_total_element_length(object_length: usize) -> usize {
+    // We need to take the "len" and count how many times we can split
+    // it into 7-bit integers.
+
+    let mut count = 1;
+    let mut remainder = object_length;
+
+    loop {
+        remainder >>= 7;
+
+        if remainder > 0 {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+
+    count
+}
+
 impl<'a> Encode for ListpackEntryData<'a> {
     /// The encoding of the data block is as follows:
     ///
@@ -457,15 +483,10 @@ impl<'a> Encode for ListpackEntryData<'a> {
         Ok(match self {
             // The small unsigned integer is embedded into the encoding
             // byte itself, so appending only the total-element-length
-            // byte which equals to two: the encoding byte and the
-            // total-element-length byte itself.
-            Self::SmallUnsignedInteger(u) => vec![u & 0b01111111, 2],
+            // byte which equals to one: the encoding byte itself.
+            Self::SmallUnsignedInteger(u) => vec![u & 0b01111111, 1],
             Self::SignedInteger13Bit(i) => {
-                let mut block = vec![
-                    // encoding_type_byte | ((i >> 11) as u8 & 0b00011111)
-                    encoding_type_byte | ((i >> 8) as u8),
-                    (*i as u8),
-                ];
+                let mut block = vec![encoding_type_byte | ((i >> 8) as u8), (*i as u8)];
 
                 let mut length = encode_total_element_length(block.len())?;
                 block.append(&mut length);
@@ -486,6 +507,12 @@ impl<'a> Encode for ListpackEntryData<'a> {
 
                 let mut data = i.to_le_bytes().to_vec();
                 block.append(&mut data);
+
+                // If the number is 24-bit, the last byte is zero, so we
+                // need to remove it.
+                if block.ends_with(&[0]) {
+                    block.pop();
+                }
 
                 let mut length = encode_total_element_length(block.len())?;
                 block.append(&mut length);
@@ -513,10 +540,7 @@ impl<'a> Encode for ListpackEntryData<'a> {
                     });
                 }
 
-                let mut block = vec![
-                    // encoding_type_byte | ((i >> 11) as u8 & 0b00011111)
-                    encoding_type_byte | (string_length as u8),
-                ];
+                let mut block = vec![encoding_type_byte | (string_length as u8)];
 
                 let mut data = s.as_bytes().to_vec();
                 block.append(&mut data);
@@ -536,7 +560,6 @@ impl<'a> Encode for ListpackEntryData<'a> {
                 }
 
                 let mut block = vec![
-                    // encoding_type_byte | ((i >> 11) as u8 & 0b00011111)
                     encoding_type_byte | ((string_length >> 8) as u8),
                     (string_length as u8),
                 ];
@@ -623,11 +646,11 @@ macro_rules! impl_listpack_entry_data_from_number {
                         Self::SmallUnsignedInteger(n as u8)
                     } else if (-4096..=4095).contains(&n) {
                         Self::SignedInteger13Bit(n as i16)
-                    } else if (-32768..=32767).contains(&n) {
+                    } else if (-32_768..=32_767).contains(&n) {
                         Self::SignedInteger16Bit(n as i16)
-                    } else if (-8388608..=8388607).contains(&n) {
+                    } else if (-8_388_608..=8_388_607).contains(&n) {
                         Self::SignedInteger24Bit(n as i32)
-                    } else if (-2147483648..=2147483647).contains(&n) {
+                    } else if (-2_147_483_648..=2_147_483_647).contains(&n) {
                         Self::SignedInteger32Bit(n as i32)
                     } else {
                         Self::SignedInteger64Bit(n)
@@ -831,7 +854,10 @@ impl ListpackEntry {
                         let data = std::slice::from_raw_parts(ptr, len);
                         // One extra byte for the length of the data block.
                         let extra_length = Self::ENCODING_TYPE_BYTE_LENGTH + 1;
-                        (data, len + extra_length)
+                        let object_length = len + extra_length;
+                        let total_bytes =
+                            object_length + calculate_total_element_length(object_length);
+                        (data, total_bytes)
                     };
                     Some(data)
                 }
@@ -845,7 +871,10 @@ impl ListpackEntry {
                         let data = std::slice::from_raw_parts(ptr, len);
                         // Four extra bytes for the length of the data block.
                         let extra_length = Self::ENCODING_TYPE_BYTE_LENGTH + 4;
-                        (data, len + extra_length)
+                        let object_length = len + extra_length;
+                        let total_bytes =
+                            object_length + calculate_total_element_length(object_length);
+                        (data, total_bytes)
                     };
                     Some(data)
                 }
@@ -1158,16 +1187,13 @@ impl ListpackEntryInsert<'_> {
                     // extra byte.
                     //
                     // 2: The "total-element-length" byte length.
-                    len + 2 + 2
+                    let object_length = len + 2;
+
+                    object_length + calculate_total_element_length(object_length)
                 } else {
-                    let total_element_length_byte_length = if len <= 65535 {
-                        3
-                    } else if len <= 16777215 {
-                        4
-                    } else {
-                        5
-                    };
-                    len + 5 + total_element_length_byte_length
+                    let object_length = len + 5;
+
+                    object_length + calculate_total_element_length(object_length)
                 }
             }
             Self::Integer(n) => {
@@ -1205,43 +1231,6 @@ impl ListpackEntryInsert<'_> {
             }
         }
     }
-
-    // fn encode_encoding_byte(&self) -> u8 {
-    //     match self {
-    //         Self::String(s) => {
-    //             let len = s.len();
-    //             if len <= 63 {
-    //                 0b10000000 | len as u8
-    //             } else if len <= 4095 {
-    //                 0b01000000 | ((len >> 8) & 0b00001111) as u8
-    //             } else {
-    //                 let total_element_length_byte_length = if len <= 65535 {
-    //                     3
-    //                 } else if len <= 16777215 {
-    //                     4
-    //                 } else {
-    //                     5
-    //                 };
-    //                 0b11000000 | total_element_length_byte_length as u8
-    //             }
-    //         }
-    //         Self::Integer(n) => {
-    //             if (0..=127).contains(n) {
-    //                 0b00000000 | *n as u8
-    //             } else if (-4096..=4095).contains(n) {
-    //                 0b10000000 | (((*n >> 8) & 0b00011111) as u8)
-    //             } else if (-32768..=32767).contains(n) {
-    //                 0b11000000
-    //             } else if (-8388608..=8388607).contains(n) {
-    //                 0b11100000
-    //             } else if (-2147483648..=2147483647).contains(n) {
-    //                 0b11110000
-    //             } else {
-    //                 0b11111111
-    //             }
-    //         }
-    //     }
-    // }
 }
 
 impl<'a> Encode for ListpackEntryInsert<'a> {
@@ -1487,6 +1476,22 @@ mod tests {
         use super::*;
 
         #[test]
+        fn total_element_length_calculation() {
+            assert_eq!(calculate_total_element_length(0), 1);
+            assert_eq!(calculate_total_element_length(1), 1);
+            assert_eq!(calculate_total_element_length(127), 1);
+            assert_eq!(calculate_total_element_length(128), 2);
+            assert_eq!(calculate_total_element_length(3000), 2);
+            assert_eq!(calculate_total_element_length(16383), 2);
+            assert_eq!(calculate_total_element_length(16384), 3);
+            assert_eq!(calculate_total_element_length(2097151), 3);
+            assert_eq!(calculate_total_element_length(2097152), 4);
+            assert_eq!(calculate_total_element_length(268435455), 4);
+            assert_eq!(calculate_total_element_length(268435456), 5);
+            assert_eq!(calculate_total_element_length(34359738367), 5);
+        }
+
+        #[test]
         fn total_element_length() {
             assert_eq!(encode_total_element_length(0).unwrap(), vec![0]);
             assert_eq!(encode_total_element_length(1).unwrap(), vec![1]);
@@ -1501,7 +1506,40 @@ mod tests {
                 vec![0b00000011, 0b11110100]
             );
 
-            // TODO: more test coverage for all the other lengths.
+            assert_eq!(
+                encode_total_element_length(16383).unwrap(),
+                vec![0b01111111, 0b11111111]
+            );
+
+            assert_eq!(
+                encode_total_element_length(16384).unwrap(),
+                vec![0b00000001, 0b10000000, 0b10000000]
+            );
+
+            assert_eq!(
+                encode_total_element_length(2097151).unwrap(),
+                vec![0b01111111, 0b11111111, 0b11111111]
+            );
+
+            assert_eq!(
+                encode_total_element_length(2097152).unwrap(),
+                vec![0b00000001, 0b10000000, 0b10000000, 0b10000000]
+            );
+
+            assert_eq!(
+                encode_total_element_length(268435455).unwrap(),
+                vec![0b01111111, 0b11111111, 0b11111111, 0b11111111]
+            );
+
+            assert_eq!(
+                encode_total_element_length(268435456).unwrap(),
+                vec![0b00000001, 0b10000000, 0b10000000, 0b10000000, 0b10000000]
+            );
+
+            assert_eq!(
+                encode_total_element_length(34359738367).unwrap(),
+                vec![0b01111111, 0b11111111, 0b11111111, 0b11111111, 0b11111111]
+            );
         }
 
         #[test]
