@@ -1752,7 +1752,7 @@ where
 
                 // Skip the referred element.
                 let next_after_referred_element_ptr =
-                    unsafe { referred_element_ptr.add(referred_element.total_bytes()) };
+                    unsafe { referred_element_ptr.add(referred_element_length) };
 
                 unsafe {
                     // Shift the elements to the right.
