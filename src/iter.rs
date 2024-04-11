@@ -297,7 +297,7 @@ where
     }
 }
 
-/// Removes the specified range from the vector in bulk, returning all
+/// Removes the specified range from the listpack in bulk, returning all
 /// removed elements as an iterator. If the iterator is dropped before
 /// being fully consumed, it drops the remaining removed elements.
 ///
@@ -339,7 +339,8 @@ where
             return None;
         }
 
-        let element = self.listpack.remove(self.start + self.offset);
+        let element = self.listpack.get(self.start + self.offset).unwrap().into();
+
         self.offset += 1;
 
         Some(element)
@@ -355,7 +356,11 @@ where
             return None;
         }
 
-        let element = self.listpack.remove(self.end - self.offset - 1);
+        let element = self
+            .listpack
+            .get(self.end - self.offset - 1)
+            .unwrap()
+            .into();
         self.offset += 1;
 
         Some(element)
@@ -367,23 +372,11 @@ where
     Allocator: CustomAllocator,
 {
     fn drop(&mut self) {
-        unimplemented!("Drop is not implemented.")
-        // let ptr = unsafe {
-        //     bindings::lpDeleteRange(
-        //         self.listpack.allocation.as_ptr(),
-        //         (self.start + self.offset) as _,
-        //         (self.end - self.start - self.offset) as _,
-        //     )
-        // };
-
-        // if let Some(ptr) = NonNull::new(ptr) {
-        //     self.listpack.allocation = ptr;
-        // } else {
-        //     panic!("The range is out of bounds.");
-        // }
+        self.listpack
+            .remove_range(self.start, self.end - self.start);
     }
 }
-
+//
 // /// A mutable iterator over the elements of a listpack.
 // ///
 // /// # Example
