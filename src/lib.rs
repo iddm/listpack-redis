@@ -54,7 +54,6 @@ pub mod entry;
 pub mod error;
 pub mod iter;
 pub mod listpack;
-mod redis_helpers;
 
 /// The prelude module contains all the types and traits that you need
 /// to use the listpack library.

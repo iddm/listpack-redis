@@ -1,4 +1,11 @@
-//! The listpack interface.
+//! The listpack interface and main implementation.
+//!
+//! The listpack data structure is a memory-efficient and compact
+//! representation of a list of elements. It is used in Redis to store
+//! lists of strings and numbers. The listpack data structure is
+//! implemented in the C programming language, and this crate
+//! reimplements the listpack data structure in Rust, also extending its
+//! functionality and the data types it can store.
 
 use std::{
     alloc::Layout,
@@ -100,7 +107,7 @@ impl From<usize> for FittingRequirement {
         match size.cmp(&0) {
             std::cmp::Ordering::Greater => Self::Grow(size),
             std::cmp::Ordering::Equal => Self::NoChange,
-            _ => unreachable!(),
+            _ => unreachable!("The size cannot be negative."),
         }
     }
 }
@@ -230,14 +237,6 @@ impl AsRef<ListpackHeader> for ListpackHeaderRef<'_> {
     }
 }
 
-// impl Deref for ListpackHeaderRef<'_> {
-//     type Target = Listpack;
-
-//     fn deref(&self) -> &Self::Target {
-//         unsafe { &*(self as *const _ as *const Listpack) }
-//     }
-// }
-
 impl ListpackHeaderRef<'_> {
     /// Returns the total amount of bytes representing the listpack.
     ///
@@ -286,20 +285,6 @@ impl ListpackAllocationPointer {
         }
 
         Ok(Self(ptr, layout))
-
-        // unsafe { ptr.as_ref() }
-        //     .iter()
-        //     .enumerate()
-        //     .find_map(|(i, &b)| if b == END_MARKER { Some(i) } else { None })
-        //     .map(|end_index| {
-        //         // An impossible panic scenario, since all the
-        //         // requirements for calling this function are met.
-        //         let layout =
-        //             Layout::from_size_align(end_index, 1).expect("Could not create layout");
-
-        //         Self(ptr, layout)
-        //     })
-        //     .ok_or(crate::error::Error::MissingEndMarker)
     }
 
     fn ptr(&self) -> NonNull<u8> {
@@ -473,8 +458,7 @@ where
 
 impl<Allocator> Drop for Listpack<Allocator>
 where
-    Allocator: CustomAllocator, // Allocator: ListpackAllocator,
-                                // <Allocator as CustomAllocator>::Error: Debug,
+    Allocator: CustomAllocator,
 {
     fn drop(&mut self) {
         unsafe {
@@ -963,24 +947,21 @@ where
     /// let mut listpack: Listpack = Listpack::default();
     ///
     /// listpack.push("Hello");
-    /// listpack.push("World");
+    /// listpack.push("World!");
     ///
     /// unsafe { listpack.swap_unchecked(0, 1) };
     ///
     /// assert_eq!(listpack.len(), 2);
     ///
-    /// assert_eq!(listpack[0].to_string(), "World");
+    /// assert_eq!(listpack[0].to_string(), "World!");
     /// assert_eq!(listpack[1].to_string(), "Hello");
     /// ```
     pub unsafe fn swap_unchecked(&mut self, a: usize, b: usize) {
         let a_object = ListpackEntryRemoved::from(self.get(a).expect("Get an entry from listpack"));
         let b_object = ListpackEntryRemoved::from(self.get(b).expect("Get an entry from listpack"));
 
-        let b_object = ListpackEntryInsert::from(&b_object);
-        self.replace(a, b_object);
-
-        let a_object = ListpackEntryInsert::from(&a_object);
-        self.replace(b, a_object);
+        self.replace(a, &b_object);
+        self.replace(b, &a_object);
     }
 
     /// Returns an iterator over all contiguous windows of length
@@ -1498,10 +1479,6 @@ where
         self.truncate(0)
     }
 
-    // pub fn allocator(&self) -> bindings::lpAlloc {
-    //     unsafe { bindings::lpGetAlloc(self.ptr.as_ptr()) }
-    // }
-
     /// Appends an element to the back of the listpack.
     ///
     /// # Panics
@@ -1640,7 +1617,7 @@ where
 
         let referred_element = ListpackEntry::ref_from_ptr(referred_element_ptr);
 
-        let referred_element_offset = unsafe {
+        let referred_element_offset_from_start = unsafe {
             referred_element_ptr
                 .as_ptr()
                 .offset_from(self.allocation.data_start_ptr()) as usize
@@ -1709,7 +1686,7 @@ where
                 self.allocation
                     .data_start_ptr()
                     .cast_mut()
-                    .add(referred_element_offset),
+                    .add(referred_element_offset_from_start),
             )
         }
         .as_ptr();
@@ -1772,6 +1749,17 @@ where
                 self.increment_num_elements();
             }
             InsertionPlacement::Replace(_) => unsafe {
+                // Skip the referred element.
+                let next_after_referred_element_ptr =
+                    referred_element_ptr.add(referred_element_length);
+
+                // Shift the elements to the right.
+                std::ptr::copy_nonoverlapping(
+                    next_after_referred_element_ptr,
+                    referred_element_ptr.add(encoded_value.len()),
+                    length_to_relocate - referred_element_length,
+                );
+
                 std::ptr::copy_nonoverlapping(
                     encoded_value.as_ptr(),
                     referred_element_ptr,
@@ -1933,7 +1921,7 @@ where
     /// Removes the elements in the specified range from the listpack
     /// in bulk, returning all removed elements as an iterator.
     ///
-    /// See [`ListpackDrain`].
+    /// See [`crate::iter::ListpackDrain`].
     ///
     /// # Panics
     ///
@@ -2461,29 +2449,6 @@ where
         self.get_header_ref().total_bytes()
     }
 
-    // Commented out, as listpack C API doesn't provide a method to
-    // return the total bytes used by the listpack (including the
-    // capacity).
-    // /// Returns the total number of bytes used by the listpack,
-    // /// not just the storage bytes (the actual elements), but also the
-    // /// memory allocated for the capacity.
-    // ///
-    // /// # Example
-    // ///
-    // /// ```
-    // /// use listpack_redis::Listpack;
-    // ///
-    // /// let mut listpack = Listpack::with_capacity(10);
-    // /// assert_eq!(listpack.get_total_bytes(), 7);
-    // /// assert_eq!(listpack.get_storage_bytes(), 7);
-    // /// listpack.push("Hello, world!");
-    // /// assert_eq!(listpack.get_storage_bytes(), 22);
-    // /// assert_eq!(listpack.get_total_bytes(), 22);
-    // /// ```
-    // pub fn get_total_bytes(&self) -> usize {
-    //     unsafe { self.header_ref() }.total_bytes()
-    // }
-
     /// Removes the elements in the specified range from the listpack.
     ///
     /// # Panics
@@ -2750,7 +2715,7 @@ mod tests {
 
     #[test]
     fn new_and_empty() {
-        let allocator = DefaultAllocator::default();
+        let allocator = DefaultAllocator;
         let listpack: Listpack = Listpack::new(allocator);
         drop(listpack);
     }
@@ -2969,16 +2934,39 @@ mod tests {
 
     #[test]
     fn replace() {
+        const SMALLER_STRING: &str = "a";
+        const MIDDLE_STRING: &str = "ab";
+        const LARGER_STRING: &str = "abc";
+
         let mut listpack: Listpack = Listpack::default();
         assert_eq!(listpack.memory_consumption(), 39);
         listpack.validate().unwrap();
-        listpack.push("Hello, world!");
+
+        listpack.push(MIDDLE_STRING);
         listpack.validate().unwrap();
-        assert_eq!(listpack.memory_consumption(), 54);
+        assert_eq!(listpack.memory_consumption(), 43);
+        assert_eq!(&listpack.get(0).unwrap().to_string(), MIDDLE_STRING);
         assert_eq!(listpack.len(), 1);
-        listpack.replace(0, "Hello!");
-        assert_eq!(listpack.memory_consumption(), 47);
+
+        // Downsize to a smaller string.
+        listpack.replace(0, SMALLER_STRING);
+        assert_eq!(listpack.memory_consumption(), 42);
         assert_eq!(listpack.len(), 1);
+        assert_eq!(listpack.get(0).unwrap().to_string(), SMALLER_STRING);
+        listpack.validate().unwrap();
+
+        // Upsize to a larger string.
+        listpack.replace(0, LARGER_STRING);
+        assert_eq!(listpack.memory_consumption(), 44);
+        assert_eq!(listpack.len(), 1);
+        assert_eq!(listpack.get(0).unwrap().to_string(), LARGER_STRING);
+        listpack.validate().unwrap();
+
+        // Replace to the same string.
+        listpack.replace(0, LARGER_STRING);
+        assert_eq!(listpack.memory_consumption(), 44);
+        assert_eq!(listpack.len(), 1);
+        assert_eq!(listpack.get(0).unwrap().to_string(), LARGER_STRING);
         listpack.validate().unwrap();
     }
 
@@ -3167,5 +3155,32 @@ mod tests {
         // A large string occupies one byte for the encoding, then four
         // next bytes for the string length, and then the string itself.
         assert_eq!(length, encoded.len());
+    }
+
+    #[test]
+    fn swap() {
+        // let mut listpack: Listpack = Listpack::default();
+
+        // listpack.push("Hello");
+        // listpack.push("World");
+
+        // unsafe { listpack.swap_unchecked(0, 1) };
+
+        // assert_eq!(listpack.len(), 2);
+
+        // assert_eq!(listpack[0].to_string(), "World");
+        // assert_eq!(listpack[1].to_string(), "Hello");
+
+        let mut listpack: Listpack = Listpack::default();
+
+        listpack.push("Hello");
+        listpack.push("World!");
+
+        unsafe { listpack.swap_unchecked(0, 1) };
+
+        assert_eq!(listpack.len(), 2);
+
+        assert_eq!(listpack[0].to_string(), "World!");
+        assert_eq!(listpack[1].to_string(), "Hello");
     }
 }

@@ -105,7 +105,6 @@ pub enum ListpackEntryEncodingType {
 
 impl Encode for ListpackEntryEncodingType {
     fn encode(&self) -> Result<Vec<u8>> {
-        // Ok(vec![*self as u8])
         Ok(vec![u8::from(*self)])
     }
 }
@@ -464,10 +463,12 @@ impl<'a> Encode for ListpackEntryData<'a> {
     /// The encoding of the data block is as follows:
     ///
     /// 1. If the data block is a small unsigned integer, the encoding
-    ///   byte is the integer itself.
+    ///  byte is the integer itself.
+    ///
     /// 2. If the data block is a small string, the encoding byte is the
-    ///  length of the string, and the following bytes are the string
+    /// length of the string, and the following bytes are the string
     /// itself.
+    ///
     /// 3. If the data block is a complex type, the encoding byte is the
     /// type of the complex type, and the following bytes are the data
     /// block itself.
@@ -769,12 +770,6 @@ impl ListpackEntry {
         self as *const _ as *const u8
     }
 
-    /// Returns the mutable pointer to the entry.
-    #[inline]
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self as *mut _ as *mut u8
-    }
-
     /// Returns the byte (raw) representation of the encoding type.
     ///
     /// # Example
@@ -790,6 +785,57 @@ impl ListpackEntry {
     #[inline]
     pub fn get_encoding_type_raw(&self) -> u8 {
         unsafe { std::ptr::read_unaligned(self.as_ptr()) }
+    }
+
+    /// Returns a byte slice of the entry, including its encoding type,
+    /// data and the total-element-length byte(s).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello");
+    /// let entry = listpack.get(0).unwrap();
+    /// let bytes = entry.as_slice();
+    /// assert_eq!(bytes, &[0b10000101, b'H', b'e', b'l', b'l', b'o', 6]);
+    /// assert_eq!(bytes.len(), 7);
+    /// ```
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        let len = self.total_bytes();
+        unsafe { std::slice::from_raw_parts(self.as_ptr(), len) }
+    }
+
+    /// Returns a mutable byte slice to the entry.
+    ///
+    /// # Safety
+    ///
+    /// This method is unsafe because it allows for the modification of
+    /// the entry's data, which can lead to undefined behaviour if not
+    /// handled correctly.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello");
+    /// let entry = listpack.get(0).unwrap();
+    /// let bytes = unsafe { entry.as_slice_mut() };
+    /// bytes[1] = b'W';
+    /// bytes[2] = b'o';
+    /// bytes[3] = b'r';
+    /// bytes[4] = b'l';
+    /// bytes[5] = b'd';
+    /// assert_eq!(entry.to_string(), "World");
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn as_slice_mut(&self) -> &mut [u8] {
+        let len = self.total_bytes();
+        std::slice::from_raw_parts_mut(self.as_ptr().cast_mut(), len)
     }
 
     /// Returns the encoding type of the entry, parsed from the byte.
@@ -1059,11 +1105,6 @@ impl ListpackEntry {
     pub(crate) fn ref_from_slice(slice: &[u8]) -> &ListpackEntry {
         unsafe { &*(slice.as_ptr() as *const ListpackEntry) }
     }
-
-    // /// Returns a mutable reference from a pointer.
-    // fn ref_mut_from_ptr<'a>(ptr: NonNull<u8>) -> &'a mut ListpackEntry {
-    //     unsafe { ptr.cast().as_mut() }
-    // }
 }
 
 impl PartialEq for ListpackEntry {
@@ -1109,22 +1150,6 @@ impl PartialEq<ListpackEntryInsert<'_>> for &ListpackEntry {
 }
 
 impl Eq for ListpackEntry {}
-
-// impl Drop for ListpackEntry {
-//     fn drop(&mut self) {
-//         let total_size = self.total_bytes();
-
-//         unsafe {
-//             std::alloc::dealloc(
-//                 self.as_mut_ptr(),
-//                 std::alloc::Layout::from_size_align_unchecked(
-//                     total_size,
-//                     std::mem::align_of::<u8>(),
-//                 ),
-//             )
-//         }
-//     }
-// }
 
 impl std::fmt::Debug for ListpackEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
