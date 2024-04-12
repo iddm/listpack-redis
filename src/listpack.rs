@@ -1655,7 +1655,7 @@ where
                         .add(referred_element.total_bytes())
                 };
 
-                // Excluse the referred element from the length to
+                // Exclude the referred element from the length to
                 // relocate.
                 let length_to_relocate = length_to_relocate - referred_element.total_bytes();
 
@@ -3158,19 +3158,22 @@ mod tests {
     }
 
     #[test]
-    fn swap() {
-        // let mut listpack: Listpack = Listpack::default();
+    fn swaps_various() {
+        let mut listpack: Listpack = Listpack::default();
+        listpack.push("Hello");
+        listpack.push("World");
+        listpack.push("!");
 
-        // listpack.push("Hello");
-        // listpack.push("World");
+        listpack.swap(0, 2);
 
-        // unsafe { listpack.swap_unchecked(0, 1) };
+        assert_eq!(listpack.len(), 3);
+        assert_eq!(listpack[0].to_string(), "!");
+        assert_eq!(listpack[1].to_string(), "World");
+        assert_eq!(listpack[2].to_string(), "Hello");
+    }
 
-        // assert_eq!(listpack.len(), 2);
-
-        // assert_eq!(listpack[0].to_string(), "World");
-        // assert_eq!(listpack[1].to_string(), "Hello");
-
+    #[test]
+    fn swap_to_bigger() {
         let mut listpack: Listpack = Listpack::default();
 
         listpack.push("Hello");
@@ -3181,6 +3184,36 @@ mod tests {
         assert_eq!(listpack.len(), 2);
 
         assert_eq!(listpack[0].to_string(), "World!");
+        assert_eq!(listpack[1].to_string(), "Hello");
+    }
+
+    #[test]
+    fn swap_to_smaller() {
+        let mut listpack: Listpack = Listpack::default();
+
+        listpack.push("Hello");
+        listpack.push("World!");
+
+        unsafe { listpack.swap_unchecked(0, 1) };
+
+        assert_eq!(listpack.len(), 2);
+
+        assert_eq!(listpack[0].to_string(), "World!");
+        assert_eq!(listpack[1].to_string(), "Hello");
+    }
+
+    #[test]
+    fn swap_to_the_same_length() {
+        let mut listpack: Listpack = Listpack::default();
+
+        listpack.push("Hello");
+        listpack.push("World");
+
+        unsafe { listpack.swap_unchecked(0, 1) };
+
+        assert_eq!(listpack.len(), 2);
+
+        assert_eq!(listpack[0].to_string(), "World");
         assert_eq!(listpack[1].to_string(), "Hello");
     }
 }
