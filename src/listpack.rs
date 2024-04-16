@@ -957,11 +957,129 @@ where
     /// assert_eq!(listpack[1].to_string(), "Hello");
     /// ```
     pub unsafe fn swap_unchecked(&mut self, a: usize, b: usize) {
-        let a_object = ListpackEntryRemoved::from(self.get(a).expect("Get an entry from listpack"));
-        let b_object = ListpackEntryRemoved::from(self.get(b).expect("Get an entry from listpack"));
+        if a == b {
+            return;
+        }
 
-        self.replace(a, &b_object);
-        self.replace(b, &a_object);
+        // Instead of calling the replace method, we can directly
+        // replace the elements in the listpack. This is more
+        // efficient, because we do not need to check if the listpack
+        // can fit the new element, since we are just swapping the
+        // elements, and we don't need to reallocate twice.
+
+        let a_entry = self.get(a).expect("Get an entry from listpack");
+        let b_entry = self.get(b).expect("Get an entry from listpack");
+
+        if a_entry.total_bytes() == b_entry.total_bytes() {
+            a_entry
+                .as_slice_mut()
+                .swap_with_slice(b_entry.as_slice_mut());
+        } else {
+            // if a > b {
+            //     // For the simplicity, let's always assume that the a
+            //     // element is before the "b" element.
+            //     return self.swap_unchecked(b, a);
+            // }
+
+            let ((smaller, smaller_initial_offset), (bigger, bigger_initial_offset)) = {
+                let a_encoded = a_entry.as_slice();
+                let b_encoded = b_entry.as_slice();
+
+                // Casting to usize is safe since the elements are always
+                // father that the listpack start.
+                let a_offset = a_entry
+                    .as_ptr()
+                    .offset_from(self.allocation.data_start_ptr())
+                    as usize;
+
+                let b_offset = b_entry
+                    .as_ptr()
+                    .offset_from(self.allocation.data_start_ptr())
+                    as usize;
+
+                if a_encoded.len() < b_encoded.len() {
+                    (
+                        (a_encoded.to_owned(), a_offset),
+                        (b_encoded.to_owned(), b_offset),
+                    )
+                } else {
+                    (
+                        (b_encoded.to_owned(), b_offset),
+                        (a_encoded.to_owned(), a_offset),
+                    )
+                }
+            };
+
+            let data_start_ptr = self.allocation.data_start_ptr();
+
+            let length_difference = bigger.len() - smaller.len();
+
+            // Shift the elements to the left or to the right by the
+            // amount of the difference between the bigger and the
+            // smaller element. This is based on the initial offset of the elements to swap.
+            if smaller_initial_offset > bigger_initial_offset {
+                // Move the smaller element to the bigger element's
+                // place.
+                std::ptr::copy_nonoverlapping(
+                    smaller.as_ptr(),
+                    data_start_ptr.add(bigger_initial_offset).cast_mut(),
+                    smaller.len(),
+                );
+
+                // Here as the smallest element should be on the left,
+                // (should be copied into the bigger one's place), so
+                // we should move all the elements after it until the
+                // element-to-swap-with inclusively, to the left, by
+                // the difference between the lengths of those.
+                let count_to_move =
+                    smaller_initial_offset - bigger_initial_offset - length_difference;
+
+                std::ptr::copy(
+                    data_start_ptr.add(bigger_initial_offset + bigger.len()),
+                    data_start_ptr
+                        .add(bigger_initial_offset + smaller.len())
+                        .cast_mut(),
+                    count_to_move,
+                );
+
+                // Move the bigger element to the smaller element's place.
+                std::ptr::copy_nonoverlapping(
+                    bigger.as_ptr(),
+                    // data_start_ptr.add(bigger_initial_offset - difference).cast_mut(),
+                    data_start_ptr
+                        .add(smaller_initial_offset - length_difference)
+                        .cast_mut(),
+                    bigger.len(),
+                );
+            } else {
+                // Move the smaller element to the bigger element's place,
+                // but not to the start of it, but to the end (backwards).
+                std::ptr::copy_nonoverlapping(
+                    smaller.as_ptr(),
+                    data_start_ptr
+                        .add(bigger_initial_offset + bigger.len() - smaller.len())
+                        .cast_mut(),
+                    smaller.len(),
+                );
+
+                // Move the in-between elements to the right.
+                let count_to_move = bigger_initial_offset - smaller_initial_offset - smaller.len();
+
+                for i in (0..count_to_move).rev() {
+                    let source = data_start_ptr.add(smaller_initial_offset + smaller.len() + i);
+                    let destination = data_start_ptr.add(smaller_initial_offset + bigger.len() + i);
+                    std::ptr::copy_nonoverlapping(source, destination.cast_mut(), 1);
+                }
+
+                // Move the bigger element to the smaller element's place.
+                std::ptr::copy_nonoverlapping(
+                    bigger.as_ptr(),
+                    // data_start_ptr.add(bigger_initial_offset - difference).cast_mut(),
+                    data_start_ptr.add(smaller_initial_offset).cast_mut(),
+                    bigger.len(),
+                );
+            }
+        }
     }
 
     /// Returns an iterator over all contiguous windows of length
