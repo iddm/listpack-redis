@@ -1,7 +1,7 @@
 use listpack_redis::*;
 
 fn main() {
-    let mut listpack = Listpack::new();
+    let mut listpack: Listpack = Listpack::default();
     listpack.push("hello");
     listpack.push("world");
 
@@ -19,6 +19,8 @@ fn main() {
     });
 
     listpack.drain(0..1).for_each(|removed| {
+        // The element isn't removed as of this closure, it will be
+        // removed after the iterator is dropped.
         println!("Drained entry: {removed}");
     });
 

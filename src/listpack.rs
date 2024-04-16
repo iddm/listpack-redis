@@ -1,20 +1,120 @@
-//! The listpack interface.
+//! The listpack interface and main implementation.
+//!
+//! The listpack data structure is a memory-efficient and compact
+//! representation of a list of elements. It is used in Redis to store
+//! lists of strings and numbers. The listpack data structure is
+//! implemented in the C programming language, and this crate
+//! reimplements the listpack data structure in Rust, also extending its
+//! functionality and the data types it can store.
 
 use std::{
+    alloc::Layout,
     fmt::{Debug, Write},
-    ops::{Deref, Index, RangeBounds},
+    ops::{Deref, DerefMut, Index, RangeBounds},
     ptr::NonNull,
 };
 
+use redis_custom_allocator::{CustomAllocator, MemoryConsumption};
+
 use crate::{
-    bindings,
-    entry::{ListpackEntry, ListpackEntryInsert, ListpackEntryMutable, ListpackEntryRemoved},
-    error::Result,
+    allocator::ListpackAllocator,
+    entry::{
+        Encode, ListpackEntry, ListpackEntryInsert, ListpackEntryMutable, ListpackEntryRemoved,
+    },
+    error::{AllocationError, Result},
+    iter::{ListpackChunks, ListpackIntoIter, ListpackIter, ListpackWindows},
 };
+
+/// The last byte of the allocator for the listpack should always be
+/// this value. It is used to detect overflows in the listpack.
+const END_MARKER: u8 = 0xFF;
+
+/// A location where an element should be inserted.
+#[derive(Debug, Copy, Clone)]
+pub enum InsertionPlacement {
+    /// Before the element specified by the index.
+    Before(usize),
+    /// After the element specified by the index.
+    After(usize),
+    /// Replace the referred element with the new one, accessible by
+    /// the provided index.
+    Replace(usize),
+}
+
+impl InsertionPlacement {
+    /// Returns the index of the element where the new element should be
+    /// inserted.
+    pub fn index(&self) -> usize {
+        match self {
+            Self::Before(index) | Self::After(index) | Self::Replace(index) => *index,
+        }
+    }
+
+    /// Returns the index of the element to replace, if the placement is
+    /// to replace an element.
+    pub fn to_replace(&self) -> Option<usize> {
+        match self {
+            Self::Replace(index) => Some(*index),
+            _ => None,
+        }
+    }
+}
+
+/// The fitting requirement for the listpack, after a test for an entry
+/// to be inserted. See [`Listpack::can_fit_entry`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FittingRequirement {
+    /// The listpack must be extended by the given amount of bytes.
+    Grow(usize),
+    /// The listpack must be shrinked by the given amount of bytes.
+    Shrink(usize),
+    /// The listpack does not need to be changed.
+    NoChange,
+}
+
+impl FittingRequirement {
+    /// Returns the number of bytes regardless of the requirement.
+    #[allow(unused)]
+    fn get_size(&self) -> usize {
+        match self {
+            Self::Grow(size) => *size,
+            Self::Shrink(size) => *size,
+            Self::NoChange => 0,
+        }
+    }
+
+    fn from_difference(needed: usize, available: usize) -> Self {
+        match needed.cmp(&available) {
+            std::cmp::Ordering::Greater => Self::Grow(needed - available),
+            std::cmp::Ordering::Less => Self::Shrink(available - needed),
+            std::cmp::Ordering::Equal => Self::NoChange,
+        }
+    }
+}
+
+impl From<isize> for FittingRequirement {
+    fn from(size: isize) -> Self {
+        match size.cmp(&0) {
+            std::cmp::Ordering::Greater => Self::Grow(size as usize),
+            std::cmp::Ordering::Less => Self::Shrink(size.unsigned_abs()),
+            std::cmp::Ordering::Equal => Self::NoChange,
+        }
+    }
+}
+
+impl From<usize> for FittingRequirement {
+    fn from(size: usize) -> Self {
+        match size.cmp(&0) {
+            std::cmp::Ordering::Greater => Self::Grow(size),
+            std::cmp::Ordering::Equal => Self::NoChange,
+            _ => unreachable!("The size cannot be negative."),
+        }
+    }
+}
 
 /// The header of the listpack data structure. Can only be obtained
 /// from an existing listpack using the [`Listpack::header_ref`] method.
-#[repr(C)]
+#[repr(C, packed(1))]
 #[derive(Debug, Copy, Clone)]
 pub struct ListpackHeader {
     /// An unsigned integer holding the total amount of bytes
@@ -38,6 +138,22 @@ pub struct ListpackHeader {
 }
 
 impl ListpackHeader {
+    // TODO: This is better and more correct, future-proof, but the
+    // size_of_val function is not yet stable.
+    //
+    // /// The maximum number of bytes the listpack header may hold.
+    // const MAXIMUM_TOTAL_BYTES: usize = std::mem::size_of_val(&Self::total_bytes) * 8;
+    // /// The maximum number of bytes allowed to be used by the elements.
+    // const MAXIMUM_ELEMENT_BYTES: usize = Self::MAXIMUM_TOTAL_BYTES
+    //     + std::mem::size_of_val(&END_MARKER)
+    //     - std::mem::size_of::<Self>();
+
+    /// The maximum number of bytes the listpack header may hold.
+    const MAXIMUM_TOTAL_BYTES: usize = std::u32::MAX as usize;
+    /// The maximum number of bytes allowed to be used by the elements.
+    const MAXIMUM_ELEMENT_BYTES: usize =
+        Self::MAXIMUM_TOTAL_BYTES + std::mem::size_of::<u8>() - std::mem::size_of::<Self>();
+
     /// Returns the total amount of bytes representing the listpack.
     ///
     /// # Example
@@ -45,8 +161,8 @@ impl ListpackHeader {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let listpack = Listpack::new();
-    /// let header = unsafe { listpack.header_ref() };
+    /// let listpack: Listpack = Listpack::default();
+    /// let header = unsafe { listpack.get_header_ref() };
     /// // The header is 6 bytes long, one more byte is the terminator.
     /// assert_eq!(header.total_bytes(), 7);
     pub fn total_bytes(&self) -> usize {
@@ -60,21 +176,42 @@ impl ListpackHeader {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let listpack = Listpack::new();
-    /// let header = unsafe { listpack.header_ref() };
+    /// let listpack: Listpack = Listpack::default();
+    /// let header = unsafe { listpack.get_header_ref() };
     /// assert_eq!(header.num_elements(), 0);
     ///
-    /// let listpack = Listpack::from(&[1, 2, 3]);
-    /// let header = unsafe { listpack.header_ref() };
+    /// let listpack: Listpack = Listpack::from(&[1, 2, 3]);
+    /// let header = unsafe { listpack.get_header_ref() };
     /// assert_eq!(header.num_elements(), 3);
     pub fn num_elements(&self) -> usize {
         self.num_elements as usize
     }
 
     /// Returns the amount of bytes available for the listpack to store
-    /// new elements.
+    /// new elements. This is the maximum size of the allocation minus
+    /// the size of the header and the end marker and the existing
+    /// elements.
     pub fn available_bytes(&self) -> usize {
-        (std::u32::MAX as usize) - self.total_bytes()
+        Self::MAXIMUM_TOTAL_BYTES - self.total_bytes()
+    }
+
+    /// Returns the number of bytes the elements occupy in the listpack,
+    /// that is available right after the header. This is the number of
+    /// bytes in the allocation without the header and the end marker.
+    pub fn element_bytes(&self) -> usize {
+        self.total_bytes()
+            - std::mem::size_of::<ListpackHeader>()
+            - std::mem::size_of_val(&END_MARKER)
+    }
+
+    /// Sets the new total amount of bytes representing the listpack.
+    pub fn set_total_bytes(&mut self, total_bytes: u32) {
+        self.total_bytes = total_bytes;
+    }
+
+    /// Sets the new total number of elements the listpack holds.
+    pub fn set_num_elements(&mut self, num_elements: u16) {
+        self.num_elements = num_elements;
     }
 }
 
@@ -100,20 +237,20 @@ impl AsRef<ListpackHeader> for ListpackHeaderRef<'_> {
     }
 }
 
-impl Deref for ListpackHeaderRef<'_> {
-    type Target = Listpack;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*(self as *const _ as *const Listpack) }
-    }
-}
-
 impl ListpackHeaderRef<'_> {
     /// Returns the total amount of bytes representing the listpack.
     ///
     /// See [`ListpackHeader::total_bytes`].
     pub fn total_bytes(&self) -> usize {
         self.0.total_bytes as usize
+    }
+
+    /// Returns the number of bytes the elements occupy in the listpack,
+    /// that is available right after the header.
+    pub fn element_bytes(&self) -> usize {
+        self.total_bytes()
+            - std::mem::size_of::<ListpackHeader>()
+            - std::mem::size_of_val(&END_MARKER)
     }
 
     /// Returns the total number of elements the listpack holds.
@@ -132,30 +269,178 @@ impl ListpackHeaderRef<'_> {
     }
 }
 
-/// The listpack data structure.
-#[repr(transparent)]
-pub struct Listpack {
-    /// A pointer to the listpack object in C.
-    ptr: NonNull<u8>,
+/// A pointer to the allocation of the listpack. It will contain the
+/// header, the data block (including the elements), and the end marker.
+#[derive(Debug, Copy, Clone)]
+struct ListpackAllocationPointer(NonNull<[u8]>, Layout);
+
+impl ListpackAllocationPointer {
+    /// Finds out the layout of the listpack by looking for the end
+    /// marker.
+    fn from_ptr(ptr: NonNull<[u8]>) -> Result<Self> {
+        let layout = Layout::from_size_align(ptr.len(), 1).expect("Could not create layout");
+
+        if unsafe { ptr.as_ref() }.last() != Some(&END_MARKER) {
+            return Err(crate::error::Error::MissingEndMarker);
+        }
+
+        Ok(Self(ptr, layout))
+    }
+
+    fn ptr(&self) -> NonNull<u8> {
+        self.0.cast()
+    }
+
+    fn layout(&self) -> Layout {
+        self.1
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { self.0.as_ref() }
+    }
+
+    /// Returns a pointer to the beginning of the data.
+    fn data_start_ptr(&self) -> *const u8 {
+        unsafe {
+            self.ptr()
+                .as_ptr()
+                .add(std::mem::size_of::<ListpackHeader>())
+        }
+    }
+
+    fn data_start_slice(&self) -> &[u8] {
+        unsafe { &self.0.as_ref()[std::mem::size_of::<ListpackHeader>()..] }
+    }
+
+    /// Returns a pointer pointing to the end marker.
+    fn data_end_ptr(&self) -> *const u8 {
+        unsafe { self.ptr().as_ptr().add(self.layout().size() - 1) }
+    }
+
+    /// Sets the last byte of the listpack to the end marker.
+    fn set_end_marker(&mut self) {
+        unsafe {
+            *self.data_end_ptr().cast_mut() = END_MARKER;
+        }
+    }
+
+    fn get_header(&self) -> &ListpackHeader {
+        // unsafe { self.ptr().as_ptr().cast().as_ref().unwrap() }
+
+        unsafe {
+            self.ptr()
+                .as_ptr()
+                .cast::<ListpackHeader>()
+                .as_ref()
+                .unwrap()
+        }
+    }
+
+    fn get_header_mut(&mut self) -> &mut ListpackHeader {
+        unsafe {
+            self.ptr()
+                .as_ptr()
+                .cast::<ListpackHeader>()
+                .as_mut()
+                .unwrap()
+        }
+    }
+
+    /// Sets a new layout.
+    ///
+    /// # Safety
+    ///
+    /// The user of this function must ensure that the layout is
+    /// correct.
+    unsafe fn set_layout(&mut self, layout: Layout) {
+        self.1 = layout;
+        self.get_header_mut().set_total_bytes(layout.size() as u32);
+        self.set_end_marker();
+    }
 }
 
-impl Default for Listpack {
+impl Deref for ListpackAllocationPointer {
+    type Target = ListpackHeader;
+
+    fn deref(&self) -> &Self::Target {
+        self.get_header()
+    }
+}
+
+impl DerefMut for ListpackAllocationPointer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.get_header_mut()
+    }
+}
+
+/// Represents the capacity of the listpack. The capacity is the number
+/// of bytes the listpack is allowed to use for storing elements,
+/// excluding the extra memory costs related to the header and the end
+/// marker, or any other data stored but unrelated to the elements.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct ListpackCapacity(usize);
+
+impl ListpackCapacity {
+    /// The zero capacity of the listpack, which is the same as the
+    /// minimum capacity, which includes the header and the end marker.
+    const ZERO: Self = Self::MINIMUM_CAPACITY;
+    /// The minimum capacity of the listpack, which is the size of the
+    /// header and the end marker.
+    const MINIMUM_CAPACITY: Self =
+        Self(std::mem::size_of::<ListpackHeader>() + std::mem::size_of::<u8>());
+}
+
+impl TryFrom<usize> for ListpackCapacity {
+    type Error = crate::error::Error;
+
+    fn try_from(value: usize) -> Result<Self> {
+        if value > ListpackHeader::MAXIMUM_ELEMENT_BYTES {
+            return Err(AllocationError::ListpackIsTooBig {
+                size: value,
+                max_size: ListpackHeader::MAXIMUM_TOTAL_BYTES,
+            }
+            .into());
+        }
+
+        Ok(Self(value + Self::MINIMUM_CAPACITY.0))
+    }
+}
+
+/// The listpack data structure.
+pub struct Listpack<Allocator: CustomAllocator = crate::allocator::DefaultAllocator> {
+    allocation: ListpackAllocationPointer,
+    allocator: Allocator,
+}
+
+impl<Allocator> Default for Listpack<Allocator>
+where
+    Allocator: ListpackAllocator,
+    <Allocator as CustomAllocator>::Error: Debug,
+{
     fn default() -> Self {
         Self::with_capacity(0)
     }
 }
 
-impl Debug for Listpack {
+impl<Allocator> Debug for Listpack<Allocator>
+where
+    Allocator: CustomAllocator + Debug,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Listpack")
-            .field("ptr", &self.ptr)
+            .field("allocation", &self.allocation)
             // TODO: optimise to not use collection to vector.
             .field("elements", &self.iter().collect::<Vec<_>>())
+            .field("allocator", &self.allocator)
             .finish()
     }
 }
 
-impl std::fmt::Display for Listpack {
+impl<Allocator> std::fmt::Display for Listpack<Allocator>
+where
+    Allocator: CustomAllocator,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_char('[')?;
 
@@ -171,23 +456,45 @@ impl std::fmt::Display for Listpack {
     }
 }
 
-impl Drop for Listpack {
+impl<Allocator> Drop for Listpack<Allocator>
+where
+    Allocator: CustomAllocator,
+{
     fn drop(&mut self) {
-        unsafe { bindings::lpFree(self.ptr.as_ptr()) }
-    }
-}
-
-impl Clone for Listpack {
-    fn clone(&self) -> Self {
-        let ptr = unsafe { bindings::lpDup(self.ptr.as_ptr()) };
-
-        Self {
-            ptr: NonNull::new(ptr).expect("The listpack clones fine."),
+        unsafe {
+            self.allocator
+                .deallocate(self.allocation.ptr(), self.allocation.layout())
         }
     }
 }
 
-impl PartialEq for Listpack {
+impl<Allocator> Clone for Listpack<Allocator>
+where
+    Allocator: ListpackAllocator,
+    <Allocator as CustomAllocator>::Error: Debug,
+{
+    fn clone(&self) -> Self {
+        let mut cloned = Self::with_capacity_and_allocator(
+            self.get_header_ref().element_bytes(),
+            self.allocator.clone(),
+        );
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.as_ptr(),
+                cloned.as_mut_ptr().cast(),
+                self.allocation.layout().size(),
+            );
+        }
+
+        cloned
+    }
+}
+
+impl<Allocator> PartialEq for Listpack<Allocator>
+where
+    Allocator: CustomAllocator,
+{
     fn eq(&self, other: &Self) -> bool {
         self.iter().eq(other.iter())
     }
@@ -202,12 +509,13 @@ impl PartialEq for Listpack {
 ///
 /// let array = ["Hello", "World"];
 ///
-/// let listpack = Listpack::from(&["Hello", "World"]);
+/// let listpack: Listpack = Listpack::from(&["Hello", "World"]);
 /// assert_eq!(listpack, &array);
 /// ```
-impl<'a, T> PartialEq<&'a [T]> for Listpack
+impl<'a, T, Allocator> PartialEq<&'a [T]> for Listpack<Allocator>
 where
     ListpackEntryInsert<'a>: std::convert::From<&'a T>,
+    Allocator: CustomAllocator,
 {
     fn eq(&self, other: &&'a [T]) -> bool {
         for (a, b) in self.iter().zip(other.iter()) {
@@ -229,81 +537,250 @@ where
 /// ```
 /// use listpack_redis::{Listpack, ListpackEntryInsert};
 ///
-/// let listpack = Listpack::from(&["Hello", "World"]);
+/// let listpack: Listpack = Listpack::from(&["Hello", "World"]);
 /// assert_eq!(listpack, &["Hello", "World"]);
 /// ```
-impl<'a, T, const N: usize> PartialEq<&'a [T; N]> for Listpack
+impl<'a, T, const N: usize, Allocator> PartialEq<&'a [T; N]> for Listpack<Allocator>
 where
     &'a T: Into<ListpackEntryInsert<'a>>,
     ListpackEntryInsert<'a>: std::convert::From<&'a T>,
+    Allocator: CustomAllocator,
 {
     fn eq(&self, other: &&'a [T; N]) -> bool {
         self.eq(&other.as_slice())
     }
 }
 
-impl Eq for Listpack {}
+impl<Allocator> Eq for Listpack<Allocator> where Allocator: CustomAllocator {}
 
-impl<'a, T> From<&'a [T]> for Listpack
+impl<'a, T, Allocator> From<&'a [T]> for Listpack<Allocator>
 where
     &'a T: Into<ListpackEntryInsert<'a>>,
     ListpackEntryInsert<'a>: std::convert::From<&'a T>,
+    Allocator: ListpackAllocator,
+    <Allocator as CustomAllocator>::Error: Debug,
 {
     fn from(slice: &'a [T]) -> Self {
-        let mut listpack = Listpack::with_capacity(slice.len());
-        for item in slice {
-            let item: ListpackEntryInsert<'a> = ListpackEntryInsert::from(item);
-            listpack.push(item);
+        let items = slice
+            .iter()
+            .map(ListpackEntryInsert::from)
+            .collect::<Vec<_>>();
+        let elements_size: usize = items
+            .iter()
+            .map(ListpackEntryInsert::full_encoded_size)
+            .sum();
+        let mut listpack = Listpack::with_capacity(elements_size);
+        let mut ptr = listpack.allocation.data_start_ptr();
+
+        for item in items {
+            let mut encoded = item.encode().expect("Encoded value");
+
+            unsafe {
+                std::ptr::copy_nonoverlapping(encoded.as_mut_ptr(), ptr.cast_mut(), encoded.len());
+            }
+
+            ptr = unsafe { ptr.add(encoded.len()) };
         }
+
+        listpack.set_num_elements(slice.len() as u16);
+
         listpack
     }
 }
 
-impl<'a, T, const N: usize> From<&'a [T; N]> for Listpack
+impl<'a, T, const N: usize, Allocator> From<&'a [T; N]> for Listpack<Allocator>
 where
     &'a T: Into<ListpackEntryInsert<'a>>,
     ListpackEntryInsert<'a>: std::convert::From<&'a T>,
+    Allocator: ListpackAllocator,
+    <Allocator as CustomAllocator>::Error: Debug,
 {
     fn from(slice: &'a [T; N]) -> Self {
-        let mut listpack = Listpack::with_capacity(slice.len());
-        for item in slice {
-            let item: ListpackEntryInsert<'a> = ListpackEntryInsert::from(item);
-            listpack.push(item);
+        let items = slice
+            .iter()
+            .map(ListpackEntryInsert::from)
+            .collect::<Vec<_>>();
+
+        let elements_size: usize = items
+            .iter()
+            .map(ListpackEntryInsert::full_encoded_size)
+            .sum();
+
+        let mut listpack = Listpack::with_capacity(elements_size);
+        let mut ptr = listpack.allocation.data_start_ptr();
+
+        for item in items {
+            let mut encoded = item.encode().expect("Encoded value");
+
+            unsafe {
+                std::ptr::copy_nonoverlapping(encoded.as_mut_ptr(), ptr.cast_mut(), encoded.len());
+            }
+
+            ptr = unsafe { ptr.add(encoded.len()) };
         }
+
+        listpack.set_num_elements(N as u16);
         listpack
     }
 }
 
-/// The [`Vec`]-like interface for the listpack.
-impl Listpack {
-    /// Returns a new listpack.
+impl<Allocator> MemoryConsumption for Listpack<Allocator>
+where
+    Allocator: CustomAllocator,
+{
+    fn memory_consumption(&self) -> usize {
+        self.allocation.layout().size() + std::mem::size_of::<Self>()
+    }
+}
+
+/// The methods which do not require any additional constraints on the
+/// allocator.
+impl<Allocator> Listpack<Allocator>
+where
+    Allocator: CustomAllocator,
+{
+    /// Returns true if the listpack is homogeneous, that is, all the
+    /// elements have the same type.
+    ///
+    /// In case the listpack is empty, it is considered homogeneous.
     ///
     /// # Example
     ///
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let listpack = Listpack::new();
-    /// assert!(listpack.is_empty());
+    /// let mut listpack: Listpack = Listpack::default();
+    /// assert!(listpack.is_homogeneous());
+    ///
+    /// listpack.push("Hello");
+    /// listpack.push("World");
+    /// assert!(listpack.is_homogeneous());
+    ///
+    /// listpack.push(1);
+    /// assert!(!listpack.is_homogeneous());
     /// ```
-    pub fn new() -> Self {
-        Self::with_capacity(0)
+    pub fn is_homogeneous(&self) -> bool {
+        if self.is_empty() {
+            return true;
+        }
+
+        let mut iter = self.iter();
+        let first = iter.next().map(|e| e.encoding_type().unwrap()).unwrap();
+
+        iter.all(|e| e.encoding_type().unwrap() == first)
     }
 
-    /// Creates a new listpack with the given capacity.
+    /// Returns the allocator of the listpack.
+    pub fn get_allocator(&self) -> &Allocator {
+        &self.allocator
+    }
+
+    /// Returns a mutable reference to the allocator of the listpack.
+    pub fn get_allocator_mut(&mut self) -> &mut Allocator {
+        &mut self.allocator
+    }
+
+    /// Returns a raw pointer to the listpack. The returned pointer is
+    /// never null.
     ///
     /// # Example
     ///
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let listpack = Listpack::with_capacity(10);
-    /// assert!(listpack.is_empty());
+    /// let listpack: Listpack = Listpack::default();
+    /// let ptr = listpack.as_ptr();
+    /// assert!(!ptr.is_null());
     /// ```
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            ptr: NonNull::new(unsafe { bindings::lpNew(capacity) })
-                .expect("could not create listpack"),
+    pub fn as_ptr(&self) -> *const u8 {
+        self.allocation.0.as_ptr().cast()
+    }
+
+    /// Returns a mutable raw pointer to the listpack. The returned
+    /// pointer is never null.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// let ptr = listpack.as_mut_ptr();
+    /// assert!(!ptr.is_null());
+    /// ```
+    pub fn as_mut_ptr(&mut self) -> *mut [u8] {
+        self.allocation.0.as_ptr()
+    }
+
+    /// Returns a mutable reference to the listpack header.
+    pub fn get_header_mut(&mut self) -> &mut ListpackHeader {
+        unsafe {
+            self.allocation
+                .0
+                .as_ptr()
+                .cast::<ListpackHeader>()
+                .as_mut()
+                .unwrap()
+        }
+    }
+
+    /// Returns the number of elements of this listpack.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello, world!");
+    /// assert_eq!(listpack.len(), 1);
+    /// ```
+    pub fn len(&self) -> usize {
+        self.get_header_ref().num_elements()
+    }
+
+    /// Returns the length of the listpack, describing how many elements
+    /// are currently in this listpack.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello, world!");
+    /// assert!(!listpack.is_empty());
+    /// ```
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// An unsafe way to obtain an immutable reference to the listpack
+    /// header.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the header is not valid.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// let header = unsafe { listpack.get_header_ref() };
+    /// assert_eq!(header.num_elements(), 0);
+    ///
+    /// listpack.push(1);
+    /// let header = unsafe { listpack.get_header_ref() };
+    /// assert_eq!(header.num_elements(), 1);
+    /// ```
+    pub fn get_header_ref(&self) -> &ListpackHeader {
+        // &*(self.ptr.as_ptr() as *const ListpackHeader)
+        unsafe {
+            (self.as_ptr() as *const ListpackHeader)
+                .as_ref()
+                .expect("Header is valid")
         }
     }
 
@@ -325,377 +802,23 @@ impl Listpack {
     /// use listpack_redis::Listpack;
     /// use std::ptr::NonNull;
     ///
-    /// let mut old = Listpack::new();
+    /// let mut old: Listpack = Listpack::default();
     /// old.push("Hello, world!");
     /// let ptr = unsafe { NonNull::new_unchecked(old.as_mut_ptr()) };
-    /// let new = unsafe { Listpack::from_raw_parts(ptr) };
+    /// let new: Listpack = unsafe { Listpack::from_raw_parts(ptr, old.get_allocator().clone()) };
     /// assert_eq!(old.get(0), new.get(0));
     ///
     /// // The old listpack is forgotten so that there is no
     /// // double-free.
     /// std::mem::forget(old);
     /// ```
-    pub unsafe fn from_raw_parts(ptr: NonNull<u8>) -> Self {
-        Self { ptr }
-    }
+    pub unsafe fn from_raw_parts(ptr: NonNull<[u8]>, allocator: Allocator) -> Self {
+        let allocation = ListpackAllocationPointer::from_ptr(ptr).expect("The listpack is valid.");
 
-    /// An unsafe way to obtain an immutable reference to the listpack
-    /// header.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the header is valid.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the header is not valid.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    ///
-    /// let listpack = Listpack::new();
-    /// let header = unsafe { listpack.header_ref() };
-    /// assert_eq!(header.num_elements(), 0);
-    /// ```
-    pub unsafe fn header_ref(&self) -> ListpackHeaderRef {
-        // &*(self.ptr.as_ptr() as *const ListpackHeader)
-        ListpackHeaderRef(
-            (self.ptr.as_ptr() as *const ListpackHeader)
-                .as_ref()
-                .expect("Header is valid"),
-        )
-    }
-
-    /// Returns the number of elements of this listpack.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    ///
-    /// let mut listpack = Listpack::new();
-    /// listpack.push("Hello, world!");
-    /// assert_eq!(listpack.len(), 1);
-    /// ```
-    pub fn len(&self) -> usize {
-        unsafe { bindings::lpLength(self.ptr.as_ptr()) as usize }
-    }
-
-    /// Returns the length of the listpack, describing how many elements
-    /// are currently in this listpack.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    ///
-    /// let mut listpack = Listpack::new();
-    /// listpack.push("Hello, world!");
-    /// assert!(!listpack.is_empty());
-    /// ```
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Shrinks the capacity of the listpack to fit the number of
-    /// elements.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the listpack was shrunk, `false` if it wasn't.
-    // Commented out, as this method seems redundant: it seems that
-    // `shrink_to_fit` is called automatically when the listpack is
-    // modified (at least always when something is deleted).
-    // ///
-    // /// # Example
-    // ///
-    // /// ```
-    // /// use listpack_redis::Listpack;
-    // ///
-    // /// let mut listpack = Listpack::with_capacity(10);
-    // /// assert_eq!(listpack.get_storage_bytes(), 7);
-    // /// listpack.push("Hello, world!");
-    // /// assert_eq!(listpack.get_storage_bytes(), 22);
-    // /// listpack.push("Hello!");
-    // /// assert_eq!(listpack.get_storage_bytes(), 30);
-    // /// assert!(listpack.shrink_to_fit());
-    // /// assert_eq!(listpack.get_storage_bytes(), 22);
-    // /// let _ = listpack.pop();
-    // /// assert_eq!(listpack.get_storage_bytes(), 20);
-    // /// ```
-    // ///
-    // /// See [`Listpack::get_storage_bytes`] and
-    // /// [`Listpack::get_total_bytes`] for more information.
-    pub fn shrink_to_fit(&mut self) -> bool {
-        if let Some(ptr) = NonNull::new(unsafe { bindings::lpShrinkToFit(self.ptr.as_ptr()) }) {
-            self.ptr = ptr;
-            true
-        } else {
-            false
+        Self {
+            allocation,
+            allocator,
         }
-    }
-
-    /// Truncates the listpack, keeping only the first `len` elements.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    ///
-    /// let mut listpack = Listpack::new();
-    /// assert_eq!(listpack.len(), 0);
-    /// listpack.push("Hello, world!");
-    /// assert_eq!(listpack.len(), 1);
-    /// listpack.push("Hello!");
-    /// assert_eq!(listpack.len(), 2);
-    /// listpack.truncate(1);
-    /// assert_eq!(listpack.len(), 1);
-    pub fn truncate(&mut self, len: usize) {
-        if len > self.len() {
-            return;
-        }
-
-        let start = len;
-        let length = self.len() - len;
-        let ptr = unsafe { bindings::lpDeleteRange(self.ptr.as_ptr(), start as _, length as _) };
-
-        if let Some(ptr) = NonNull::new(ptr) {
-            self.ptr = ptr;
-        }
-    }
-
-    /// Returns a raw pointer to the listpack. The returned pointer is
-    /// never null.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    ///
-    /// let listpack = Listpack::new();
-    /// let ptr = listpack.as_ptr();
-    /// assert!(!ptr.is_null());
-    /// ```
-    pub fn as_ptr(&self) -> *const u8 {
-        self.ptr.as_ptr()
-    }
-
-    /// Returns a mutable raw pointer to the listpack. The returned
-    /// pointer is never null.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    ///
-    /// let mut listpack = Listpack::new();
-    /// let ptr = listpack.as_mut_ptr();
-    /// assert!(!ptr.is_null());
-    /// ```
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.ptr.as_ptr()
-    }
-
-    /// Clears the entire listpack. Same as calling [`Self::truncate()`]
-    /// with `0` as an argument.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    /// let mut listpack = Listpack::new();
-    /// listpack.push("Hello, world!");
-    /// assert_eq!(listpack.len(), 1);
-    /// listpack.clear();
-    /// assert_eq!(listpack.len(), 0);
-    /// ```
-    pub fn clear(&mut self) {
-        self.truncate(0)
-    }
-
-    // pub fn allocator(&self) -> bindings::lpAlloc {
-    //     unsafe { bindings::lpGetAlloc(self.ptr.as_ptr()) }
-    // }
-
-    /// Appends an element to the back of the listpack.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the string is too long to be stored in the listpack.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    ///
-    /// let mut listpack = Listpack::new();
-    /// listpack.push("Hello, world!");
-    /// assert_eq!(listpack.len(), 1);
-    /// ```
-    pub fn push<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, entry: T) {
-        self.try_push(entry).expect("Pushed to listpack");
-        // let entry = entry.into();
-        // self.ptr = NonNull::new(match entry {
-        //     ListpackEntryInsert::String(s) => {
-        //         let string_ptr = s.as_ptr() as *mut _;
-        //         let len_bytes = s.len();
-        //         if len_bytes == 0 {
-        //             return;
-        //         }
-
-        //         if len_bytes > std::u32::MAX as usize {
-        //             panic!("The string is too long to be stored in the listpack.");
-        //         }
-
-        //         unsafe { bindings::lpAppend(self.ptr.as_ptr(), string_ptr, len_bytes as _) }
-        //     }
-        //     ListpackEntryInsert::Integer(n) => unsafe {
-        //         bindings::lpAppendInteger(self.ptr.as_ptr(), n)
-        //     },
-        // })
-        // .expect("Appended to listpack");
-    }
-
-    /// Inserts an element at the given index into the listpack.
-    /// The insertion is done before the specified index, shifting
-    /// all the elements past this index to the right.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the string is too long to be stored in the listpack
-    /// or if the index is out of bounds.
-    ///
-    /// The maximum length of a string stored within the listpack is
-    /// (`std::u32::MAX - 1`) bytes.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    ///
-    /// let mut listpack = Listpack::new();
-    /// listpack.push("Hello, world!");
-    /// listpack.insert(0, "Hello!");
-    /// assert_eq!(listpack.len(), 2);
-    /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello!");
-    /// assert_eq!(listpack.get(1).unwrap().to_string(), "Hello, world!");
-    /// ```
-    /// Or a more familiar example from [`std::vec::Vec`]:
-    /// ```
-    /// use listpack_redis::Listpack;
-    /// let mut listpack = Listpack::new();
-    /// listpack.push(1);
-    /// listpack.push(2);
-    /// listpack.push(3);
-    ///
-    /// listpack.insert(1, 4);
-    /// assert_eq!(listpack.len(), 4);
-    /// assert_eq!(listpack.get(0).unwrap().to_string(), "1");
-    /// assert_eq!(listpack.get(1).unwrap().to_string(), "4");
-    /// assert_eq!(listpack.get(2).unwrap().to_string(), "2");
-    /// assert_eq!(listpack.get(3).unwrap().to_string(), "3");
-    /// ```
-    pub fn insert<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
-        self.insert_internal(index, entry, bindings::LP_BEFORE)
-    }
-
-    /// Inserts an element at the given index into the listpack.
-    ///
-    /// The safe version of [`Self::insert`].
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    ///
-    /// let mut listpack = Listpack::new();
-    ///
-    /// // Index out of bounds:
-    /// assert!(listpack.try_insert(0, "Hello, world!").is_err());
-    /// listpack.push("Hello, world!");
-    /// assert!(listpack.try_insert(0, "Hello!").is_ok());
-    ///
-    /// assert_eq!(listpack.len(), 2);
-    /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello!");
-    /// assert_eq!(listpack.get(1).unwrap().to_string(), "Hello, world!");
-    /// ```
-    pub fn try_insert<'a, T: Into<ListpackEntryInsert<'a>>>(
-        &mut self,
-        index: usize,
-        entry: T,
-    ) -> Result {
-        self.try_insert_internal(index, entry, bindings::LP_BEFORE)
-    }
-
-    fn insert_internal<'a, T: Into<ListpackEntryInsert<'a>>>(
-        &mut self,
-        index: usize,
-        entry: T,
-        location: u32,
-    ) {
-        self.try_insert_internal(index, entry, location)
-            .expect("Insert an element in listpack");
-    }
-
-    fn try_insert_internal<'a, T: Into<ListpackEntryInsert<'a>>>(
-        &mut self,
-        index: usize,
-        entry: T,
-        location: u32,
-    ) -> Result {
-        let entry = entry.into();
-
-        let referred_element_ptr =
-            NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) }).ok_or(
-                crate::error::InsertionError::IndexOutOfBounds {
-                    index,
-                    length: self.len(),
-                },
-            )?;
-
-        if let Some(e) = self.can_fit_entry(
-            &entry,
-            Some(ListpackEntry::ref_from_ptr(referred_element_ptr)),
-        ) {
-            return Err(e);
-        }
-
-        let ptr = NonNull::new(match entry {
-            ListpackEntryInsert::String(s) => {
-                let string_ptr = s.as_ptr() as *mut _;
-                let len_bytes = s.len();
-
-                unsafe {
-                    bindings::lpInsertString(
-                        self.ptr.as_ptr(),
-                        string_ptr,
-                        len_bytes as _,
-                        referred_element_ptr.as_ptr(),
-                        location as _,
-                        std::ptr::null_mut(),
-                    )
-                }
-            }
-            ListpackEntryInsert::Integer(n) => unsafe {
-                bindings::lpInsertInteger(
-                    self.ptr.as_ptr(),
-                    n,
-                    referred_element_ptr.as_ptr(),
-                    location as _,
-                    std::ptr::null_mut(),
-                )
-            },
-        })
-        .ok_or(crate::error::InsertionError::ListpackIsFull {
-            current_length: entry.full_encoded_size(),
-            available_listpack_length: unsafe { self.header_ref().available_bytes() },
-        })?;
-
-        self.ptr = ptr;
-
-        Ok(())
     }
 
     /// Checks that the passed element can be inserted into the
@@ -706,462 +829,62 @@ impl Listpack {
     /// method will check if the listpack can fit the new element
     /// without replacing any of the existing ones.
     ///
+    /// When it is possible to fit an entry passed, the amount of bytes
+    /// required to store the entry is returned. By this amount of bytes
+    /// the listpack must be extended prior to the insertion. Otherwise,
+    /// if the element to be replaced is bigger than the new one, the
+    /// listpack does not need to be extended and needs to be shrinked,
+    /// by the amount of bytes returned (negative).
+    ///
     /// # Example
     ///
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::new();
+    /// let mut listpack: Listpack = Listpack::default();
     ///
     /// let entry = "Hello, world!".into();
     /// let check = listpack.can_fit_entry(&entry, None);
-    /// assert!(check.is_none());
+    /// assert!(check.is_ok());
     ///
     /// // The string is too long to be stored in the listpack.
     /// let string = "a".repeat(2usize.pow(32).into());
     /// let entry = (&string).into();
     /// let check = listpack.can_fit_entry(&entry, None);
-    /// assert!(check.is_some());
+    /// assert!(check.is_err());
     /// ```
     pub fn can_fit_entry(
         &self,
         entry: &ListpackEntryInsert,
         entry_to_replace: Option<&ListpackEntry>,
-    ) -> Option<crate::error::Error> {
-        let available_listpack_length = unsafe { self.header_ref().available_bytes() };
-        let replacement_length = entry_to_replace
+    ) -> Result<FittingRequirement> {
+        let object_to_replace_size = entry_to_replace
             .map(|e| e.total_bytes())
             .unwrap_or_default();
 
-        match entry {
-            ListpackEntryInsert::String(s) => {
-                let len_bytes = s.len();
+        let available_listpack_length =
+            self.get_header_ref().available_bytes() + object_to_replace_size;
 
-                if len_bytes == 0 {
-                    return Some(crate::error::InsertionError::StringIsEmpty.into());
-                }
+        let encoded_size = entry.full_encoded_size();
 
-                if len_bytes > std::u32::MAX as usize {
-                    return Some(
-                        crate::error::InsertionError::ListpackIsFull {
-                            current_length: len_bytes,
-                            available_listpack_length,
-                        }
-                        .into(),
-                    );
-                }
-
-                let encoded_size = entry.full_encoded_size();
-
-                if encoded_size > replacement_length
-                    && (encoded_size - replacement_length) > available_listpack_length
-                {
-                    return Some(
-                        crate::error::InsertionError::ListpackIsFull {
-                            current_length: encoded_size,
-                            available_listpack_length,
-                        }
-                        .into(),
-                    );
-                }
+        if encoded_size > available_listpack_length {
+            return Err(crate::error::InsertionError::ListpackIsFull {
+                current_length: encoded_size,
+                available_listpack_length,
             }
-            ListpackEntryInsert::Integer(_) => {
-                let encoded_size = entry.full_encoded_size();
+            .into());
+        }
 
-                if encoded_size > replacement_length
-                    && (encoded_size - replacement_length) > available_listpack_length
-                {
-                    return Some(
-                        crate::error::InsertionError::ListpackIsFull {
-                            current_length: encoded_size,
-                            available_listpack_length,
-                        }
-                        .into(),
-                    );
-                }
+        if let ListpackEntryInsert::String(s) = entry {
+            if s.is_empty() {
+                return Err(crate::error::InsertionError::StringIsEmpty.into());
             }
         }
 
-        None
-    }
-
-    /// A safe version of [`Self::push`]. It is a little more useful,
-    /// when the listpack grows large. As the listpack is a single
-    /// allocation, and this allocation is limited in terms of length,
-    /// by the listpack header's `total_bytes` field, it is only
-    /// possible to occupy the four bytes (`2u32.pow(32) - 1`) bytes of
-    /// memory. This method will return an [`crate::error::Error`] if
-    /// the listpack is full and the element cannot be pushed.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    ///
-    /// let mut listpack = Listpack::new();
-    /// assert!(listpack.try_push("Hello, world!").is_ok());
-    /// assert_eq!(listpack.len(), 1);
-    /// ```
-    pub fn try_push<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, entry: T) -> Result {
-        let entry = entry.into();
-
-        if let Some(e) = self.can_fit_entry(&entry, None) {
-            return Err(e);
-        }
-
-        self.ptr = NonNull::new(match entry {
-            ListpackEntryInsert::String(s) => {
-                let string_ptr = s.as_ptr() as *mut _;
-                let len_bytes = s.len();
-
-                unsafe { bindings::lpAppend(self.ptr.as_ptr(), string_ptr, len_bytes as _) }
-            }
-            ListpackEntryInsert::Integer(n) => unsafe {
-                bindings::lpAppendInteger(self.ptr.as_ptr(), n)
-            },
-        })
-        .expect("Appended to listpack");
-
-        Ok(())
-    }
-
-    /// Removes the element at the given index from the listpack and
-    /// returns it.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the index is out of bounds.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    ///
-    /// let mut listpack = Listpack::new();
-    /// listpack.push("Hello, world!");
-    /// let removed = listpack.remove(0);
-    /// assert_eq!(listpack.len(), 0);
-    /// assert_eq!(removed.to_string(), "Hello, world!");
-    /// ```
-    pub fn remove(&mut self, index: usize) -> ListpackEntryRemoved {
-        let removed = self.get(index).unwrap().into();
-        self.remove_range(index, 1);
-        removed
-    }
-
-    /// Retains only the elements specified by the predicate.
-    ///
-    /// In other words, removes all elements `e` such that `f(&e)`
-    /// returns `false`. This method operates in place, visiting each
-    /// element exactly once in the original order, and preserves the
-    /// order of the retained elements.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    ///
-    /// let mut listpack = Listpack::new();
-    /// listpack.push("Hello, world!");
-    /// listpack.push("Hello!");
-    /// listpack.push("World!");
-    /// listpack.retain(|entry| entry.to_string().contains("Hello"));
-    ///
-    /// assert_eq!(listpack.len(), 2);
-    /// assert_eq!(listpack[0].to_string(), "Hello, world!");
-    /// assert_eq!(listpack[1].to_string(), "Hello!");
-    /// ```
-    pub fn retain<F>(&mut self, mut f: F)
-    where
-        F: FnMut(&ListpackEntry) -> bool,
-    {
-        let mut index = 0;
-        while index < self.len() {
-            let entry = self.get(index).unwrap();
-            if !f(entry) {
-                let _ = self.remove(index);
-            } else {
-                index += 1;
-            }
-        }
-    }
-
-    /// Appends the elements of another listpack to the back of this
-    /// listpack.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the listpacks cannot be merged.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    ///
-    /// let mut listpack1 = Listpack::new();
-    /// listpack1.push("Hello, world!");
-    /// listpack1.push("Hello!");
-    ///
-    /// let mut listpack2 = Listpack::new();
-    /// listpack2.push("World!");
-    ///
-    /// listpack1.append(&mut listpack2);
-    ///
-    /// assert_eq!(listpack1.len(), 3);
-    /// assert_eq!(listpack2.len(), 1);
-    ///
-    /// assert_eq!(listpack1[0].to_string(), "Hello, world!");
-    /// assert_eq!(listpack1[1].to_string(), "Hello!");
-    /// assert_eq!(listpack1[2].to_string(), "World!");
-    /// ```
-    pub fn append(&mut self, other: &mut Self) {
-        other.iter().for_each(|entry| {
-            let data = entry.data().expect("Extract an entry from listpack");
-            let entry = ListpackEntryInsert::try_from(&data)
-                .expect("Convert an entry to ListpackEntryInsert");
-            self.push(entry);
-        });
-    }
-
-    /// Removes the elements in the specified range from the listpack
-    /// in bulk, returning all removed elements as an iterator.
-    ///
-    /// See [`ListpackDrain`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if the starting point is greater than the end point
-    /// or if the end point is greater than the length of the listpack.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    ///
-    /// let mut listpack = Listpack::new();
-    /// listpack.push("Hello, world!");
-    /// listpack.push("Hello!");
-    /// listpack.push("World!");
-    /// let removed = listpack.drain(1..3).collect::<Vec<_>>();
-    /// assert_eq!(listpack.len(), 1);
-    /// assert_eq!(removed.len(), 2);
-    /// assert_eq!(removed[0].get_str().unwrap(), "Hello!");
-    /// assert_eq!(removed[1].get_str().unwrap(), "World!");
-    /// ```
-    ///
-    /// Use it the same way as [`Self::clear`], if you want to remove
-    /// all elements from the listpack:
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    ///
-    /// let mut listpack = Listpack::new();
-    /// listpack.push("Hello, world!");
-    /// listpack.push("Hello!");
-    /// listpack.push("World!");
-    /// let removed = listpack.drain(..).collect::<Vec<_>>();
-    /// assert!(listpack.is_empty());
-    /// assert_eq!(removed.len(), 3);
-    /// assert_eq!(removed[0].get_str().unwrap(), "Hello, world!");
-    /// assert_eq!(removed[1].get_str().unwrap(), "Hello!");
-    /// assert_eq!(removed[2].get_str().unwrap(), "World!");
-    /// ```
-    ///
-    /// See [std::vec::Vec::drain] for more information.
-    pub fn drain<R>(&mut self, range: R) -> impl std::iter::Iterator<Item = ListpackEntryRemoved>
-    where
-        R: RangeBounds<usize>,
-    {
-        use std::ops::Bound;
-
-        let start = match range.start_bound() {
-            Bound::Included(&start) => start,
-            Bound::Excluded(&start) => start + 1,
-            Bound::Unbounded => 0,
-        };
-
-        let end = match range.end_bound() {
-            Bound::Included(&end) => end + 1,
-            Bound::Excluded(&end) => end,
-            Bound::Unbounded => self.len(),
-        };
-
-        if start > end {
-            panic!("The start is greater than the end.")
-        } else if end > self.len() {
-            panic!("The end is greater than the length of the listpack.")
-        }
-
-        let length = end - start;
-        let removed_elements = self
-            .iter()
-            .skip(start)
-            .take(length)
-            .map(ListpackEntryRemoved::from)
-            .collect::<Vec<_>>();
-        let ptr = unsafe { bindings::lpDeleteRange(self.ptr.as_ptr(), start as _, length as _) };
-
-        if let Some(ptr) = NonNull::new(ptr) {
-            self.ptr = ptr;
-        } else {
-            panic!("The range is out of bounds.");
-        }
-
-        removed_elements.into_iter()
-    }
-
-    /// Splits the listpack into two at the given index. Returns a new
-    /// listpack containing the elements from `at` to the end, and
-    /// removes those elements from the original listpack.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the index is out of bounds.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    ///
-    /// let mut listpack = Listpack::new();
-    /// listpack.push("Hello, world!");
-    /// listpack.push("Hello!");
-    /// listpack.push("World!");
-    ///
-    /// let other = listpack.split_off(1);
-    ///
-    /// assert_eq!(listpack.len(), 1);
-    /// assert_eq!(other.len(), 2);
-    ///
-    /// assert_eq!(listpack[0].to_string(), "Hello, world!");
-    /// assert_eq!(other[0].to_string(), "Hello!");
-    /// assert_eq!(other[1].to_string(), "World!");
-    /// ```
-    pub fn split_off(&mut self, at: usize) -> Self {
-        let length = self.len();
-        if at > length {
-            panic!("The index is out of bounds.")
-        }
-
-        let mut other = Self::with_capacity(length - at);
-
-        self.drain(at..(at + length - 1))
-            .for_each(|entry| other.push(ListpackEntryInsert::from(&entry)));
-
-        other
-    }
-
-    /// Appends all the elements of a slice to the listpack.
-    ///
-    /// # Note
-    ///
-    /// The elements must be convertible to [`ListpackEntryInsert`].
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    ///
-    /// let mut listpack = Listpack::new();
-    /// listpack.extend_from_slice(&["Hello", "World", "!"]);
-    /// assert_eq!(listpack.len(), 3);
-    /// assert_eq!(listpack[0].to_string(), "Hello");
-    /// assert_eq!(listpack[1].to_string(), "World");
-    /// assert_eq!(listpack[2].to_string(), "!");
-    /// ```
-    pub fn extend_from_slice<'a, T>(&mut self, slice: &'a [T])
-    where
-        &'a T: Into<ListpackEntryInsert<'a>>,
-        ListpackEntryInsert<'a>: std::convert::From<&'a T>,
-    {
-        for item in slice {
-            self.push(item.into());
-        }
-    }
-
-    /// Copies elements from `src` range to the end of the listpack.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the range is out of bounds.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    ///
-    /// let mut listpack = Listpack::new();
-    ///
-    /// listpack.push("Hello");
-    /// listpack.push("World");
-    /// listpack.push("!");
-    ///
-    /// // Copy the first two elements to the end of the listpack.
-    /// listpack.extend_from_within(0..2);
-    ///
-    /// assert_eq!(listpack.len(), 5);
-    /// assert_eq!(listpack[0].to_string(), "Hello");
-    /// assert_eq!(listpack[1].to_string(), "World");
-    /// assert_eq!(listpack[2].to_string(), "!");
-    /// assert_eq!(listpack[3].to_string(), "Hello");
-    /// assert_eq!(listpack[4].to_string(), "World");
-    /// ```
-    pub fn extend_from_within(&mut self, src: std::ops::Range<usize>) {
-        if src.contains(&self.len()) {
-            panic!("The range is out of bounds.");
-        }
-
-        for i in src {
-            let entry = self.get(i).unwrap();
-            let entry = ListpackEntryRemoved::from(entry);
-            let entry = ListpackEntryInsert::from(&entry);
-
-            self.push(entry);
-        }
-    }
-
-    /// Removes consecutive repeated elements from the listpack.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    ///
-    /// let mut listpack = Listpack::new();
-    /// listpack.push("Hello");
-    /// listpack.push("Hello");
-    /// listpack.push("World");
-    /// listpack.push("World");
-    /// listpack.push("World");
-    /// listpack.push("!");
-    /// listpack.dedup();
-    /// assert_eq!(listpack.len(), 3);
-    /// assert_eq!(listpack[0].to_string(), "Hello");
-    /// assert_eq!(listpack[1].to_string(), "World");
-    /// assert_eq!(listpack[2].to_string(), "!");
-    /// ```
-    pub fn dedup(&mut self) {
-        let mut index = 0;
-        let mut indexes_to_remove = Vec::new();
-
-        while index < self.len() {
-            let entry = self.get(index).unwrap();
-            let mut next_index = index + 1;
-            while next_index < self.len() {
-                let next_entry = self.get(next_index).unwrap();
-                if entry == next_entry {
-                    indexes_to_remove.push(next_index);
-                    next_index += 1;
-                } else {
-                    break;
-                }
-            }
-            index = next_index;
-        }
-
-        for index in indexes_to_remove.into_iter().rev() {
-            let _ = self.remove(index);
-        }
+        Ok(FittingRequirement::from_difference(
+            encoded_size,
+            object_to_replace_size,
+        ))
     }
 
     /// Returns the first element of the listpack, or [`None`] if it is
@@ -1176,38 +899,6 @@ impl Listpack {
         self.get(self.len() - 1)
     }
 
-    /// Reverses the order of the elements in the listpack in place.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    ///
-    /// let mut listpack = Listpack::new();
-    /// listpack.push("Hello");
-    /// listpack.push("World");
-    /// listpack.push("!");
-    ///
-    /// listpack.reverse();
-    ///
-    /// assert_eq!(listpack.len(), 3);
-    /// assert_eq!(listpack[0].to_string(), "!");
-    /// assert_eq!(listpack[1].to_string(), "World");
-    /// assert_eq!(listpack[2].to_string(), "Hello");
-    /// ```
-    pub fn reverse(&mut self) {
-        let length = self.len();
-        let mut indexes_to_swap = Vec::new();
-
-        for i in 0..length / 2 {
-            indexes_to_swap.push((i, length - i - 1));
-        }
-
-        for (a, b) in indexes_to_swap {
-            self.swap(a, b);
-        }
-    }
-
     /// Swaps two elements in the listpack.
     ///
     /// # Panics
@@ -1219,7 +910,7 @@ impl Listpack {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::new();
+    /// let mut listpack: Listpack = Listpack::default();
     /// listpack.push("Hello");
     /// listpack.push("World");
     /// listpack.push("!");
@@ -1253,27 +944,136 @@ impl Listpack {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::new();
+    /// let mut listpack: Listpack = Listpack::default();
     ///
     /// listpack.push("Hello");
-    /// listpack.push("World");
+    /// listpack.push("World!");
     ///
     /// unsafe { listpack.swap_unchecked(0, 1) };
     ///
     /// assert_eq!(listpack.len(), 2);
     ///
-    /// assert_eq!(listpack[0].to_string(), "World");
+    /// assert_eq!(listpack[0].to_string(), "World!");
     /// assert_eq!(listpack[1].to_string(), "Hello");
     /// ```
     pub unsafe fn swap_unchecked(&mut self, a: usize, b: usize) {
-        let a_object = ListpackEntryRemoved::from(self.get(a).expect("Get an entry from listpack"));
-        let b_object = ListpackEntryRemoved::from(self.get(b).expect("Get an entry from listpack"));
+        if a == b {
+            return;
+        }
 
-        let b_object = ListpackEntryInsert::from(&b_object);
-        self.replace(a, b_object);
+        // Instead of calling the replace method, we can directly
+        // replace the elements in the listpack. This is more
+        // efficient, because we do not need to check if the listpack
+        // can fit the new element, since we are just swapping the
+        // elements, and we don't need to reallocate twice.
 
-        let a_object = ListpackEntryInsert::from(&a_object);
-        self.replace(b, a_object);
+        let a_entry = self.get(a).expect("Get an entry from listpack");
+        let b_entry = self.get(b).expect("Get an entry from listpack");
+
+        if a_entry.total_bytes() == b_entry.total_bytes() {
+            a_entry
+                .as_slice_mut()
+                .swap_with_slice(b_entry.as_slice_mut());
+        } else {
+            let ((smaller, smaller_initial_offset), (bigger, bigger_initial_offset)) = {
+                let a_encoded = a_entry.as_slice();
+                let b_encoded = b_entry.as_slice();
+
+                // Casting to usize is safe since the elements are always
+                // father that the listpack start.
+                let a_offset = a_entry
+                    .as_ptr()
+                    .offset_from(self.allocation.data_start_ptr())
+                    as usize;
+
+                let b_offset = b_entry
+                    .as_ptr()
+                    .offset_from(self.allocation.data_start_ptr())
+                    as usize;
+
+                if a_encoded.len() < b_encoded.len() {
+                    (
+                        (a_encoded.to_owned(), a_offset),
+                        (b_encoded.to_owned(), b_offset),
+                    )
+                } else {
+                    (
+                        (b_encoded.to_owned(), b_offset),
+                        (a_encoded.to_owned(), a_offset),
+                    )
+                }
+            };
+
+            let data_start_ptr = self.allocation.data_start_ptr();
+
+            let length_difference = bigger.len() - smaller.len();
+
+            // Shift the elements to the left or to the right by the
+            // amount of the difference between the bigger and the
+            // smaller element. This is based on the initial offset of the elements to swap.
+            if smaller_initial_offset > bigger_initial_offset {
+                // Move the smaller element to the bigger element's
+                // place.
+                std::ptr::copy_nonoverlapping(
+                    smaller.as_ptr(),
+                    data_start_ptr.add(bigger_initial_offset).cast_mut(),
+                    smaller.len(),
+                );
+
+                // Here as the smallest element should be on the left,
+                // (should be copied into the bigger one's place), so
+                // we should move all the elements after it until the
+                // element-to-swap-with inclusively, to the left, by
+                // the difference between the lengths of those.
+                let count_to_move =
+                    smaller_initial_offset - bigger_initial_offset - length_difference;
+
+                std::ptr::copy(
+                    data_start_ptr.add(bigger_initial_offset + bigger.len()),
+                    data_start_ptr
+                        .add(bigger_initial_offset + smaller.len())
+                        .cast_mut(),
+                    count_to_move,
+                );
+
+                // Move the bigger element to the smaller element's place.
+                std::ptr::copy_nonoverlapping(
+                    bigger.as_ptr(),
+                    // data_start_ptr.add(bigger_initial_offset - difference).cast_mut(),
+                    data_start_ptr
+                        .add(smaller_initial_offset - length_difference)
+                        .cast_mut(),
+                    bigger.len(),
+                );
+            } else {
+                // Move the smaller element to the bigger element's place,
+                // but not to the start of it, but to the end (backwards).
+                std::ptr::copy_nonoverlapping(
+                    smaller.as_ptr(),
+                    data_start_ptr
+                        .add(bigger_initial_offset + bigger.len() - smaller.len())
+                        .cast_mut(),
+                    smaller.len(),
+                );
+
+                // Move the in-between elements to the right.
+                let count_to_move = bigger_initial_offset - smaller_initial_offset - smaller.len();
+
+                for i in (0..count_to_move).rev() {
+                    let source = data_start_ptr.add(smaller_initial_offset + smaller.len() + i);
+                    let destination = data_start_ptr.add(smaller_initial_offset + bigger.len() + i);
+                    std::ptr::copy_nonoverlapping(source, destination.cast_mut(), 1);
+                }
+
+                // Move the bigger element to the smaller element's place.
+                std::ptr::copy_nonoverlapping(
+                    bigger.as_ptr(),
+                    // data_start_ptr.add(bigger_initial_offset - difference).cast_mut(),
+                    data_start_ptr.add(smaller_initial_offset).cast_mut(),
+                    bigger.len(),
+                );
+            }
+        }
     }
 
     /// Returns an iterator over all contiguous windows of length
@@ -1285,7 +1085,7 @@ impl Listpack {
     /// Panics if the size is zero.
     ///
     /// See [`ListpackWindows`] for more information.
-    pub fn windows(&self, size: usize) -> ListpackWindows {
+    pub fn windows(&self, size: usize) -> ListpackWindows<Allocator> {
         if size == 0 {
             panic!("The size must be greater than zero.");
         }
@@ -1306,7 +1106,7 @@ impl Listpack {
     /// Panics if the size is zero.
     ///
     /// See [`ListpackChunks`] for more information.
-    pub fn chunks(&self, size: usize) -> ListpackChunks {
+    pub fn chunks(&self, size: usize) -> ListpackChunks<Allocator> {
         if size == 0 {
             panic!("The size must be greater than zero.");
         }
@@ -1318,73 +1118,6 @@ impl Listpack {
         }
     }
 
-    /// Removes the last element from the listpack and returns it, or
-    /// [`None`] if it is empty. The returned [`ListpackEntry`] is not
-    /// a part of the listpack anymore.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use listpack_redis::Listpack;
-    ///
-    /// let mut listpack = Listpack::new();
-    /// listpack.push("Hello, world!");
-    /// assert_eq!(listpack.len(), 1);
-    /// let removed = listpack.pop().unwrap();
-    /// assert_eq!(listpack.len(), 0);
-    /// assert_eq!(removed.get_str().unwrap(), "Hello, world!");
-    /// ```
-    pub fn pop(&mut self) -> Option<ListpackEntryRemoved> {
-        let ptr = NonNull::new(unsafe { bindings::lpLast(self.ptr.as_ptr()) });
-
-        if let Some(ptr) = ptr {
-            let cloned = ListpackEntryRemoved::from(ptr);
-            self.ptr = NonNull::new(unsafe {
-                bindings::lpDelete(self.ptr.as_ptr(), ptr.as_ptr(), std::ptr::null_mut())
-            })?;
-            Some(cloned)
-        } else {
-            None
-        }
-    }
-
-    // Commented out, as there is no such method in listpack C API as
-    // of now.
-    // /// Removes the element at the given index from the listpack and
-    // /// returns it, swapping it with the last element.
-    // ///
-    // /// # Panics
-    // ///
-    // /// Panics if the index is out of bounds.
-    // ///
-    // /// # Example
-    // ///
-    // /// ```
-    // /// use listpack_redis::Listpack;
-    // ///
-    // /// let mut listpack = Listpack::new();
-    // /// listpack.push("Hello");
-    // /// listpack.push("World");
-    // /// listpack.push("!");
-    // /// let removed = listpack.swap_remove(0);
-    // /// assert_eq!(listpack.len(), 2);
-    // /// assert_eq!(removed.as_str().unwrap(), "Hello");
-    // /// assert_eq!(listpack.get(0).unwrap().data().unwrap().get_small_str().unwrap(), "!");
-    // /// assert_eq!(listpack.get(1).unwrap().data().unwrap().get_small_str().unwrap(), "World");
-    // /// ```
-    // pub fn swap_remove(&mut self, index: usize) -> ListpackEntryRemoved {
-    //     let ptr = NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
-    //         .expect("Index out of bounds.");
-    //     let cloned = ListpackEntryRemoved::from(ptr);
-    //     let last = NonNull::new(unsafe { bindings::lpLast(self.ptr.as_ptr()) })
-    //         .expect("The last element is accessible.");
-    //     self.ptr = NonNull::new(unsafe {
-    //         bindings::lpDelete(self.ptr.as_ptr(), ptr.as_ptr(), std::ptr::null_mut())
-    //     })
-    //     .expect("Deleted from listpack");
-    //     cloned
-    // }
-
     /// Returns `true` if the listpack contains an element with the
     /// given value.
     ///
@@ -1393,7 +1126,7 @@ impl Listpack {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::new();
+    /// let mut listpack: Listpack = Listpack::default();
     /// listpack.push("Hello");
     /// listpack.push("World");
     /// assert!(listpack.contains("Hello"));
@@ -1427,7 +1160,7 @@ impl Listpack {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::new();
+    /// let mut listpack: Listpack = Listpack::default();
     /// listpack.push("Hello");
     /// listpack.push("World");
     /// assert!(listpack.starts_with(&["Hello"]));
@@ -1469,7 +1202,7 @@ impl Listpack {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::new();
+    /// let mut listpack: Listpack = Listpack::default();
     /// listpack.push("Hello");
     /// listpack.push("World");
     /// assert!(listpack.ends_with(&["World"]));
@@ -1519,7 +1252,7 @@ impl Listpack {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::new();
+    /// let mut listpack: Listpack = Listpack::default();
     /// listpack.push("Hello");
     /// listpack.push("World");
     /// assert_eq!(listpack.strip_prefix(&["Hello"]), vec!["World"]);
@@ -1549,7 +1282,7 @@ impl Listpack {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::new();
+    /// let mut listpack: Listpack = Listpack::default();
     /// listpack.push("Hello");
     /// listpack.push("World");
     /// assert_eq!(listpack.strip_suffix(&["World"]), vec!["Hello"]);
@@ -1572,7 +1305,7 @@ impl Listpack {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::new();
+    /// let mut listpack: Listpack = Listpack::default();
     ///
     /// listpack.push("Hello");
     /// listpack.push("World");
@@ -1583,12 +1316,1009 @@ impl Listpack {
     /// assert_eq!(iter.next().unwrap().to_string(), "World");
     /// assert!(iter.next().is_none());
     /// ```
-    pub fn iter(&self) -> ListpackIter {
+    pub fn iter(&self) -> ListpackIter<Allocator> {
         ListpackIter {
             listpack: self,
             index: 0,
         }
     }
+}
+
+/// The methods requiring the allocator to be a listpack allocator.
+impl<Allocator> Listpack<Allocator>
+where
+    Allocator: ListpackAllocator,
+    <Allocator as CustomAllocator>::Error: Debug,
+{
+    /// Splits the listpack into two at the given index. Returns a new
+    /// listpack containing the elements from `at` to the end, and
+    /// removes those elements from the original listpack.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the index is out of bounds.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello, world!");
+    /// listpack.push("Hello!");
+    /// listpack.push("World!");
+    ///
+    /// let other = listpack.split_off(1);
+    ///
+    /// assert_eq!(listpack.len(), 1);
+    /// assert_eq!(other.len(), 2);
+    ///
+    /// assert_eq!(listpack[0].to_string(), "Hello, world!");
+    /// assert_eq!(other[0].to_string(), "Hello!");
+    /// assert_eq!(other[1].to_string(), "World!");
+    /// ```
+    pub fn split_off(&mut self, at: usize) -> Self {
+        let length = self.len();
+        if at > length {
+            panic!("The index is out of bounds.")
+        }
+
+        // TODO: use allocate with capacity and calculate the amount
+        // of bytes needed, then memcpy instead of pushes.
+        let mut other = Self::new(self.allocator.clone());
+
+        self.drain(at..(at + length - 1))
+            .for_each(|entry| other.push(ListpackEntryInsert::from(&entry)));
+
+        other
+    }
+}
+
+impl<Allocator> Listpack<Allocator>
+where
+    Allocator: ListpackAllocator,
+    <Allocator as CustomAllocator>::Error: Debug,
+{
+    /// Creates a new listpack with the given capacity. A shorthand for
+    /// `Listpack::with_capacity_and_allocator(capacity, Allocator::default())`.
+    pub fn with_capacity<T>(capacity: T) -> Self
+    where
+        T: TryInto<ListpackCapacity>,
+    {
+        Self::with_capacity_and_allocator(capacity, Allocator::default())
+    }
+}
+
+impl<Allocator, AllocatorError> Listpack<Allocator>
+where
+    Allocator: CustomAllocator<Error = AllocatorError>,
+    AllocatorError: Debug,
+{
+    /// Returns a new listpack.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    /// use listpack_redis::allocator::DefaultAllocator;
+    ///
+    /// let allocator = DefaultAllocator;
+    /// let listpack = Listpack::new(allocator);
+    /// assert!(listpack.is_empty());
+    /// ```
+    pub fn new(allocator: Allocator) -> Self {
+        Self::with_capacity_and_allocator(ListpackCapacity::ZERO, allocator)
+    }
+
+    fn allocate_header_for_capacity(
+        allocator: &Allocator,
+        capacity: ListpackCapacity,
+    ) -> Result<ListpackAllocationPointer, AllocatorError> {
+        let bytes_to_allocate = capacity.0;
+
+        // This is an impossible situation, as the maximum size of the
+        // is already checked in the `ListpackCapacity::try_from`.
+        let total_bytes: u32 = capacity
+            .0
+            .try_into()
+            .expect("The bytes to allocate fits into the header.");
+
+        // Another impossible scenario, as we have fully satisfied the
+        // requirements for this function to avoid returning an error.
+        let layout = std::alloc::Layout::from_size_align(bytes_to_allocate, 1)
+            .expect("Could not create layout");
+
+        let ptr = allocator.allocate(layout)?;
+
+        let header_ptr = ptr.cast().as_ptr();
+
+        unsafe {
+            *header_ptr = ListpackHeader {
+                total_bytes,
+                num_elements: 0,
+            };
+        }
+
+        let mut pointer = ListpackAllocationPointer(ptr, layout);
+
+        pointer.set_end_marker();
+
+        Ok(pointer)
+    }
+
+    /// Creates a new listpack with the given capacity (the number of
+    /// bytes). There is no notion of "capacity" in the listpack, as it
+    /// is a single allocation and all the elements may vary in size,
+    /// and the main purpose of the data structure is to be compressed.
+    ///
+    /// However, in certain use-cases it is useful to pre-allocate the
+    /// memory for the listpack, so that the listpack doesn't have to
+    /// reallocate the memory every time a new element is added.
+    ///
+    /// The allocated amount will be the given capacity plus the size
+    /// of the listpack header and the end marker.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the capacity is too big to be stored in the listpack.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let listpack: Listpack = Listpack::with_capacity(10);
+    /// assert!(listpack.is_empty());
+    /// ```
+    fn with_capacity_and_allocator<T>(capacity: T, allocator: Allocator) -> Self
+    where
+        T: TryInto<ListpackCapacity>,
+    {
+        let capacity = match capacity.try_into() {
+            Ok(capacity) => capacity,
+            Err(_) => panic!("Couldn't convert the provided capacity to listpack capacity"),
+        };
+
+        // TODO: provide the error back to the user.
+        let allocation = Self::allocate_header_for_capacity(&allocator, capacity)
+            .expect("Allocated header successfully.");
+
+        Self {
+            allocation,
+            allocator,
+        }
+    }
+}
+
+impl<Allocator> Listpack<Allocator>
+where
+    Allocator: CustomAllocator,
+{
+    /// Reallocates the pointer to a new place in memory, growing the
+    /// size of the data block.
+    ///
+    /// # Note
+    ///
+    /// After calling this function, the block contains two end markers:
+    /// one at the end of the old block and one at the end of the new
+    /// block (for the safety).
+    fn grow(&mut self, new_layout: Layout) -> Result<(), <Allocator as CustomAllocator>::Error> {
+        unsafe {
+            self.allocation.0 = self.allocator.grow(
+                self.allocation.ptr().cast(),
+                self.allocation.layout(),
+                new_layout,
+            )?;
+
+            self.allocation.set_layout(new_layout);
+        }
+
+        Ok(())
+    }
+
+    /// Grows the capacity of the listpack by `additional_bytes`.
+    fn grow_by(
+        &mut self,
+        additional_bytes: usize,
+    ) -> Result<(), <Allocator as CustomAllocator>::Error> {
+        let new_layout =
+            Layout::from_size_align(self.allocation.layout().size() + additional_bytes, 1)
+                .expect("Created layout");
+        self.grow(new_layout)
+    }
+
+    /// Shrinks the listpack by `bytes_to_shrink`.
+    fn shrink_by(
+        &mut self,
+        bytes_to_shrink: usize,
+    ) -> Result<(), <Allocator as CustomAllocator>::Error> {
+        let new_layout =
+            Layout::from_size_align(self.allocation.layout().size() - bytes_to_shrink, 1)
+                .expect("Created layout");
+
+        unsafe {
+            self.allocation.0 = self.get_allocator().shrink(
+                self.allocation.ptr().cast(),
+                self.allocation.layout(),
+                new_layout,
+            )?;
+
+            self.allocation.set_layout(new_layout);
+        }
+
+        Ok(())
+    }
+
+    /// Truncates the listpack, keeping only the first `len` elements.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// assert_eq!(listpack.len(), 0);
+    /// listpack.push("Hello, world!");
+    /// assert_eq!(listpack.len(), 1);
+    /// listpack.push("Hello!");
+    /// assert_eq!(listpack.len(), 2);
+    /// listpack.truncate(1);
+    /// assert_eq!(listpack.len(), 1);
+    pub fn truncate(&mut self, len: usize) {
+        if len > self.len() {
+            return;
+        }
+
+        let start = len;
+        let length = self.len() - len;
+        self.remove_range(start, length);
+    }
+
+    /// Clears the entire listpack. Same as calling [`Self::truncate()`]
+    /// with `0` as an argument.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello, world!");
+    /// assert_eq!(listpack.len(), 1);
+    /// listpack.clear();
+    /// assert_eq!(listpack.len(), 0);
+    /// ```
+    pub fn clear(&mut self) {
+        self.truncate(0)
+    }
+
+    /// Appends an element to the back of the listpack.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the string is too long to be stored in the listpack.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello, world!");
+    /// assert_eq!(listpack.len(), 1);
+    /// ```
+    pub fn push<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, entry: T) {
+        self.try_push(entry).expect("Pushed to listpack");
+    }
+
+    /// Inserts an element at the given index into the listpack.
+    /// The insertion is done before the specified index, shifting
+    /// all the elements past this index to the right.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the string is too long to be stored in the listpack
+    /// or if the index is out of bounds.
+    ///
+    /// The maximum length of a string stored within the listpack is
+    /// (`std::u32::MAX - 1`) bytes.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello, world!");
+    /// listpack.insert(0, "Hello!");
+    /// assert_eq!(listpack.len(), 2);
+    /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello!");
+    /// assert_eq!(listpack.get(1).unwrap().to_string(), "Hello, world!");
+    /// ```
+    /// Or a more familiar example from [`std::vec::Vec`]:
+    /// ```
+    /// use listpack_redis::Listpack;
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push(1);
+    /// listpack.push(2);
+    /// listpack.push(3);
+    ///
+    /// listpack.insert(1, 4);
+    /// assert_eq!(listpack.len(), 4);
+    /// assert_eq!(listpack.get(0).unwrap().to_string(), "1");
+    /// assert_eq!(listpack.get(1).unwrap().to_string(), "4");
+    /// assert_eq!(listpack.get(2).unwrap().to_string(), "2");
+    /// assert_eq!(listpack.get(3).unwrap().to_string(), "3");
+    /// ```
+    pub fn insert<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
+        self.insert_with_placement_internal(InsertionPlacement::Before(index), entry)
+    }
+
+    /// Inserts an element at the given index into the listpack.
+    ///
+    /// The safe version of [`Self::insert`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    ///
+    /// // Index out of bounds:
+    /// assert!(listpack.try_insert(0, "Hello, world!").is_err());
+    /// listpack.push("Hello, world!");
+    /// assert!(listpack.try_insert(0, "Hello!").is_ok());
+    ///
+    /// assert_eq!(listpack.len(), 2);
+    /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello!");
+    /// assert_eq!(listpack.get(1).unwrap().to_string(), "Hello, world!");
+    /// ```
+    pub fn try_insert<'a, T: Into<ListpackEntryInsert<'a>>>(
+        &mut self,
+        index: usize,
+        entry: T,
+    ) -> Result {
+        self.try_insert_with_placement_internal(InsertionPlacement::Before(index), entry)
+    }
+
+    fn insert_with_placement_internal<'a, T: Into<ListpackEntryInsert<'a>>>(
+        &mut self,
+        placement: InsertionPlacement,
+        entry: T,
+    ) {
+        self.try_insert_with_placement_internal(placement, entry)
+            .expect("Insert an element into listpack");
+    }
+
+    // 1. First and foremost, check that the index is within the bounds.
+    // 2. Check that the listpack can fit the new element: if it is a
+    //    replacement of an existing element, consider its size,
+    //    otherwise, just check that the listpack can fit the new
+    //    element.
+    // 3. Grow the listpack if necessary by the amount of bytes
+    //    necessary.
+    // 4. If it was a replacement, replace the element, otherwise
+    //    insert the new element, either before or after the referred
+    //    element, by shifting the memory of the listpack to the right.
+    // 5. Safety check: if reallocating, don't forget to mark the end
+    //    of the listpack.
+    fn try_insert_with_placement_internal<'a, T: Into<ListpackEntryInsert<'a>>>(
+        &mut self,
+        placement: InsertionPlacement,
+        entry: T,
+    ) -> Result {
+        let entry = entry.into();
+        let index = placement.index();
+
+        if index > self.len() {
+            return Err(crate::error::InsertionError::IndexOutOfBounds {
+                index,
+                length: self.len(),
+            }
+            .into());
+        }
+
+        let encoded_value = entry.encode()?;
+
+        let referred_element_ptr = self.get_internal_entry_ptr(index).ok_or(
+            crate::error::InsertionError::IndexOutOfBounds {
+                index,
+                length: self.len(),
+            },
+        )?;
+
+        let referred_element = ListpackEntry::ref_from_ptr(referred_element_ptr);
+
+        let referred_element_offset_from_start = unsafe {
+            referred_element_ptr
+                .as_ptr()
+                .offset_from(self.allocation.data_start_ptr()) as usize
+        };
+        let referred_element_length = referred_element.total_bytes();
+
+        let element_to_replace = placement.to_replace().map(|_| referred_element);
+
+        let length_to_relocate = {
+            let referred_element_ptr = referred_element.as_ptr();
+            let end_ptr = self.allocation.data_end_ptr();
+            unsafe { end_ptr.offset_from(referred_element_ptr) as usize }
+        };
+
+        let fitting_requirement = self.can_fit_entry(&entry, element_to_replace)?;
+
+        match fitting_requirement {
+            FittingRequirement::NoChange => {}
+            FittingRequirement::Grow(size) => {
+                self.grow_by(size)
+                    .map_err(|_| AllocationError::FailedToGrow { size })?;
+            }
+            FittingRequirement::Shrink(size) => {
+                // The downsizing can only happen in the case of a
+                // replace. That means the new element is smaller than
+                // the one it replaces. The element to replace is the
+                // referred element. We can reposition the elements to
+                // the right of the referred element to the left by the
+                // size of the new element, so that the shrinking can
+                // happen.
+
+                let next_after_referred_element_ptr = unsafe {
+                    referred_element
+                        .as_ptr()
+                        .add(referred_element.total_bytes())
+                };
+
+                // Exclude the referred element from the length to
+                // relocate.
+                let length_to_relocate = length_to_relocate - referred_element.total_bytes();
+
+                if length_to_relocate > 0 {
+                    unsafe {
+                        std::ptr::copy(
+                            next_after_referred_element_ptr,
+                            referred_element
+                                .as_ptr()
+                                .cast_mut()
+                                .add(encoded_value.len()),
+                            length_to_relocate,
+                        );
+                    }
+                }
+
+                self.shrink_by(size)
+                    .map_err(|_| AllocationError::FailedToShrink { size })?;
+            }
+        }
+
+        // Lets obtain a new reference to the element after the
+        // reallocation. If the element was to be replaced, it might
+        // be partially destroyed by the reallocation. So, we can't
+        // work with it here, but we can work with its pointer.
+        let referred_element_ptr = unsafe {
+            NonNull::new_unchecked(
+                self.allocation
+                    .data_start_ptr()
+                    .cast_mut()
+                    .add(referred_element_offset_from_start),
+            )
+        }
+        .as_ptr();
+
+        match placement {
+            InsertionPlacement::Before(_) => {
+                // 1. Relocate all the memory to the right of the
+                // referred element (including the referred element's
+                // memory) by the size of the new element.
+                // 2. Insert the new element at the location of the
+                // referred element.
+
+                unsafe {
+                    // Shift the elements to the right.
+                    std::ptr::copy(
+                        referred_element_ptr,
+                        referred_element_ptr.add(encoded_value.len()),
+                        length_to_relocate,
+                    );
+
+                    std::ptr::copy_nonoverlapping(
+                        encoded_value.as_ptr(),
+                        referred_element_ptr,
+                        encoded_value.len(),
+                    );
+                }
+
+                self.increment_num_elements();
+            }
+            InsertionPlacement::After(_) => {
+                // 1. Relocate all the memory to the right of the
+                // referred element, excluding the referred element's
+                // memory, by the size of the new element.
+                // 2. Insert the new element at the location after that
+                // of the referred element.
+
+                // If this is the last element, it should point to
+                // the end marker (the old one, before the
+                // reallocation).
+
+                // Skip the referred element.
+                let next_after_referred_element_ptr =
+                    unsafe { referred_element_ptr.add(referred_element_length) };
+
+                unsafe {
+                    // Shift the elements to the right.
+                    std::ptr::copy_nonoverlapping(
+                        next_after_referred_element_ptr,
+                        next_after_referred_element_ptr.add(encoded_value.len()),
+                        length_to_relocate - referred_element_length,
+                    );
+
+                    std::ptr::copy_nonoverlapping(
+                        encoded_value.as_ptr(),
+                        next_after_referred_element_ptr,
+                        encoded_value.len(),
+                    );
+                }
+
+                self.increment_num_elements();
+            }
+            InsertionPlacement::Replace(_) => unsafe {
+                // Skip the referred element.
+                let next_after_referred_element_ptr =
+                    referred_element_ptr.add(referred_element_length);
+
+                // Shift the elements to the right.
+                std::ptr::copy_nonoverlapping(
+                    next_after_referred_element_ptr,
+                    referred_element_ptr.add(encoded_value.len()),
+                    length_to_relocate - referred_element_length,
+                );
+
+                std::ptr::copy_nonoverlapping(
+                    encoded_value.as_ptr(),
+                    referred_element_ptr,
+                    encoded_value.len(),
+                );
+            },
+        }
+
+        Ok(())
+    }
+
+    /// A safe version of [`Self::push`]. It is a little more useful,
+    /// when the listpack grows large. As the listpack is a single
+    /// allocation, and this allocation is limited in terms of length,
+    /// by the listpack header's `total_bytes` field, it is only
+    /// possible to occupy the four bytes (`2u32.pow(32) - 1`) bytes of
+    /// memory. This method will return an [`crate::error::Error`] if
+    /// the listpack is full and the element cannot be pushed.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// assert!(listpack.try_push("Hello, world!").is_ok());
+    /// assert_eq!(listpack.len(), 1);
+    /// ```
+    pub fn try_push<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, entry: T) -> Result {
+        let entry = entry.into();
+        let fitting_requirement = self.can_fit_entry(&entry, None)?;
+        let old_end_offset = unsafe {
+            self.allocation
+                .data_end_ptr()
+                .offset_from(self.allocation.ptr().as_ptr().cast()) as usize
+        };
+
+        match fitting_requirement {
+            FittingRequirement::NoChange => {}
+            FittingRequirement::Grow(size) => {
+                self.grow_by(size)
+                    .map_err(|_| AllocationError::FailedToGrow { size })?;
+            }
+            FittingRequirement::Shrink(_) => {
+                unreachable!("The listpack is growing, not shrinking.");
+            }
+        }
+
+        let encoded_value = entry.encode()?;
+
+        unsafe {
+            let ptr = self.allocation.ptr().as_ptr().add(old_end_offset);
+            std::ptr::copy_nonoverlapping(encoded_value.as_ptr(), ptr, encoded_value.len());
+        }
+
+        self.increment_num_elements();
+
+        Ok(())
+    }
+
+    /// Removes the element at the given index from the listpack and
+    /// returns it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the index is out of bounds.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello, world!");
+    /// let removed = listpack.remove(0);
+    /// assert_eq!(listpack.len(), 0);
+    /// assert_eq!(removed.to_string(), "Hello, world!");
+    /// ```
+    pub fn remove(&mut self, index: usize) -> ListpackEntryRemoved {
+        let removed = self.get(index).unwrap().into();
+        self.remove_range(index, 1);
+        removed
+    }
+
+    /// Retains only the elements specified by the predicate.
+    ///
+    /// In other words, removes all elements `e` such that `f(&e)`
+    /// returns `false`. This method operates in place, visiting each
+    /// element exactly once in the original order, and preserves the
+    /// order of the retained elements.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello, world!");
+    /// listpack.push("Hello!");
+    /// listpack.push("World!");
+    /// listpack.retain(|entry| entry.to_string().contains("Hello"));
+    ///
+    /// assert_eq!(listpack.len(), 2);
+    /// assert_eq!(listpack[0].to_string(), "Hello, world!");
+    /// assert_eq!(listpack[1].to_string(), "Hello!");
+    /// ```
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&ListpackEntry) -> bool,
+    {
+        let mut index = 0;
+        while index < self.len() {
+            let entry = self.get(index).unwrap();
+            if !f(entry) {
+                let _ = self.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    /// Appends the elements of another listpack to the back of this
+    /// listpack.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the listpacks cannot be merged.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack1: Listpack = Listpack::default();
+    /// listpack1.push("Hello, world!");
+    /// listpack1.push("Hello!");
+    ///
+    /// let mut listpack2: Listpack = Listpack::default();
+    /// listpack2.push("World!");
+    ///
+    /// listpack1.append(&mut listpack2);
+    ///
+    /// assert_eq!(listpack1.len(), 3);
+    /// assert_eq!(listpack2.len(), 1);
+    ///
+    /// assert_eq!(listpack1[0].to_string(), "Hello, world!");
+    /// assert_eq!(listpack1[1].to_string(), "Hello!");
+    /// assert_eq!(listpack1[2].to_string(), "World!");
+    /// ```
+    pub fn append(&mut self, other: &mut Self) {
+        other.iter().for_each(|entry| {
+            let data = entry.data().expect("Extract an entry from listpack");
+            let entry = ListpackEntryInsert::try_from(&data)
+                .expect("Convert an entry to ListpackEntryInsert");
+            self.push(entry);
+        });
+    }
+
+    /// Removes the elements in the specified range from the listpack
+    /// in bulk, returning all removed elements as an iterator.
+    ///
+    /// See [`crate::iter::ListpackDrain`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the starting point is greater than the end point
+    /// or if the end point is greater than the length of the listpack.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello, world!");
+    /// listpack.push("Hello!");
+    /// listpack.push("World!");
+    /// let removed = listpack.drain(1..3).collect::<Vec<_>>();
+    /// assert_eq!(listpack.len(), 1);
+    /// assert_eq!(removed.len(), 2);
+    /// assert_eq!(removed[0].get_str().unwrap(), "Hello!");
+    /// assert_eq!(removed[1].get_str().unwrap(), "World!");
+    /// ```
+    ///
+    /// Use it the same way as [`Self::clear`], if you want to remove
+    /// all elements from the listpack:
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello, world!");
+    /// listpack.push("Hello!");
+    /// listpack.push("World!");
+    /// let removed = listpack.drain(..).collect::<Vec<_>>();
+    /// assert!(listpack.is_empty());
+    /// assert_eq!(removed.len(), 3);
+    /// assert_eq!(removed[0].get_str().unwrap(), "Hello, world!");
+    /// assert_eq!(removed[1].get_str().unwrap(), "Hello!");
+    /// assert_eq!(removed[2].get_str().unwrap(), "World!");
+    /// ```
+    ///
+    /// See [std::vec::Vec::drain] for more information.
+    pub fn drain<R>(&mut self, range: R) -> impl std::iter::Iterator<Item = ListpackEntryRemoved>
+    where
+        R: RangeBounds<usize>,
+    {
+        use std::ops::Bound;
+
+        let start = match range.start_bound() {
+            Bound::Included(&start) => start,
+            Bound::Excluded(&start) => start + 1,
+            Bound::Unbounded => 0,
+        };
+
+        let end = match range.end_bound() {
+            Bound::Included(&end) => end + 1,
+            Bound::Excluded(&end) => end,
+            Bound::Unbounded => self.len(),
+        };
+
+        if start > end {
+            panic!("The start is greater than the end.")
+        } else if end > self.len() {
+            panic!("The end is greater than the length of the listpack.")
+        }
+
+        let length = end - start;
+        let removed_elements = self
+            .iter()
+            .skip(start)
+            .take(length)
+            .map(ListpackEntryRemoved::from)
+            .collect::<Vec<_>>();
+
+        self.remove_range(start, length);
+
+        removed_elements.into_iter()
+    }
+
+    /// Appends all the elements of a slice to the listpack.
+    ///
+    /// # Note
+    ///
+    /// The elements must be convertible to [`ListpackEntryInsert`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.extend_from_slice(&["Hello", "World", "!"]);
+    /// assert_eq!(listpack.len(), 3);
+    /// assert_eq!(listpack[0].to_string(), "Hello");
+    /// assert_eq!(listpack[1].to_string(), "World");
+    /// assert_eq!(listpack[2].to_string(), "!");
+    /// ```
+    pub fn extend_from_slice<'a, T>(&mut self, slice: &'a [T])
+    where
+        &'a T: Into<ListpackEntryInsert<'a>>,
+        ListpackEntryInsert<'a>: std::convert::From<&'a T>,
+    {
+        // TODO: perform a one-time reallocation instead of many
+        // due to `push()`.
+        for item in slice {
+            self.push(item.into());
+        }
+    }
+
+    /// Copies elements from `src` range to the end of the listpack.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range is out of bounds.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    ///
+    /// listpack.push("Hello");
+    /// listpack.push("World");
+    /// listpack.push("!");
+    ///
+    /// // Copy the first two elements to the end of the listpack.
+    /// listpack.extend_from_within(0..2);
+    ///
+    /// assert_eq!(listpack.len(), 5);
+    /// assert_eq!(listpack[0].to_string(), "Hello");
+    /// assert_eq!(listpack[1].to_string(), "World");
+    /// assert_eq!(listpack[2].to_string(), "!");
+    /// assert_eq!(listpack[3].to_string(), "Hello");
+    /// assert_eq!(listpack[4].to_string(), "World");
+    /// ```
+    pub fn extend_from_within(&mut self, src: std::ops::Range<usize>) {
+        if src.contains(&self.len()) {
+            panic!("The range is out of bounds.");
+        }
+
+        for i in src {
+            let entry = self.get(i).unwrap();
+            let entry = ListpackEntryRemoved::from(entry);
+            let entry = ListpackEntryInsert::from(&entry);
+
+            self.push(entry);
+        }
+    }
+
+    /// Removes consecutive repeated elements from the listpack.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello");
+    /// listpack.push("Hello");
+    /// listpack.push("World");
+    /// listpack.push("World");
+    /// listpack.push("World");
+    /// listpack.push("!");
+    /// listpack.dedup();
+    /// assert_eq!(listpack.len(), 3);
+    /// assert_eq!(listpack[0].to_string(), "Hello");
+    /// assert_eq!(listpack[1].to_string(), "World");
+    /// assert_eq!(listpack[2].to_string(), "!");
+    /// ```
+    pub fn dedup(&mut self) {
+        let mut index = 0;
+        let mut indexes_to_remove = Vec::new();
+
+        while index < self.len() {
+            let entry = self.get(index).unwrap();
+            let mut next_index = index + 1;
+            while next_index < self.len() {
+                let next_entry = self.get(next_index).unwrap();
+                if entry == next_entry {
+                    indexes_to_remove.push(next_index);
+                    next_index += 1;
+                } else {
+                    break;
+                }
+            }
+            index = next_index;
+        }
+
+        for index in indexes_to_remove.into_iter().rev() {
+            let _ = self.remove(index);
+        }
+    }
+
+    /// Reverses the order of the elements in the listpack in place.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello");
+    /// listpack.push("World");
+    /// listpack.push("!");
+    ///
+    /// listpack.reverse();
+    ///
+    /// assert_eq!(listpack.len(), 3);
+    /// assert_eq!(listpack[0].to_string(), "!");
+    /// assert_eq!(listpack[1].to_string(), "World");
+    /// assert_eq!(listpack[2].to_string(), "Hello");
+    /// ```
+    pub fn reverse(&mut self) {
+        let length = self.len();
+        let mut indexes_to_swap = Vec::new();
+
+        for i in 0..length / 2 {
+            indexes_to_swap.push((i, length - i - 1));
+        }
+
+        for (a, b) in indexes_to_swap {
+            self.swap(a, b);
+        }
+    }
+
+    /// Removes the last element from the listpack and returns it, or
+    /// [`None`] if it is empty. The returned [`ListpackEntry`] is not
+    /// a part of the listpack anymore.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello, world!");
+    /// assert_eq!(listpack.len(), 1);
+    /// let removed = listpack.pop().unwrap();
+    /// assert_eq!(listpack.len(), 0);
+    /// assert_eq!(removed.get_str().unwrap(), "Hello, world!");
+    /// ```
+    pub fn pop(&mut self) -> Option<ListpackEntryRemoved> {
+        if self.is_empty() {
+            return None;
+        }
+
+        Some(self.remove(self.len() - 1))
+    }
+
+    // Commented out, as there is no such method in listpack C API as
+    // of now.
+    // /// Removes the element at the given index from the listpack and
+    // /// returns it, swapping it with the last element.
+    // ///
+    // /// # Panics
+    // ///
+    // /// Panics if the index is out of bounds.
+    // ///
+    // /// # Example
+    // ///
+    // /// ```
+    // /// use listpack_redis::Listpack;
+    // ///
+    // /// let mut listpack = Listpack::default();
+    // /// listpack.push("Hello");
+    // /// listpack.push("World");
+    // /// listpack.push("!");
+    // /// let removed = listpack.swap_remove(0);
+    // /// assert_eq!(listpack.len(), 2);
+    // /// assert_eq!(removed.as_str().unwrap(), "Hello");
+    // /// assert_eq!(listpack.get(0).unwrap().data().unwrap().get_small_str().unwrap(), "!");
+    // /// assert_eq!(listpack.get(1).unwrap().data().unwrap().get_small_str().unwrap(), "World");
+    // /// ```
+    // pub fn swap_remove(&mut self, index: usize) -> ListpackEntryRemoved {
+    //     let ptr = NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
+    //         .expect("Index out of bounds.");
+    //     let cloned = ListpackEntryRemoved::from(ptr);
+    //     let last = NonNull::new(unsafe { bindings::lpLast(self.ptr.as_ptr()) })
+    //         .expect("The last element is accessible.");
+    //     self.ptr = NonNull::new(unsafe {
+    //         bindings::lpDelete(self.ptr.as_ptr(), ptr.as_ptr(), std::ptr::null_mut())
+    //     })
+    //     .expect("Deleted from listpack");
+    //     cloned
+    // }
 
     // // TODO: doc
     // /// Returns an iterator over the elements of the listpack.
@@ -1606,7 +2336,10 @@ impl Listpack {
 /// contiguous array, we can't implement the [`Deref`] trait to
 /// convert the listpack to a slice. Instead, we provide the
 /// corresponding methods.
-impl Listpack {
+impl<Allocator> Listpack<Allocator>
+where
+    Allocator: CustomAllocator,
+{
     /// Returns an element of the listpack at the given index.
     ///
     /// # Example
@@ -1614,7 +2347,7 @@ impl Listpack {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::new();
+    /// let mut listpack: Listpack = Listpack::default();
     /// listpack.push("Hello");
     /// listpack.push("World");
     /// assert_eq!(listpack.get(0).unwrap().data().unwrap().get_small_str().unwrap(), "Hello");
@@ -1634,14 +2367,14 @@ impl Listpack {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::new();
+    /// let mut listpack: Listpack = Listpack::default();
     /// listpack.push("Hello");
     /// listpack.push("World");
     /// assert_eq!(listpack.get_mut(0).unwrap().to_string(), "Hello");
     /// assert_eq!(listpack.get_mut(1).unwrap().to_string(), "World");
     /// assert!(listpack.get_mut(2).is_none());
     /// ```
-    pub fn get_mut(&mut self, index: usize) -> Option<ListpackEntryMutable> {
+    pub fn get_mut(&mut self, index: usize) -> Option<ListpackEntryMutable<Allocator>> {
         self.get_internal_entry_ptr(index).map(|ptr| {
             let entry = ListpackEntry::ref_from_ptr(ptr);
             ListpackEntryMutable::new(self, entry, index)
@@ -1649,7 +2382,10 @@ impl Listpack {
     }
 }
 
-impl Index<usize> for Listpack {
+impl<Allocator> Index<usize> for Listpack<Allocator>
+where
+    Allocator: CustomAllocator,
+{
     type Output = ListpackEntry;
 
     fn index(&self, index: usize) -> &Self::Output {
@@ -1657,9 +2393,12 @@ impl Index<usize> for Listpack {
     }
 }
 
-impl IntoIterator for Listpack {
+impl<Allocator> IntoIterator for Listpack<Allocator>
+where
+    Allocator: CustomAllocator,
+{
     type Item = ListpackEntryRemoved;
-    type IntoIter = ListpackIntoIter;
+    type IntoIter = ListpackIntoIter<Allocator>;
 
     fn into_iter(self) -> Self::IntoIter {
         ListpackIntoIter {
@@ -1670,11 +2409,137 @@ impl IntoIterator for Listpack {
 }
 
 /// Specific methods for this list-pack implementation.
-impl Listpack {
+impl<Allocator> Listpack<Allocator>
+where
+    Allocator: CustomAllocator,
+{
+    fn increment_num_elements(&mut self) {
+        let num_elements = self.get_header_ref().num_elements() as u16;
+        self.set_num_elements(num_elements + 1);
+    }
+
+    fn set_num_elements(&mut self, num_elements: u16) {
+        self.get_header_mut().set_num_elements(num_elements);
+    }
+
+    /// Validates the listpack by iterating over its memory and
+    /// checking that the entries are correctly formatted.
+    #[allow(unused)]
+    fn validate(&self) -> Result {
+        if self.is_empty() {
+            return Ok(());
+        }
+
+        let mut current = 0;
+        let mut data = self.allocation.data_start_slice();
+
+        while current < self.len() {
+            if data[0] == END_MARKER {
+                return Err(crate::error::Error::UnexpectedEndMarker);
+            }
+
+            let entry = ListpackEntry::ref_from_slice(data);
+            data = &data[entry.total_bytes()..];
+            current += 1;
+        }
+
+        if data[0] != END_MARKER {
+            return Err(crate::error::Error::MissingEndMarker);
+        }
+
+        Ok(())
+    }
+
+    fn read_element_length_from_the_end(ptr: *const u8) -> usize {
+        let mut data = ptr;
+        let mut bytes = [0u8; 5];
+        let mut current = bytes.len() - 1;
+
+        loop {
+            let byte = unsafe { *data };
+            bytes[current] = byte;
+
+            if byte & 0b1000_0000 == 0 {
+                break;
+            }
+
+            current -= 1;
+
+            data = unsafe { data.sub(1) };
+        }
+
+        // Concatenate all the bytes from the left-to-right, ignoring
+        // the most significant bit.
+        let mut length = 0;
+
+        for byte in bytes[current..].iter() {
+            length = (length << 7) | (byte & 0b0111_1111) as usize;
+        }
+
+        // length + bytes.len() - 1 - current
+        length + bytes.len() - current
+    }
+
+    fn get_internal_entry_ptr_from_start(&self, index: usize) -> Option<NonNull<u8>> {
+        if self.is_empty() || index >= self.len() {
+            return None;
+        }
+
+        let mut current = 0;
+
+        let mut data = self.allocation.data_start_slice();
+
+        while current < index {
+            if data[0] == END_MARKER {
+                return None;
+            }
+
+            let entry = ListpackEntry::ref_from_slice(data);
+            data = data[entry.total_bytes()..].try_into().unwrap();
+            current += 1;
+        }
+
+        Some(unsafe { NonNull::new_unchecked(data.as_ptr().cast_mut()) })
+    }
+
+    fn get_internal_entry_ptr_from_end(&self, index: usize) -> Option<NonNull<u8>> {
+        if self.is_empty() || index >= self.len() {
+            return None;
+        }
+
+        let mut current = self.len();
+        // Point to the last byte of the last's element total element
+        // length.
+        let mut data = self.allocation.data_end_ptr();
+
+        while current > index {
+            let element_length = Self::read_element_length_from_the_end(unsafe { data.sub(1) });
+            data = unsafe { data.sub(element_length) };
+
+            if current == 0 {
+                return None;
+            }
+
+            current -= 1;
+        }
+
+        Some(unsafe { NonNull::new_unchecked(data.cast_mut()) })
+    }
+
     /// Returns a pointer to the listpack's entry at the given index.
     fn get_internal_entry_ptr(&self, index: usize) -> Option<NonNull<u8>> {
-        NonNull::new(unsafe { bindings::lpSeek(self.ptr.as_ptr(), index as _) })
+        // Check that the index is at the beginning or close to the end,
+        // and search for the entry from the beginning or the end
+        // respectively. This will reduce the number of iterations
+        // needed to find the entry.
+
+        if index < self.len() / 2 {
+            self.get_internal_entry_ptr_from_start(index)
+        } else {
+            self.get_internal_entry_ptr_from_end(index)
+        }
     }
+
     /// Returns the amount of bytes used by the listpack to store the
     /// elements.
     ///
@@ -1683,7 +2548,7 @@ impl Listpack {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::with_capacity(10);
+    /// let mut listpack: Listpack = Listpack::default();
     /// assert_eq!(listpack.get_storage_bytes(), 7);
     /// listpack.push("Hello, world!");
     /// assert_eq!(listpack.get_storage_bytes(), 22);
@@ -1693,31 +2558,8 @@ impl Listpack {
     /// assert_eq!(listpack.get_storage_bytes(), 22);
     /// ```
     pub fn get_storage_bytes(&self) -> usize {
-        unsafe { bindings::lpBytes(self.ptr.as_ptr()) }
+        self.get_header_ref().total_bytes()
     }
-
-    // Commented out, as listpack C API doesn't provide a method to
-    // return the total bytes used by the listpack (including the
-    // capacity).
-    // /// Returns the total number of bytes used by the listpack,
-    // /// not just the storage bytes (the actual elements), but also the
-    // /// memory allocated for the capacity.
-    // ///
-    // /// # Example
-    // ///
-    // /// ```
-    // /// use listpack_redis::Listpack;
-    // ///
-    // /// let mut listpack = Listpack::with_capacity(10);
-    // /// assert_eq!(listpack.get_total_bytes(), 7);
-    // /// assert_eq!(listpack.get_storage_bytes(), 7);
-    // /// listpack.push("Hello, world!");
-    // /// assert_eq!(listpack.get_storage_bytes(), 22);
-    // /// assert_eq!(listpack.get_total_bytes(), 22);
-    // /// ```
-    // pub fn get_total_bytes(&self) -> usize {
-    //     unsafe { self.header_ref() }.total_bytes()
-    // }
 
     /// Removes the elements in the specified range from the listpack.
     ///
@@ -1730,26 +2572,96 @@ impl Listpack {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::new();
+    /// let mut listpack: Listpack = Listpack::default();
     /// listpack.push("Hello, world!");
     /// listpack.push("Hello!");
     /// listpack.push("World!");
+    /// assert_eq!(listpack.len(), 3);
+    /// assert_eq!(listpack.get_storage_bytes(), 38);
     /// listpack.remove_range(1, 2);
     /// assert_eq!(listpack.len(), 1);
+    /// assert_eq!(listpack.get_storage_bytes(), 22);
     /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello, world!");
     /// ```
     pub fn remove_range(&mut self, start: usize, length: usize) {
+        self.try_remove_range(start, length)
+            .expect("Remove the range of elements.");
+    }
+
+    /// A safe version of [`Self::remove_range`].
+    pub fn try_remove_range(&mut self, start: usize, length: usize) -> Result {
         if start + length > self.len() {
-            panic!("The range is out of bounds.");
+            return Err(crate::error::DeletionError::IndexOutOfBounds {
+                start_index: start,
+                delete_count: length,
+                length: self.len(),
+            }
+            .into());
         }
 
-        let ptr = unsafe { bindings::lpDeleteRange(self.ptr.as_ptr(), start as _, length as _) };
+        // 1. Position a pointer to the start of the range.
+        let start_element_ptr =
+            self.get_internal_entry_ptr(start)
+                .ok_or(crate::error::Error::Deletion(
+                    crate::error::DeletionError::IndexOutOfBounds {
+                        start_index: start,
+                        delete_count: length,
+                        length: self.len(),
+                    },
+                ))?;
 
-        if let Some(ptr) = NonNull::new(ptr) {
-            self.ptr = ptr;
-        } else {
-            panic!("The delete range failed.");
+        // 2. Determine the length of the range in bytes by iterating
+        // over the elements and counting their sizes.
+        // The `end_element_ptr` points to the beginning of the element
+        // after the range (of the end marker).
+        let (length_to_delete, end_element_ptr) = {
+            let mut bytes = 0;
+            let mut current = 0;
+            let mut till_ptr = start_element_ptr.as_ptr();
+
+            while current < length {
+                if till_ptr.is_null() || unsafe { *till_ptr } == END_MARKER {
+                    return Err(crate::error::Error::UnexpectedEndMarker);
+                }
+
+                let entry =
+                    ListpackEntry::ref_from_ptr(unsafe { NonNull::new_unchecked(till_ptr) });
+
+                till_ptr = unsafe { till_ptr.add(entry.total_bytes()) };
+                bytes += entry.total_bytes();
+                current += 1;
+            }
+
+            (bytes, till_ptr)
+        };
+
+        // 3. Delete the range by moving the elements to the left, and
+        // then shrinking the listpack.
+
+        let listpack_end_ptr = self.allocation.data_end_ptr();
+
+        // The length of the elements after the range, that must be
+        // moved to the left and left in the listpack.
+        let rest_elements_length =
+            unsafe { listpack_end_ptr.offset_from(end_element_ptr) } as usize;
+
+        unsafe {
+            std::ptr::copy(
+                end_element_ptr,
+                start_element_ptr.as_ptr(),
+                rest_elements_length,
+                // self.get_storage_bytes() - (data as usize - self.allocation.data_start_ptr().as_ptr() as usize),
+            );
         }
+
+        self.shrink_by(length_to_delete)
+            .map_err(|_| AllocationError::FailedToShrink {
+                size: length_to_delete,
+            })?;
+
+        self.set_num_elements((self.len() - length) as u16);
+
+        Ok(())
     }
 
     /// Inserts an element at the given index into the listpack, after
@@ -1765,7 +2677,7 @@ impl Listpack {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::new();
+    /// let mut listpack: Listpack = Listpack::default();
     /// listpack.push("Hello, world!");
     /// listpack.insert_after(0, "Hello!");
     /// assert_eq!(listpack.len(), 2);
@@ -1773,7 +2685,7 @@ impl Listpack {
     /// assert_eq!(listpack.get(1).unwrap().to_string(), "Hello!");
     /// ```
     pub fn insert_after<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
-        self.insert_internal(index, entry, bindings::LP_AFTER)
+        self.insert_with_placement_internal(InsertionPlacement::After(index), entry)
     }
 
     /// Inserts an element at the given index into the listpack, after
@@ -1786,7 +2698,7 @@ impl Listpack {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::new();
+    /// let mut listpack: Listpack = Listpack::default();
     /// listpack.push("Hello, world!");
     /// assert!(listpack.try_insert_after(0, "Hello!").is_ok());
     ///
@@ -1799,7 +2711,7 @@ impl Listpack {
         index: usize,
         entry: T,
     ) -> Result {
-        self.try_insert_internal(index, entry, bindings::LP_AFTER)
+        self.try_insert_with_placement_internal(InsertionPlacement::After(index), entry)
     }
 
     /// Replaces the element at the given index with the given element.
@@ -1814,14 +2726,16 @@ impl Listpack {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::new();
+    /// let mut listpack: Listpack = Listpack::default();
     /// listpack.push("Hello, world!");
     /// listpack.replace(0, "Hello!");
     /// assert_eq!(listpack.len(), 1);
+    /// assert_eq!(listpack.get_storage_bytes(), 15);
     /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello!");
+    /// assert_eq!(listpack.get_storage_bytes(), 15);
     /// ```
     pub fn replace<'a, T: Into<ListpackEntryInsert<'a>>>(&mut self, index: usize, entry: T) {
-        self.insert_internal(index, entry, bindings::LP_REPLACE)
+        self.try_replace(index, entry).expect("Replaced an element")
     }
 
     /// Replaces the element at the given index with the given element.
@@ -1833,7 +2747,7 @@ impl Listpack {
     /// ```
     /// use listpack_redis::Listpack;
     ///
-    /// let mut listpack = Listpack::new();
+    /// let mut listpack: Listpack = Listpack::default();
     ///
     /// listpack.push("Hello, world!");
     ///
@@ -1847,404 +2761,9 @@ impl Listpack {
         index: usize,
         entry: T,
     ) -> Result {
-        self.try_insert_internal(index, entry, bindings::LP_REPLACE)
+        self.try_insert_with_placement_internal(InsertionPlacement::Replace(index), entry)
     }
 }
-
-/// An iterator over the elements of a listpack.
-///
-/// # Example
-///
-/// ```
-/// use listpack_redis::Listpack;
-///
-/// let mut listpack = Listpack::new();
-/// listpack.push("Hello");
-/// listpack.push("World");
-/// let mut iter = listpack.iter();
-/// assert_eq!(iter.next().unwrap().to_string(), "Hello");
-/// assert_eq!(iter.next().unwrap().to_string(), "World");
-/// assert!(iter.next().is_none());
-/// ```
-#[derive(Debug)]
-pub struct ListpackIter<'a> {
-    listpack: &'a Listpack,
-    index: usize,
-}
-
-impl<'a> Iterator for ListpackIter<'a> {
-    type Item = &'a ListpackEntry;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.index >= self.listpack.len() {
-            return None;
-        }
-
-        let element = self.listpack.get(self.index)?;
-
-        self.index += 1;
-
-        Some(element)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.index, Some(self.listpack.len()))
-    }
-}
-
-impl DoubleEndedIterator for ListpackIter<'_> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.index >= self.listpack.len() {
-            return None;
-        }
-
-        let index = self.listpack.len() - self.index - 1;
-        let element = self.listpack.get(index)?;
-
-        self.index += 1;
-
-        Some(element)
-    }
-}
-
-/// An iterator over the elements of a listpack, which returns the
-/// elements as [`ListpackEntryRemoved`]. This iterator owns the
-/// listpack.
-#[derive(Debug)]
-pub struct ListpackIntoIter {
-    listpack: Listpack,
-    index: usize,
-}
-
-impl Iterator for ListpackIntoIter {
-    type Item = ListpackEntryRemoved;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.index >= self.listpack.len() {
-            return None;
-        }
-
-        let element = self.listpack.get(self.index)?;
-
-        self.index += 1;
-
-        Some(element.into())
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.index, Some(self.listpack.len()))
-    }
-}
-
-impl DoubleEndedIterator for ListpackIntoIter {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.index >= self.listpack.len() {
-            return None;
-        }
-
-        let index = self.listpack.len() - self.index - 1;
-        let element = self.listpack.get(index)?;
-
-        self.index += 1;
-
-        Some(element.into())
-    }
-}
-
-/// An iterator over the elements of a listpack, which returns
-/// contiguous windows of elements.
-///
-/// # Example
-///
-/// ```
-/// use listpack_redis::Listpack;
-///
-/// let mut listpack = Listpack::new();
-/// listpack.push("Hello");
-/// listpack.push("World");
-/// listpack.push("!");
-/// let mut iter = listpack.windows(2);
-/// assert_eq!(iter.next().unwrap().len(), 2);
-/// assert_eq!(iter.next().unwrap().len(), 2);
-/// assert!(iter.next().is_none());
-/// ```
-///
-/// Or with values:
-///
-/// ```
-/// use listpack_redis::Listpack;
-///
-/// let mut listpack = Listpack::new();
-/// listpack.push("Hello");
-/// listpack.push("World");
-/// listpack.push("!");
-///
-/// let mut iter = listpack.windows(2);
-///
-/// let value = iter.next().unwrap();
-///
-/// assert_eq!(value[0].to_string(), "Hello");
-/// assert_eq!(value[1].to_string(), "World");
-/// assert_eq!(value.len(), 2);
-///
-/// let value = iter.next().unwrap();
-///
-/// assert_eq!(value[0].to_string(), "World");
-/// assert_eq!(value[1].to_string(), "!");
-/// assert_eq!(value.len(), 2);
-///
-/// assert!(iter.next().is_none());
-/// ```
-#[derive(Debug)]
-pub struct ListpackWindows<'a> {
-    listpack: &'a Listpack,
-    size: usize,
-    index: usize,
-}
-
-impl<'a> Iterator for ListpackWindows<'a> {
-    type Item = Vec<&'a ListpackEntry>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.index + self.size > self.listpack.len() {
-            return None;
-        }
-
-        let mut window = Vec::with_capacity(self.size);
-        for i in self.index..self.index + self.size {
-            window.push(self.listpack.get(i).unwrap());
-        }
-
-        self.index += 1;
-
-        Some(window)
-    }
-}
-
-impl DoubleEndedIterator for ListpackWindows<'_> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        let length = self.listpack.len();
-
-        if self.index + self.size > length {
-            return None;
-        }
-
-        let mut window = Vec::with_capacity(self.size);
-        for i in length - self.index - self.size..length - self.index + self.size {
-            window.push(self.listpack.get(i).unwrap());
-        }
-
-        self.index += 1;
-
-        Some(window)
-    }
-}
-
-/// An iterator over the elements of a listpack, which returns chunks
-/// of elements.
-///
-/// # Example
-///
-/// ```
-/// use listpack_redis::Listpack;
-///
-/// let mut listpack = Listpack::new();
-/// listpack.push("Hello");
-/// listpack.push("World");
-/// listpack.push("!");
-/// let mut iter = listpack.chunks(2);
-/// assert_eq!(iter.next().unwrap().len(), 2);
-/// assert_eq!(iter.next().unwrap().len(), 1);
-/// assert!(iter.next().is_none());
-/// ```
-///
-/// Or with values:
-///
-/// ```
-/// use listpack_redis::Listpack;
-///
-/// let mut listpack = Listpack::new();
-/// listpack.push("Hello");
-/// listpack.push("World");
-/// listpack.push("!");
-///
-/// let mut iter = listpack.chunks(2);
-///
-/// let value = iter.next().unwrap();
-///
-/// assert_eq!(value[0].to_string(), "Hello");
-/// assert_eq!(value[1].to_string(), "World");
-/// assert_eq!(value.len(), 2);
-///
-/// let value = iter.next().unwrap();
-///
-/// assert_eq!(value[0].to_string(), "!");
-/// assert_eq!(value.len(), 1);
-///
-/// assert!(iter.next().is_none());
-/// ```
-#[derive(Debug)]
-
-pub struct ListpackChunks<'a> {
-    listpack: &'a Listpack,
-    size: usize,
-    index: usize,
-}
-
-impl<'a> Iterator for ListpackChunks<'a> {
-    type Item = Vec<&'a ListpackEntry>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.index >= self.listpack.len() {
-            return None;
-        }
-
-        let remaining = (self.listpack.len() - self.index).min(self.size);
-        let mut chunk = Vec::with_capacity(remaining);
-        for i in self.index..self.index + remaining {
-            chunk.push(self.listpack.get(i).unwrap());
-        }
-
-        self.index += remaining;
-
-        Some(chunk)
-    }
-}
-
-/// Removes the specified range from the vector in bulk, returning all
-/// removed elements as an iterator. If the iterator is dropped before
-/// being fully consumed, it drops the remaining removed elements.
-///
-/// The returned iterator keeps a mutable borrow on the vector to
-/// optimize its implementation.
-///
-/// # Example
-///
-/// ```
-/// use listpack_redis::Listpack;
-///
-/// let mut listpack = Listpack::new();
-/// listpack.push("Hello");
-/// listpack.push("World");
-/// listpack.push("!");
-/// let removed = listpack.drain(..).collect::<Vec<_>>();
-/// assert!(listpack.is_empty());
-/// assert_eq!(removed.len(), 3);
-
-#[derive(Debug)]
-pub struct ListpackDrain<'a> {
-    listpack: &'a mut Listpack,
-    offset: usize,
-    start: usize,
-    end: usize,
-}
-
-impl<'a> Iterator for ListpackDrain<'a> {
-    type Item = ListpackEntryRemoved;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.offset >= self.end - self.start || self.offset + self.start >= self.listpack.len() {
-            return None;
-        }
-
-        let element = self.listpack.remove(self.start + self.offset);
-        self.offset += 1;
-
-        Some(element)
-    }
-}
-
-impl<'a> DoubleEndedIterator for ListpackDrain<'a> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.offset >= self.end - self.start || self.offset + self.start >= self.listpack.len() {
-            return None;
-        }
-
-        let element = self.listpack.remove(self.end - self.offset - 1);
-        self.offset += 1;
-
-        Some(element)
-    }
-}
-
-impl Drop for ListpackDrain<'_> {
-    fn drop(&mut self) {
-        let ptr = unsafe {
-            bindings::lpDeleteRange(
-                self.listpack.ptr.as_ptr(),
-                (self.start + self.offset) as _,
-                (self.end - self.start - self.offset) as _,
-            )
-        };
-
-        if let Some(ptr) = NonNull::new(ptr) {
-            self.listpack.ptr = ptr;
-        } else {
-            panic!("The range is out of bounds.");
-        }
-    }
-}
-
-// /// A mutable iterator over the elements of a listpack.
-// ///
-// /// # Example
-// ///
-// /// ```
-// /// use listpack_redis::Listpack;
-// ///
-// /// let mut listpack = Listpack::new();
-// /// listpack.push("Hello");
-// /// listpack.push("World");
-// /// let mut iter = listpack.iter_mut();
-// /// assert_eq!(iter.next().unwrap().to_string(), "Hello");
-// /// assert_eq!(iter.next().unwrap().to_string(), "World");
-// /// assert!(iter.next().is_none());
-// /// ```
-// #[derive(Debug)]
-// pub struct ListpackIterMut<'a> {
-//     listpack: &'a mut Listpack,
-//     index: usize,
-// }
-
-// impl<'a> Iterator for ListpackIterMut<'a> {
-//     type Item = ListpackEntryMutable<'a>;
-
-//     fn next(&mut self) -> Option<Self::Item> {
-//         if self.index >= self.listpack.len() {
-//             return None;
-//         }
-
-//         let element = self.listpack.get_mut(self.index).unwrap();
-
-//         self.index += 1;
-
-//         Some(element)
-//     }
-
-//     fn size_hint(&self) -> (usize, Option<usize>) {
-//         (self.index, Some(self.listpack.len()))
-//     }
-// }
-
-// impl<'a> DoubleEndedIterator for ListpackIterMut<'a> {
-//     fn next_back(&mut self) -> Option<Self::Item> {
-//         if self.index >= self.listpack.len() {
-//             return None;
-//         }
-
-//         let index = self.listpack.len() - self.index - 1;
-//         let element = self.listpack.get(self.index).unwrap();
-//         let entry = ListpackEntryMutable {
-//             listpack: self.listpack,
-//             entry: element,
-//             index: self.index - 1,
-//         };
-
-//         self.index += 1;
-
-//         Some(entry)
-//     }
-// }
 
 /// A macro that creates a new listpack from a list of elements.
 /// An analogue of the [`vec!`] macro.
@@ -2252,18 +2771,18 @@ impl Drop for ListpackDrain<'_> {
 /// # Example
 ///
 /// ```
-/// use listpack_redis::listpack;
+/// use listpack_redis::{listpack, Listpack};
 ///
-/// let listpack = listpack!["Hello", "World"];
+/// let listpack: Listpack = listpack!["Hello", "World"];
 /// assert_eq!(listpack.len(), 2);
 /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello");
 /// assert_eq!(listpack.get(1).unwrap().to_string(), "World");
 /// ```
 /// Or a more vec-like equivalent:
 /// ```
-/// use listpack_redis::listpack;
+/// use listpack_redis::{listpack, Listpack};
 ///
-/// let listpack = listpack![1, 2, 3];
+/// let listpack: Listpack = listpack![1, 2, 3];
 /// assert_eq!(listpack.len(), 3);
 /// assert_eq!(listpack[0].to_string(), "1");
 /// assert_eq!(listpack[1].to_string(), "2");
@@ -2272,9 +2791,9 @@ impl Drop for ListpackDrain<'_> {
 /// It is also possible to specify different types, contrary to the
 /// [`std::convert::From`] trait:
 /// ```
-/// use listpack_redis::listpack;
+/// use listpack_redis::{listpack, Listpack};
 ///
-/// let listpack = listpack![1, "Hello", 3];
+/// let listpack: Listpack = listpack![1, "Hello", 3];
 /// assert_eq!(listpack.len(), 3);
 /// assert_eq!(listpack[0].to_string(), "1");
 /// assert_eq!(listpack[1].to_string(), "Hello");
@@ -2284,7 +2803,7 @@ impl Drop for ListpackDrain<'_> {
 macro_rules! listpack {
     ( $ ( $ x : expr ) , * ) => {
         {
-            let mut listpack = $crate::Listpack::new();
+            let mut listpack = $crate::Listpack::default();
             $ (
                 listpack.push($x);
             ) *
@@ -2295,49 +2814,81 @@ macro_rules! listpack {
 
 #[cfg(test)]
 mod tests {
+    use crate::allocator::DefaultAllocator;
+
     use super::*;
 
     fn create_hello_world_listpack() -> Listpack {
-        let mut listpack = Listpack::new();
+        let mut listpack = Listpack::default();
         listpack.push("Hello");
         listpack.push("World");
         listpack
     }
 
     #[test]
-    fn header() {
-        let mut listpack = Listpack::new();
+    fn new_and_empty() {
+        let allocator = DefaultAllocator;
+        let listpack: Listpack = Listpack::new(allocator);
+        drop(listpack);
+    }
 
-        unsafe {
-            assert_eq!(listpack.header_ref().total_bytes(), 7);
-            assert_eq!(listpack.header_ref().num_elements(), 0);
-        }
+    #[test]
+    fn short_lifetime() {
+        let listpack: Listpack = Listpack::default();
+        drop(listpack);
+    }
+
+    #[test]
+    fn long_lifetime() {
+        let mut listpack: Listpack = Listpack::default();
+        listpack.push("hello");
+        listpack.push("world");
+
+        let entry = listpack.get(0).unwrap();
+        assert_eq!(entry.to_string(), "hello");
+
+        let entry = &listpack[1];
+        assert_eq!(entry.to_string(), "world");
+
+        listpack.replace(1, "rust");
+        let entry = &listpack[1];
+        assert_eq!(entry.to_string(), "rust");
+
+        listpack.remove(0);
+        let entry = &listpack[0];
+        assert_eq!(entry.to_string(), "rust");
+
+        listpack.clear();
+        assert_eq!(listpack.len(), 0);
+        assert!(listpack.is_empty());
+    }
+
+    #[test]
+    fn header() {
+        let mut listpack: Listpack = Listpack::default();
+
+        assert_eq!(listpack.get_header_ref().total_bytes(), 7);
+        assert_eq!(listpack.get_header_ref().num_elements(), 0);
 
         listpack.push("Hello");
 
-        unsafe {
-            assert_eq!(listpack.header_ref().total_bytes(), 14);
-            assert_eq!(listpack.header_ref().num_elements(), 1);
-        }
+        assert_eq!(listpack.get_header_ref().total_bytes(), 14);
+        assert_eq!(listpack.get_header_ref().num_elements(), 1);
 
         listpack.push("World");
 
-        unsafe {
-            assert_eq!(listpack.header_ref().total_bytes(), 21);
-            assert_eq!(listpack.header_ref().num_elements(), 2);
-        }
+        assert_eq!(listpack.get_header_ref().total_bytes(), 21);
+        assert_eq!(listpack.get_header_ref().num_elements(), 2);
 
         listpack.clear();
 
-        unsafe {
-            assert_eq!(listpack.header_ref().total_bytes(), 7);
-            assert_eq!(listpack.header_ref().num_elements(), 0);
-        }
+        assert_eq!(listpack.get_header_ref().total_bytes(), 7);
+        assert_eq!(listpack.get_header_ref().num_elements(), 0);
     }
 
     #[test]
     fn starts_with() {
-        let mut listpack = Listpack::new();
+        let mut listpack: Listpack = Listpack::default();
         listpack.push("Hello");
         listpack.push("World");
 
@@ -2348,7 +2899,7 @@ mod tests {
 
     #[test]
     fn ends_with() {
-        let mut listpack = Listpack::new();
+        let mut listpack: Listpack = Listpack::default();
         listpack.push("Hello");
         listpack.push("World");
 
@@ -2374,7 +2925,7 @@ mod tests {
 
     #[test]
     fn iter() {
-        let mut listpack = Listpack::new();
+        let mut listpack: Listpack = Listpack::default();
         let mut iter = listpack.iter();
 
         assert_eq!(iter.next(), None);
@@ -2431,6 +2982,104 @@ mod tests {
             "World"
         );
         assert_eq!(listpack.get(2), None);
+    }
+
+    // These two ways of doing the same must have the same results.
+    // The only difference between those is how the elements are
+    // located.
+    #[test]
+    fn get_reversed() {
+        let listpack = create_hello_world_listpack();
+
+        assert_eq!(
+            listpack.get_internal_entry_ptr_from_start(0),
+            listpack.get_internal_entry_ptr_from_end(0)
+        );
+
+        assert_eq!(
+            listpack.get_internal_entry_ptr_from_start(1),
+            listpack.get_internal_entry_ptr_from_end(1)
+        );
+
+        assert_eq!(
+            listpack.get_internal_entry_ptr_from_start(2),
+            listpack.get_internal_entry_ptr_from_end(2)
+        );
+    }
+
+    #[test]
+    fn insert_before() {
+        let mut listpack: Listpack = Listpack::default();
+        listpack.push("Hello, world!");
+        listpack.insert(0, "Hello!");
+        assert_eq!(listpack.len(), 2);
+        assert_eq!(listpack.get(0).unwrap().to_string(), "Hello!");
+        assert_eq!(listpack.get(1).unwrap().to_string(), "Hello, world!");
+
+        let mut listpack: Listpack = Listpack::default();
+        listpack.push(1);
+        listpack.validate().unwrap();
+        listpack.push(2);
+        listpack.validate().unwrap();
+        listpack.push(3);
+        listpack.validate().unwrap();
+
+        listpack.insert(1, 4);
+        assert_eq!(listpack.len(), 4);
+        assert_eq!(listpack.get(0).unwrap().to_string(), "1");
+        assert_eq!(listpack.get(1).unwrap().to_string(), "4");
+        assert_eq!(listpack.get(2).unwrap().to_string(), "2");
+        assert_eq!(listpack.get(3).unwrap().to_string(), "3");
+    }
+
+    #[test]
+    fn insert_after() {
+        let mut listpack: Listpack = Listpack::default();
+
+        listpack.push("Hello, world!");
+        listpack.insert_after(0, "Hello!");
+
+        assert_eq!(listpack.len(), 2);
+        assert_eq!(listpack.get(0).unwrap().to_string(), "Hello, world!");
+        assert_eq!(listpack.get(1).unwrap().to_string(), "Hello!");
+    }
+
+    #[test]
+    fn replace() {
+        const SMALLER_STRING: &str = "a";
+        const MIDDLE_STRING: &str = "ab";
+        const LARGER_STRING: &str = "abc";
+
+        let mut listpack: Listpack = Listpack::default();
+        assert_eq!(listpack.memory_consumption(), 39);
+        listpack.validate().unwrap();
+
+        listpack.push(MIDDLE_STRING);
+        listpack.validate().unwrap();
+        assert_eq!(listpack.memory_consumption(), 43);
+        assert_eq!(&listpack.get(0).unwrap().to_string(), MIDDLE_STRING);
+        assert_eq!(listpack.len(), 1);
+
+        // Downsize to a smaller string.
+        listpack.replace(0, SMALLER_STRING);
+        assert_eq!(listpack.memory_consumption(), 42);
+        assert_eq!(listpack.len(), 1);
+        assert_eq!(listpack.get(0).unwrap().to_string(), SMALLER_STRING);
+        listpack.validate().unwrap();
+
+        // Upsize to a larger string.
+        listpack.replace(0, LARGER_STRING);
+        assert_eq!(listpack.memory_consumption(), 44);
+        assert_eq!(listpack.len(), 1);
+        assert_eq!(listpack.get(0).unwrap().to_string(), LARGER_STRING);
+        listpack.validate().unwrap();
+
+        // Replace to the same string.
+        listpack.replace(0, LARGER_STRING);
+        assert_eq!(listpack.memory_consumption(), 44);
+        assert_eq!(listpack.len(), 1);
+        assert_eq!(listpack.get(0).unwrap().to_string(), LARGER_STRING);
+        listpack.validate().unwrap();
     }
 
     #[test]
@@ -2509,29 +3158,28 @@ mod tests {
 
     #[test]
     fn get_storage_bytes() {
-        let listpack = Listpack::new();
+        let listpack: Listpack = Listpack::default();
 
         assert_eq!(listpack.get_storage_bytes(), 7);
     }
 
     #[test]
     fn entry_total_bytes() {
-        let mut listpack = Listpack::new();
+        let mut listpack: Listpack = Listpack::default();
 
         listpack.push("Hello");
 
         for (length, expected_length) in [
             (5, 7),
-            (2usize.pow(7), 130),
-            (2usize.pow(12), 4101),
-            (2usize.pow(20), 1048581),
+            (2usize.pow(7), 132),
+            (2usize.pow(12), 4103),
+            (2usize.pow(20), 1048584),
         ] {
-            // A single ASCII-character repeated (2^7 + 1) times, to test
-            // the 14-bit encoding (2 bytes for the length).
             let string = "a".repeat(length);
             listpack.replace(0, &string);
 
             let entry = listpack.get(0).unwrap();
+            dbg!(entry);
             let total_bytes = entry.total_bytes();
             assert_eq!(total_bytes, expected_length);
             assert_eq!(entry.to_string(), string);
@@ -2539,8 +3187,27 @@ mod tests {
     }
 
     #[test]
+    fn from_array() {
+        let array = ["Hello", "World"];
+
+        let listpack: Listpack = Listpack::from(&["Hello", "World"]);
+        assert_eq!(listpack, &array);
+    }
+
+    #[test]
+    fn from() {
+        let listpack1: Listpack = Listpack::from(&["Hello"]);
+        let mut listpack2: Listpack = Listpack::default();
+        listpack2.push("Hello");
+
+        assert_eq!(listpack1.len(), listpack2.len());
+        assert_eq!(listpack1[0].to_string(), "Hello");
+        assert_eq!(listpack2[0].to_string(), "Hello");
+    }
+
+    #[test]
     fn entry_can_store_and_extract_different_types() {
-        let mut listpack = Listpack::from(&["Hello"]);
+        let mut listpack: Listpack = Listpack::from(&["Hello"]);
 
         // Replace the `0`th element with the object of type above
         // and check if it can be extracted correctly and the value
@@ -2560,18 +3227,105 @@ mod tests {
             ListpackEntryInsert::Integer(4_023_372_036_854_775_807),
         ];
 
-        for object in objects.iter() {
+        for object in &objects {
             listpack.replace(0, *object);
             let entry = listpack.get(0).unwrap();
             let data = entry.data().unwrap();
             match object {
                 ListpackEntryInsert::Integer(integer) => {
-                    assert_eq!(data.get_integer().unwrap(), *integer);
+                    assert_eq!(
+                        data.get_integer().unwrap(),
+                        *integer,
+                        "with object: {object:?}"
+                    );
                 }
                 ListpackEntryInsert::String(string) => {
-                    assert_eq!(data.get_str().unwrap(), *string);
+                    assert_eq!(data.get_str().unwrap(), *string, "with object: {object:?}");
                 }
             }
         }
+    }
+
+    #[test]
+    fn calculate_element_length_from_the_end() {
+        let entry = ListpackEntryInsert::from("Hello");
+        let encoded = entry.encode().unwrap();
+        let ptr = unsafe { encoded.as_ptr().add(encoded.len() - 1) };
+        let length = Listpack::<DefaultAllocator>::read_element_length_from_the_end(ptr);
+
+        // - 1 byte for the total element length of the small string.
+        // So it occupies actually one byte for the encoding byte and
+        // five for the string itself.
+        assert_eq!(length, encoded.len());
+
+        let string = "a".repeat(2usize.pow(12));
+        let entry = ListpackEntryInsert::from(&string);
+        let encoded = entry.encode().unwrap();
+        let ptr = unsafe { encoded.as_ptr().add(encoded.len() - 1) };
+        let length = Listpack::<DefaultAllocator>::read_element_length_from_the_end(ptr);
+
+        // A large string occupies one byte for the encoding, then four
+        // next bytes for the string length, and then the string itself.
+        assert_eq!(length, encoded.len());
+    }
+
+    #[test]
+    fn swaps_various() {
+        let mut listpack: Listpack = Listpack::default();
+        listpack.push("Hello");
+        listpack.push("World");
+        listpack.push("!");
+
+        listpack.swap(0, 2);
+
+        assert_eq!(listpack.len(), 3);
+        assert_eq!(listpack[0].to_string(), "!");
+        assert_eq!(listpack[1].to_string(), "World");
+        assert_eq!(listpack[2].to_string(), "Hello");
+    }
+
+    #[test]
+    fn swap_to_bigger() {
+        let mut listpack: Listpack = Listpack::default();
+
+        listpack.push("Hello");
+        listpack.push("World!");
+
+        unsafe { listpack.swap_unchecked(0, 1) };
+
+        assert_eq!(listpack.len(), 2);
+
+        assert_eq!(listpack[0].to_string(), "World!");
+        assert_eq!(listpack[1].to_string(), "Hello");
+    }
+
+    #[test]
+    fn swap_to_smaller() {
+        let mut listpack: Listpack = Listpack::default();
+
+        listpack.push("Hello");
+        listpack.push("World!");
+
+        unsafe { listpack.swap_unchecked(0, 1) };
+
+        assert_eq!(listpack.len(), 2);
+
+        assert_eq!(listpack[0].to_string(), "World!");
+        assert_eq!(listpack[1].to_string(), "Hello");
+    }
+
+    #[test]
+    fn swap_to_the_same_length() {
+        let mut listpack: Listpack = Listpack::default();
+
+        listpack.push("Hello");
+        listpack.push("World");
+
+        unsafe { listpack.swap_unchecked(0, 1) };
+
+        assert_eq!(listpack.len(), 2);
+
+        assert_eq!(listpack[0].to_string(), "World");
+        assert_eq!(listpack[1].to_string(), "Hello");
     }
 }

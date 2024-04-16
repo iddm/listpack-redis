@@ -1,6 +1,6 @@
 [package]
 name = "listpack-redis"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Viktor Polevoi <fx@thefx.co>"]
 license = "LicenseRef-RSALv2 OR SSPL-1.0"
@@ -13,3 +13,4 @@ bindgen = "0.69"
 
 [dependencies]
 libc = "0.2"
+redis-custom-allocator = { git = "https://github.com/iddm/redis-custom-allocator" }

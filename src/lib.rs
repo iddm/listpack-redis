@@ -14,7 +14,7 @@
 //! ```
 //! use listpack_redis::*;
 //!
-//! let mut listpack = Listpack::new();
+//! let mut listpack: Listpack = Listpack::default();
 //! listpack.push("hello");
 //! listpack.push("world");
 //!
@@ -49,21 +49,11 @@
 //! iterators.
 #![deny(missing_docs)]
 
-#[allow(warnings)]
-#[allow(non_upper_case_globals)]
-#[allow(non_camel_case_types)]
-#[allow(non_snake_case)]
-#[allow(unused)]
-#[allow(missing_docs)]
-/// The raw bindings to the listpack redis implementation.
-mod bindings {
-    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
-}
-
+pub mod allocator;
 pub mod entry;
 pub mod error;
+pub mod iter;
 pub mod listpack;
-mod redis_helpers;
 
 /// The prelude module contains all the types and traits that you need
 /// to use the listpack library.
