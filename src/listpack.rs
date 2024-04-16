@@ -3225,6 +3225,12 @@ mod tests {
             ListpackEntryInsert::Integer(4_088_608),
             ListpackEntryInsert::Integer(1_047_483_648),
             ListpackEntryInsert::Integer(4_023_372_036_854_775_807),
+            ListpackEntryInsert::Boolean(true),
+            ListpackEntryInsert::Boolean(false),
+            ListpackEntryInsert::Float(42.23f64),
+            ListpackEntryInsert::CustomEmbeddedValue(0),
+            ListpackEntryInsert::CustomEmbeddedValue(1),
+            ListpackEntryInsert::CustomExtendedValue(&[0, 1, 2, 3]),
         ];
 
         for object in &objects {
@@ -3241,6 +3247,30 @@ mod tests {
                 }
                 ListpackEntryInsert::String(string) => {
                     assert_eq!(data.get_str().unwrap(), *string, "with object: {object:?}");
+                }
+                ListpackEntryInsert::Boolean(boolean) => {
+                    assert_eq!(
+                        data.get_bool().unwrap(),
+                        *boolean,
+                        "with object: {object:?}"
+                    );
+                }
+                ListpackEntryInsert::Float(float) => {
+                    assert_eq!(data.get_f64().unwrap(), *float, "with object: {object:?}");
+                }
+                ListpackEntryInsert::CustomEmbeddedValue(value) => {
+                    assert_eq!(
+                        data.get_custom_embedded().unwrap(),
+                        *value,
+                        "with object: {object:?}"
+                    );
+                }
+                ListpackEntryInsert::CustomExtendedValue(value) => {
+                    assert_eq!(
+                        data.get_custom_extended().unwrap(),
+                        *value,
+                        "with object: {object:?}"
+                    );
                 }
             }
         }
