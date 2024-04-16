@@ -975,12 +975,6 @@ where
                 .as_slice_mut()
                 .swap_with_slice(b_entry.as_slice_mut());
         } else {
-            // if a > b {
-            //     // For the simplicity, let's always assume that the a
-            //     // element is before the "b" element.
-            //     return self.swap_unchecked(b, a);
-            // }
-
             let ((smaller, smaller_initial_offset), (bigger, bigger_initial_offset)) = {
                 let a_encoded = a_entry.as_slice();
                 let b_encoded = b_entry.as_slice();
