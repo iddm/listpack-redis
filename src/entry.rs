@@ -964,7 +964,7 @@ impl<'a> From<ListpackEntryInsert<'a>> for ListpackEntryData<'a> {
 /// zero-sized object, which designates a reference to the actual
 /// listpack entry.
 #[repr(transparent)]
-pub struct ListpackEntry;
+pub struct ListpackEntry(());
 
 impl ListpackEntry {
     const ENCODING_TYPE_BYTE_LENGTH: usize = std::mem::size_of::<u8>();
@@ -1085,7 +1085,6 @@ impl ListpackEntry {
         let ptr = unsafe { (self as *const Self as *const u8).add(1) };
 
         match encoding_type {
-            // These share the same structure.
             ListpackEntryEncodingType::SmallUnsignedInteger => {
                 Some((unsafe { std::slice::from_raw_parts(ptr, 1) }, 2))
             }
