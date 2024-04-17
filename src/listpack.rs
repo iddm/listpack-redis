@@ -3267,7 +3267,7 @@ mod tests {
                 }
                 ListpackEntryInsert::CustomExtendedValue(value) => {
                     assert_eq!(
-                        data.get_custom_extended().unwrap(),
+                        data.get_custom_extended::<'_, &[u8]>().unwrap(),
                         *value,
                         "with object: {object:?}"
                     );

@@ -385,7 +385,52 @@ impl ListpackEntryData<'_> {
     }
 
     /// Attempts to extract a custom embedded value from the entry.
-    pub fn get_custom_extended(&self) -> Option<&[u8]> {
+    ///
+    /// The provided type `T` must implement the `From<&[u8]>` trait.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::ListpackEntryData;
+    ///
+    /// #[repr(transparent)]
+    /// #[derive(Debug, PartialEq, Eq)]
+    /// struct CustomValue(String);
+    /// impl From<&[u8]> for CustomValue {
+    ///    fn from(data: &[u8]) -> Self {
+    ///       Self(String::from_utf8_lossy(data).to_string())
+    ///   }
+    /// }
+    ///
+    /// let s = CustomValue("Hello, World!".to_owned());
+    /// let entry = ListpackEntryData::CustomExtendedValue(s.0.as_bytes());
+    /// let value = entry.get_custom_extended::<CustomValue>().unwrap();
+    ///
+    /// assert_eq!(value, s);
+    /// ```
+    pub fn get_custom_extended<'a, T>(&'a self) -> Option<T>
+    where
+        T: From<&'a [u8]>,
+    {
+        match self {
+            ListpackEntryData::CustomExtendedValue(v) => Some(T::from(v)),
+            _ => None,
+        }
+    }
+
+    /// Returns the raw data of the custom extended value.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::ListpackEntryData;
+    ///
+    /// let entry = ListpackEntryData::CustomExtendedValue(&[1, 2, 3, 4]);
+    /// let value = entry.get_custom_extended_raw().unwrap();
+    ///
+    /// assert_eq!(value, &[1, 2, 3, 4]);
+    /// ```
+    pub fn get_custom_extended_raw(&self) -> Option<&[u8]> {
         match self {
             ListpackEntryData::CustomExtendedValue(v) => Some(v),
             _ => None,
@@ -404,7 +449,7 @@ impl ListpackEntryData<'_> {
 
     /// Returns `true` if the entry is a custom extended value.
     pub fn is_custom_extended(&self) -> bool {
-        self.get_custom_extended().is_some()
+        matches!(self, ListpackEntryData::CustomExtendedValue(_))
     }
 
     /// Returns `true` if the entry is a small unsigned integer.
@@ -1991,7 +2036,11 @@ mod tests {
                 )
             );
             assert_eq!(
-                decoded.data().unwrap().get_custom_extended().unwrap(),
+                decoded
+                    .data()
+                    .unwrap()
+                    .get_custom_extended::<'_, &[u8]>()
+                    .unwrap(),
                 &array
             );
             assert_eq!(decoded.total_bytes(), 13);
@@ -2012,7 +2061,11 @@ mod tests {
             );
 
             assert_eq!(
-                decoded.data().unwrap().get_custom_extended().unwrap(),
+                decoded
+                    .data()
+                    .unwrap()
+                    .get_custom_extended::<'_, &[u8]>()
+                    .unwrap(),
                 &array
             );
             assert_eq!(decoded.total_bytes(), 3);
