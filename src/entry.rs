@@ -1682,6 +1682,18 @@ impl<'a> From<&'a String> for ListpackEntryInsert<'a> {
     }
 }
 
+impl From<bool> for ListpackEntryInsert<'_> {
+    fn from(value: bool) -> Self {
+        Self::Boolean(value)
+    }
+}
+
+impl<'a> From<&'a bool> for ListpackEntryInsert<'a> {
+    fn from(value: &'a bool) -> Self {
+        Self::Boolean(*value)
+    }
+}
+
 macro_rules! impl_listpack_entry_insert_from_number {
     ($($t:ty),*) => {
         $(
