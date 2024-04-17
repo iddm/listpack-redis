@@ -763,13 +763,17 @@ impl<'a> Encode for ListpackEntryData<'a> {
 
                 if data_length > 0 {
                     let data_length_length = count_bytes_in_number(data_length) as u8;
-                    block.append(&mut data_length_length.to_le_bytes().to_vec());
+                    block.push(data_length_length);
+
                     let mut data_length_length_bytes = data_length.to_le_bytes().to_vec();
                     while let Some(0) = data_length_length_bytes.last() {
                         data_length_length_bytes.pop();
                     }
+
                     block.append(&mut data_length_length_bytes);
                     block.append(&mut v.to_vec());
+                } else {
+                    block.push(0);
                 }
 
                 let mut length = encode_total_element_length(block.len())?;
@@ -2006,6 +2010,7 @@ mod tests {
                     ListpackEntrySubencodingType::CustomExtendedValue
                 )
             );
+
             assert_eq!(
                 decoded.data().unwrap().get_custom_extended().unwrap(),
                 &array
