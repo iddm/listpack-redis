@@ -1545,7 +1545,7 @@ impl TryFrom<&ListpackEntry> for String {
             .get_str()
             .map(|s| s.to_string())
             .ok_or_else(|| {
-                crate::error::Error::from(crate::error::TypeConversionError::wrong_types::<String>(
+                crate::error::Error::from(crate::error::TypeConversionError::wrong_types::<Self>(
                     encoding_type,
                 ))
             })
@@ -1559,7 +1559,7 @@ impl TryFrom<&ListpackEntry> for f64 {
         let encoding_type = entry.encoding_type()?;
 
         entry.data()?.get_f64().ok_or_else(|| {
-            crate::error::Error::from(crate::error::TypeConversionError::wrong_types::<f64>(
+            crate::error::Error::from(crate::error::TypeConversionError::wrong_types::<Self>(
                 encoding_type,
             ))
         })
@@ -1572,11 +1572,95 @@ impl TryFrom<&ListpackEntry> for i64 {
     fn try_from(entry: &ListpackEntry) -> Result<Self, Self::Error> {
         let encoding_type = entry.encoding_type()?;
 
-        entry.data()?.get_i64().ok_or_else(|| {
-            crate::error::Error::from(crate::error::TypeConversionError::wrong_types::<i64>(
+        entry.data()?.get_integer().ok_or_else(|| {
+            crate::error::Error::from(crate::error::TypeConversionError::wrong_types::<Self>(
                 encoding_type,
             ))
         })
+    }
+}
+
+impl TryFrom<&ListpackEntry> for i32 {
+    type Error = crate::error::Error;
+
+    fn try_from(entry: &ListpackEntry) -> Result<Self, Self::Error> {
+        let encoding_type = entry.encoding_type()?;
+        let integer: i64 = entry.data()?.get_integer().ok_or_else(|| {
+            crate::error::Error::from(crate::error::TypeConversionError::wrong_types::<Self>(
+                encoding_type,
+            ))
+        })?;
+
+        if ((Self::MIN as i64)..=(Self::MAX as i64)).contains(&integer) {
+            Ok(integer as Self)
+        } else {
+            Err(crate::error::Error::from(
+                crate::error::TypeConversionError::wrong_types::<Self>(encoding_type),
+            ))
+        }
+    }
+}
+
+impl TryFrom<&ListpackEntry> for i16 {
+    type Error = crate::error::Error;
+
+    fn try_from(entry: &ListpackEntry) -> Result<Self, Self::Error> {
+        let encoding_type = entry.encoding_type()?;
+        let integer: i64 = entry.data()?.get_integer().ok_or_else(|| {
+            crate::error::Error::from(crate::error::TypeConversionError::wrong_types::<Self>(
+                encoding_type,
+            ))
+        })?;
+
+        if ((Self::MIN as i64)..=(Self::MAX as i64)).contains(&integer) {
+            Ok(integer as Self)
+        } else {
+            Err(crate::error::Error::from(
+                crate::error::TypeConversionError::wrong_types::<Self>(encoding_type),
+            ))
+        }
+    }
+}
+
+impl TryFrom<&ListpackEntry> for i8 {
+    type Error = crate::error::Error;
+
+    fn try_from(entry: &ListpackEntry) -> Result<Self, Self::Error> {
+        let encoding_type = entry.encoding_type()?;
+        let integer: i64 = entry.data()?.get_integer().ok_or_else(|| {
+            crate::error::Error::from(crate::error::TypeConversionError::wrong_types::<Self>(
+                encoding_type,
+            ))
+        })?;
+
+        if ((Self::MIN as i64)..=(Self::MAX as i64)).contains(&integer) {
+            Ok(integer as Self)
+        } else {
+            Err(crate::error::Error::from(
+                crate::error::TypeConversionError::wrong_types::<Self>(encoding_type),
+            ))
+        }
+    }
+}
+
+impl TryFrom<&ListpackEntry> for u8 {
+    type Error = crate::error::Error;
+
+    fn try_from(entry: &ListpackEntry) -> Result<Self, Self::Error> {
+        let encoding_type = entry.encoding_type()?;
+        let integer: i64 = entry.data()?.get_integer().ok_or_else(|| {
+            crate::error::Error::from(crate::error::TypeConversionError::wrong_types::<Self>(
+                encoding_type,
+            ))
+        })?;
+
+        if ((Self::MIN as i64)..=(Self::MAX as i64)).contains(&integer) {
+            Ok(integer as Self)
+        } else {
+            Err(crate::error::Error::from(
+                crate::error::TypeConversionError::wrong_types::<Self>(encoding_type),
+            ))
+        }
     }
 }
 
