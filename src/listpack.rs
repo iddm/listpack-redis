@@ -571,16 +571,15 @@ where
             .map(ListpackEntryInsert::full_encoded_size)
             .sum();
         let mut listpack = Listpack::with_capacity(elements_size);
-        let mut ptr = listpack.allocation.data_start_ptr();
+        let ptr = listpack.allocation.data_start_ptr();
 
-        for item in items {
-            let mut encoded = item.encode().expect("Encoded value");
+        let encoded: Vec<u8> = items
+            .iter()
+            .flat_map(|item| item.encode().expect("Encoded value"))
+            .collect();
 
-            unsafe {
-                std::ptr::copy_nonoverlapping(encoded.as_mut_ptr(), ptr.cast_mut(), encoded.len());
-            }
-
-            ptr = unsafe { ptr.add(encoded.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), ptr.cast_mut(), encoded.len());
         }
 
         listpack.set_num_elements(slice.len() as u16);
@@ -608,16 +607,15 @@ where
             .sum();
 
         let mut listpack = Listpack::with_capacity(elements_size);
-        let mut ptr = listpack.allocation.data_start_ptr();
+        let ptr = listpack.allocation.data_start_ptr();
 
-        for item in items {
-            let mut encoded = item.encode().expect("Encoded value");
+        let encoded: Vec<u8> = items
+            .iter()
+            .flat_map(|item| item.encode().expect("Encoded value"))
+            .collect();
 
-            unsafe {
-                std::ptr::copy_nonoverlapping(encoded.as_mut_ptr(), ptr.cast_mut(), encoded.len());
-            }
-
-            ptr = unsafe { ptr.add(encoded.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), ptr.cast_mut(), encoded.len());
         }
 
         listpack.set_num_elements(N as u16);
@@ -657,16 +655,15 @@ where
         let items_len = items.len();
 
         let mut listpack = Listpack::with_capacity(elements_size);
-        let mut ptr = listpack.allocation.data_start_ptr();
+        let ptr = listpack.allocation.data_start_ptr();
 
-        for item in items {
-            let mut encoded = item.encode().expect("Encoded value");
+        let encoded: Vec<u8> = items
+            .iter()
+            .flat_map(|item| item.encode().expect("Encoded value"))
+            .collect();
 
-            unsafe {
-                std::ptr::copy_nonoverlapping(encoded.as_mut_ptr(), ptr.cast_mut(), encoded.len());
-            }
-
-            ptr = unsafe { ptr.add(encoded.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), ptr.cast_mut(), encoded.len());
         }
 
         listpack.set_num_elements(items_len as u16);
