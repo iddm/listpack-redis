@@ -25,50 +25,47 @@ pub trait Encode {
 pub enum ListpackEntrySubencodingType {
     /// A 13-bit signed integer: the higher three bits are `110`, and
     /// the following 13 bits are the integer itself.
-    SignedInteger13Bit = 0b11000000,
+    SignedInteger13Bit = 0b1100_0000,
     /// A string with length up to `4095` bytes: the higher four bits
     /// are `1110`, the lower four bytes are the highest integer part of
     /// the length of the string, with the next byte being the lowest 8
     /// bits of the length.
-    MediumString = 0b11100000,
+    MediumString = 0b1110_0000,
     /// A large string with up to `2^32 - 1` bytes: the higher four bits
     /// are `1111`, the lower four bytes are always zero, designating
     /// the large string encoding. After the encoding type, the
     /// following four bytes are the length of the string (within the
     /// data block), and then the string data itself.
-    LargeString = 0b11110000,
+    LargeString = 0b1111_0000,
     /// A 16-bit signed integer: the higher four bits are `1111`, and
     /// the following four bits are `0001`. The following two bytes of
     /// the data block represent a 16 bits signed integer.
-    SignedInteger16Bit = 0b11110001,
+    SignedInteger16Bit = 0b1111_0001,
     /// A 24-bit signed integer: the higher four bits are `1111`, and
     /// the following four bits are `0010`. The following three bytes
     /// of the data block represent a 24 bits signed integer.
-    SignedInteger24Bit = 0b11110010,
+    SignedInteger24Bit = 0b1111_0010,
     /// A 32-bit signed integer: the higher four bits are `1111`, and
     /// the following four bits are `0011`. The following four bytes of
     /// the data block represent a 32 bits signed integer.
-    SignedInteger32Bit = 0b11110011,
+    SignedInteger32Bit = 0b1111_0011,
     /// A 64-bit signed integer: the higher four bits are `1111`, and
     /// the following four bits are `0100`. The following eight bytes of
     /// the data block represent a 64 bits signed integer.
-    SignedInteger64Bit = 0b11110100,
+    SignedInteger64Bit = 0b1111_0100,
     /// A 64-bit floating-point number: the higher four bits are `1111`,
     /// and the following four bits are `0101`. The following eight
     /// bytes of the data block represent a 64 bits floating-point
     /// number.
-    FloatingPoint64Bit = 0b11110101,
+    FloatingPoint64Bit = 0b1111_0101,
     /// A boolean value: the value is embedded directly into the
     /// encoding byte. The higher four bits are `1111`, the further
     /// 3 bits are `011`, and the last remaining bit is the boolean
     /// value itself.
-    Boolean = 0b11110110,
+    Boolean = 0b1111_0110,
     /// A custom embedded value. For example, a custom data structure
     /// which data can be embedded into the entry header's last bit.
-    CustomEmbeddedValue = 0b11111000,
-    // TODO: this comment needs to be confirmed to comply with the spec
-    // and the maximum possible length, as it must not exceed the
-    // total-element-length length.
+    CustomEmbeddedValue = 0b1111_1000,
     /// A custom extended value, whose data is stored in the data block.
     /// The maximum length of the extended value is not limited by the
     /// encoding type, but by the maximum size of the data block. The
@@ -89,8 +86,8 @@ pub enum ListpackEntrySubencodingType {
     ///
     /// Let's say we store a string "Hello":
     ///
-    /// <11111010> <0b00000001> <0b00000101> "Hello" <total-element-length>
-    CustomExtendedValue = 0b11111010,
+    /// <0b1111_1010> <0b0000_0001> <0b0000_0101> "Hello" <total-element-length>
+    CustomExtendedValue = 0b1111_1010,
 }
 
 impl Encode for ListpackEntrySubencodingType {
@@ -140,12 +137,12 @@ pub enum ListpackEntryEncodingType {
     /// A small integer is encoded within the byte itself (the
     /// remaining 7 bits, meaning the values from 0 to 127 (a 7-bit
     /// unsigned integer)).
-    SmallUnsignedInteger = 0b00000000,
+    SmallUnsignedInteger = 0b0000_0000,
     /// A small string is encoded within the data block (the one
     /// following the encoding byte). The length of such a small string
     /// is encoded within the 6 lower bits of the encoding byte, so the
     /// maximum length of a small string is 63 bytes (ASCII characters).
-    SmallString = 0b10000000,
+    SmallString = 0b1000_0000,
     /// If the higher 2 bits of the encoding byte are 11, the entry is
     /// of a complex type, which may only be known after parsing the
     /// following lower bits of the encoding type.
@@ -164,14 +161,14 @@ impl TryFrom<u8> for ListpackEntryEncodingType {
     fn try_from(encoding_byte: u8) -> Result<Self> {
         // Compare the highest two bits of the encoding byte, then if
         // those aren't matched, delegate to the subencoding type.
-        match encoding_byte & 0b11000000 {
+        match encoding_byte & 0b1100_0000 {
             // If the first bit is unset, it's a small unsigned integer.
-            0b00000000 | 0b01000000 => Ok(Self::SmallUnsignedInteger),
+            0b0000_0000 | 0b0100_0000 => Ok(Self::SmallUnsignedInteger),
             // If the first bit is set, following the second bit which
             // is unset, it's a small string.
-            0b10000000 => Ok(Self::SmallString),
+            0b1000_0000 => Ok(Self::SmallString),
             // If the first two bits are set, it's a complex type.
-            0b11000000 => Ok(Self::ComplexType(ListpackEntrySubencodingType::try_from(
+            0b1100_0000 => Ok(Self::ComplexType(ListpackEntrySubencodingType::try_from(
                 encoding_byte,
             )?)),
             // Ideally, this branch should never be reached.
@@ -183,20 +180,20 @@ impl TryFrom<u8> for ListpackEntryEncodingType {
 impl From<ListpackEntryEncodingType> for u8 {
     fn from(encoding_type: ListpackEntryEncodingType) -> u8 {
         match encoding_type {
-            ListpackEntryEncodingType::SmallUnsignedInteger => 0b00000000,
-            ListpackEntryEncodingType::SmallString => 0b10000000,
+            ListpackEntryEncodingType::SmallUnsignedInteger => 0b0000_0000,
+            ListpackEntryEncodingType::SmallString => 0b1000_0000,
             ListpackEntryEncodingType::ComplexType(subencoding_type) => match subencoding_type {
-                ListpackEntrySubencodingType::SignedInteger13Bit => 0b11000000,
-                ListpackEntrySubencodingType::MediumString => 0b11100000,
-                ListpackEntrySubencodingType::LargeString => 0b11110000,
-                ListpackEntrySubencodingType::SignedInteger16Bit => 0b11110001,
-                ListpackEntrySubencodingType::SignedInteger24Bit => 0b11110010,
-                ListpackEntrySubencodingType::SignedInteger32Bit => 0b11110011,
-                ListpackEntrySubencodingType::SignedInteger64Bit => 0b11110100,
-                ListpackEntrySubencodingType::FloatingPoint64Bit => 0b11110101,
-                ListpackEntrySubencodingType::Boolean => 0b11110110,
-                ListpackEntrySubencodingType::CustomEmbeddedValue => 0b11111000,
-                ListpackEntrySubencodingType::CustomExtendedValue => 0b11111010,
+                ListpackEntrySubencodingType::SignedInteger13Bit => 0b1100_0000,
+                ListpackEntrySubencodingType::MediumString => 0b1110_0000,
+                ListpackEntrySubencodingType::LargeString => 0b1111_0000,
+                ListpackEntrySubencodingType::SignedInteger16Bit => 0b1111_0001,
+                ListpackEntrySubencodingType::SignedInteger24Bit => 0b1111_0010,
+                ListpackEntrySubencodingType::SignedInteger32Bit => 0b1111_0011,
+                ListpackEntrySubencodingType::SignedInteger64Bit => 0b1111_0100,
+                ListpackEntrySubencodingType::FloatingPoint64Bit => 0b1111_0101,
+                ListpackEntrySubencodingType::Boolean => 0b1111_0110,
+                ListpackEntrySubencodingType::CustomEmbeddedValue => 0b1111_1000,
+                ListpackEntrySubencodingType::CustomExtendedValue => 0b1111_1010,
             },
         }
     }
@@ -559,8 +556,8 @@ fn encode_total_element_length(length: usize) -> Result<Vec<u8>> {
         // the value.
         0..=127 => vec![length as u8],
         128..=16383 => {
-            let mut data = vec![(length >> 7) as u8, (length & 0b01111111) as u8];
-            data[1] |= 0b10000000;
+            let mut data = vec![(length >> 7) as u8, (length & 0b0111_1111) as u8];
+            data[1] |= 0b1000_0000;
             data
         }
         16384..=2097151 => {
@@ -569,34 +566,34 @@ fn encode_total_element_length(length: usize) -> Result<Vec<u8>> {
                 ((length >> 7) & 0b01111111) as u8,
                 (length & 0b01111111) as u8,
             ];
-            data[1] |= 0b10000000;
-            data[2] |= 0b10000000;
+            data[1] |= 0b1000_0000;
+            data[2] |= 0b1000_0000;
             data
         }
         2097152..=268435455 => {
             let mut data = vec![
                 (length >> 21) as u8,
-                ((length >> 14) & 0b01111111) as u8,
-                ((length >> 7) & 0b01111111) as u8,
-                (length & 0b01111111) as u8,
+                ((length >> 14) & 0b0111_1111) as u8,
+                ((length >> 7) & 0b0111_1111) as u8,
+                (length & 0b0111_1111) as u8,
             ];
-            data[1] |= 0b10000000;
-            data[2] |= 0b10000000;
-            data[3] |= 0b10000000;
+            data[1] |= 0b1000_0000;
+            data[2] |= 0b1000_0000;
+            data[3] |= 0b1000_0000;
             data
         }
         268435456..=34359738367 => {
             let mut data = vec![
                 (length >> 28) as u8,
-                ((length >> 21) & 0b01111111) as u8,
-                ((length >> 14) & 0b01111111) as u8,
-                ((length >> 7) & 0b01111111) as u8,
-                (length & 0b01111111) as u8,
+                ((length >> 21) & 0b0111_1111) as u8,
+                ((length >> 14) & 0b0111_1111) as u8,
+                ((length >> 7) & 0b0111_1111) as u8,
+                (length & 0b0111_1111) as u8,
             ];
-            data[1] |= 0b10000000;
-            data[2] |= 0b10000000;
-            data[3] |= 0b10000000;
-            data[4] |= 0b10000000;
+            data[1] |= 0b1000_0000;
+            data[2] |= 0b1000_0000;
+            data[3] |= 0b1000_0000;
+            data[4] |= 0b1000_0000;
             data
         }
         _ => {
@@ -668,7 +665,7 @@ impl<'a> Encode for ListpackEntryData<'a> {
             // The small unsigned integer is embedded into the encoding
             // byte itself, so appending only the total-element-length
             // byte which equals to one: the encoding byte itself.
-            Self::SmallUnsignedInteger(u) => vec![u & 0b01111111, 1],
+            Self::SmallUnsignedInteger(u) => vec![u & 0b0111_1111, 1],
             Self::SignedInteger13Bit(i) => {
                 let mut block = vec![encoding_type_byte | ((i >> 8) as u8), (*i as u8)];
 
@@ -1138,7 +1135,7 @@ impl ListpackEntry {
                 Some((unsafe { std::slice::from_raw_parts(ptr, 1) }, 2))
             }
             ListpackEntryEncodingType::SmallString => {
-                let len = (encoding_type_byte & 0b00111111) as usize;
+                let len = (encoding_type_byte & 0b0011_1111) as usize;
                 let data = unsafe {
                     let data = std::slice::from_raw_parts(ptr, len);
                     let total_bytes = len + Self::ENCODING_TYPE_BYTE_LENGTH + 1;
@@ -1160,7 +1157,8 @@ impl ListpackEntry {
                 }
                 ListpackEntrySubencodingType::MediumString => {
                     let data = unsafe {
-                        let len = ((encoding_type_byte & 0b00001111) as usize) << 8 | *ptr as usize;
+                        let len =
+                            ((encoding_type_byte & 0b0000_1111) as usize) << 8 | *ptr as usize;
                         let ptr = ptr.add(1);
                         let data = std::slice::from_raw_parts(ptr, len);
                         // One extra byte for the length of the data block.
@@ -1318,7 +1316,7 @@ impl ListpackEntry {
 
         Ok(match encoding_type {
             ListpackEntryEncodingType::SmallUnsignedInteger => {
-                let value = encoding_type_byte & 0b01111111;
+                let value = encoding_type_byte & 0b0111_1111;
                 ListpackEntryData::SmallUnsignedInteger(value)
             }
             ListpackEntryEncodingType::SmallString => {
@@ -1334,7 +1332,7 @@ impl ListpackEntry {
                     let data = self
                         .get_data_raw()
                         .ok_or(crate::error::Error::MissingDataBlock)?;
-                    let n = (((encoding_type_byte & 0b00011111) as i16) << 8) | (data[0] as i16);
+                    let n = (((encoding_type_byte & 0b0001_1111) as i16) << 8) | (data[0] as i16);
                     ListpackEntryData::SignedInteger13Bit(n)
                 }
                 ListpackEntrySubencodingType::MediumString => {
@@ -1397,11 +1395,11 @@ impl ListpackEntry {
                     ListpackEntryData::FloatingPoint64Bit(n)
                 }
                 ListpackEntrySubencodingType::Boolean => {
-                    let value = encoding_type_byte & 0b00000001 == 1;
+                    let value = encoding_type_byte & 0b0000_0001 == 1;
                     ListpackEntryData::Boolean(value)
                 }
                 ListpackEntrySubencodingType::CustomEmbeddedValue => {
-                    let value = encoding_type_byte & 0b00000001;
+                    let value = encoding_type_byte & 0b0000_0001;
                     ListpackEntryData::CustomEmbeddedValue(value)
                 }
                 ListpackEntrySubencodingType::CustomExtendedValue => {
