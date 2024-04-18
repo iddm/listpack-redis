@@ -23,6 +23,7 @@ use crate::{
     },
     error::{AllocationError, Result},
     iter::{ListpackChunks, ListpackIntoIter, ListpackIter, ListpackWindows},
+    ListpackEntryEncodingType,
 };
 
 /// The last byte of the allocator for the listpack should always be
@@ -639,8 +640,14 @@ impl<Allocator> Listpack<Allocator>
 where
     Allocator: CustomAllocator,
 {
-    /// Returns true if the listpack is homogeneous, that is, all the
-    /// elements have the same type.
+    /// Returns `true` if the listpack is homogeneous, that is, all the
+    /// elements have the same type. The type is meant to be the
+    /// encoding type of the elements. That said, there is a difference
+    /// between the small strings, large strings, and integers, and the
+    /// other types, as the [`ListpackEntryEncodingType::SmallString`]
+    /// and [`ListpackEntryEncodingType::LargeString`] are considered
+    /// to be of different types, while the actual data they store is
+    /// the same (still a string).
     ///
     /// In case the listpack is empty, it is considered homogeneous.
     ///
@@ -659,6 +666,9 @@ where
     /// listpack.push(1);
     /// assert!(!listpack.is_homogeneous());
     /// ```
+    ///
+    /// To know the types of the elements, use the
+    /// [`Listpack::get_element_types`] method.
     pub fn is_homogeneous(&self) -> bool {
         if self.is_empty() {
             return true;
@@ -668,6 +678,50 @@ where
         let first = iter.next().map(|e| e.encoding_type().unwrap()).unwrap();
 
         iter.all(|e| e.encoding_type().unwrap() == first)
+    }
+
+    /// Returns the encoding types of the elements of the listpack.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::{Listpack, ListpackEntryEncodingType};
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello");
+    /// listpack.push(1);
+    ///
+    /// let types = listpack.get_element_types();
+    /// assert_eq!(types, vec![ListpackEntryEncodingType::SmallString, ListpackEntryEncodingType::SmallUnsignedInteger]);
+    /// ```
+    pub fn get_element_types(&self) -> Vec<ListpackEntryEncodingType> {
+        self.iter().map(|e| e.encoding_type().unwrap()).collect()
+    }
+
+    /// Returns a vector of elements of the listpack. The elements are
+    /// converted to the type `T` using the [`From`] trait.
+    /// If the listpack is not homogeneous, returns [`None`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello");
+    /// listpack.push("World");
+    ///
+    /// let vec: Vec<String> = listpack.get_homogenous_vec().unwrap();
+    /// assert_eq!(vec, vec!["Hello", "World"]);
+    ///
+    /// listpack.push(1);
+    /// assert!(listpack.get_homogenous_vec::<String>().is_err());
+    /// ```
+    pub fn get_homogenous_vec<'a, T>(&'a self) -> Result<Vec<T>, T::Error>
+    where
+        T: TryFrom<&'a ListpackEntry>,
+    {
+        self.iter().map(T::try_from).collect::<Result<_, _>>()
     }
 
     /// Returns the allocator of the listpack.

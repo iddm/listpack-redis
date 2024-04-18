@@ -1534,6 +1534,52 @@ impl MemoryConsumption for ListpackEntry {
     }
 }
 
+impl TryFrom<&ListpackEntry> for String {
+    type Error = crate::error::Error;
+
+    fn try_from(entry: &ListpackEntry) -> Result<Self, Self::Error> {
+        let encoding_type = entry.encoding_type()?;
+
+        entry
+            .data()?
+            .get_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                crate::error::Error::from(crate::error::TypeConversionError::wrong_types::<String>(
+                    encoding_type,
+                ))
+            })
+    }
+}
+
+impl TryFrom<&ListpackEntry> for f64 {
+    type Error = crate::error::Error;
+
+    fn try_from(entry: &ListpackEntry) -> Result<Self, Self::Error> {
+        let encoding_type = entry.encoding_type()?;
+
+        entry.data()?.get_f64().ok_or_else(|| {
+            crate::error::Error::from(crate::error::TypeConversionError::wrong_types::<f64>(
+                encoding_type,
+            ))
+        })
+    }
+}
+
+impl TryFrom<&ListpackEntry> for i64 {
+    type Error = crate::error::Error;
+
+    fn try_from(entry: &ListpackEntry) -> Result<Self, Self::Error> {
+        let encoding_type = entry.encoding_type()?;
+
+        entry.data()?.get_i64().ok_or_else(|| {
+            crate::error::Error::from(crate::error::TypeConversionError::wrong_types::<i64>(
+                encoding_type,
+            ))
+        })
+    }
+}
+
 /// The allowed types to be inserted into a listpack.
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]
 pub enum ListpackEntryInsert<'a> {
