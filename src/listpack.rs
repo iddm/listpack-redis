@@ -625,6 +625,55 @@ where
     }
 }
 
+/// Allows to create a listpack from an iterator of insertable entries.
+///
+/// # Example
+///
+/// ```
+/// use listpack_redis::Listpack;
+///
+/// let listpack: Listpack = vec!["Hello", "World"].into_iter().collect();
+/// assert_eq!(listpack, &["Hello", "World"]);
+///
+/// let listpack: Listpack = (0..10).collect();
+/// assert_eq!(listpack.len(), 10);
+/// assert_eq!(listpack, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+/// ```
+impl<'a, T, Allocator> FromIterator<T> for Listpack<Allocator>
+where
+    ListpackEntryInsert<'a>: From<T>,
+    Allocator: ListpackAllocator,
+    <Allocator as CustomAllocator>::Error: Debug,
+{
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let items = iter
+            .into_iter()
+            .map(ListpackEntryInsert::from)
+            .collect::<Vec<_>>();
+        let elements_size: usize = items
+            .iter()
+            .map(ListpackEntryInsert::full_encoded_size)
+            .sum();
+        let items_len = items.len();
+
+        let mut listpack = Listpack::with_capacity(elements_size);
+        let mut ptr = listpack.allocation.data_start_ptr();
+
+        for item in items {
+            let mut encoded = item.encode().expect("Encoded value");
+
+            unsafe {
+                std::ptr::copy_nonoverlapping(encoded.as_mut_ptr(), ptr.cast_mut(), encoded.len());
+            }
+
+            ptr = unsafe { ptr.add(encoded.len()) };
+        }
+
+        listpack.set_num_elements(items_len as u16);
+        listpack
+    }
+}
+
 impl<Allocator> MemoryConsumption for Listpack<Allocator>
 where
     Allocator: CustomAllocator,
