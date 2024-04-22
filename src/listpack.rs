@@ -501,6 +501,8 @@ where
     }
 }
 
+impl<Allocator> Eq for Listpack<Allocator> where Allocator: CustomAllocator {}
+
 /// Comparing a listpack against a slice of insertable entries.
 ///
 /// # Example
@@ -551,8 +553,6 @@ where
         self.eq(&other.as_slice())
     }
 }
-
-impl<Allocator> Eq for Listpack<Allocator> where Allocator: CustomAllocator {}
 
 impl<'a, T, Allocator> From<&'a [T]> for Listpack<Allocator>
 where
