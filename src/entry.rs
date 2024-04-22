@@ -2,7 +2,7 @@
 
 use std::{ops::Deref, ptr::NonNull};
 
-use redis_custom_allocator::CustomAllocator;
+use redis_custom_allocator::{CustomAllocator, MemoryConsumption};
 
 use crate::{error::Result, Listpack};
 
@@ -25,39 +25,81 @@ pub trait Encode {
 pub enum ListpackEntrySubencodingType {
     /// A 13-bit signed integer: the higher three bits are `110`, and
     /// the following 13 bits are the integer itself.
-    SignedInteger13Bit = 0b11000000,
+    SignedInteger13Bit = 0b1100_0000,
     /// A string with length up to `4095` bytes: the higher four bits
     /// are `1110`, the lower four bytes are the highest integer part of
     /// the length of the string, with the next byte being the lowest 8
     /// bits of the length.
-    MediumString = 0b11100000,
+    MediumString = 0b1110_0000,
     /// A large string with up to `2^32 - 1` bytes: the higher four bits
     /// are `1111`, the lower four bytes are always zero, designating
     /// the large string encoding. After the encoding type, the
     /// following four bytes are the length of the string (within the
     /// data block), and then the string data itself.
-    LargeString = 0b11110000,
+    LargeString = 0b1111_0000,
     /// A 16-bit signed integer: the higher four bits are `1111`, and
     /// the following four bits are `0001`. The following two bytes of
     /// the data block represent a 16 bits signed integer.
-    SignedInteger16Bit = 0b11110001,
+    SignedInteger16Bit = 0b1111_0001,
     /// A 24-bit signed integer: the higher four bits are `1111`, and
     /// the following four bits are `0010`. The following three bytes
     /// of the data block represent a 24 bits signed integer.
-    SignedInteger24Bit = 0b11110010,
+    SignedInteger24Bit = 0b1111_0010,
     /// A 32-bit signed integer: the higher four bits are `1111`, and
     /// the following four bits are `0011`. The following four bytes of
     /// the data block represent a 32 bits signed integer.
-    SignedInteger32Bit = 0b11110011,
+    SignedInteger32Bit = 0b1111_0011,
     /// A 64-bit signed integer: the higher four bits are `1111`, and
     /// the following four bits are `0100`. The following eight bytes of
     /// the data block represent a 64 bits signed integer.
-    SignedInteger64Bit = 0b11110100,
+    SignedInteger64Bit = 0b1111_0100,
+    /// A 64-bit floating-point number: the higher four bits are `1111`,
+    /// and the following four bits are `0101`. The following eight
+    /// bytes of the data block represent a 64 bits floating-point
+    /// number.
+    FloatingPoint64Bit = 0b1111_0101,
+    /// A boolean value: the value is embedded directly into the
+    /// encoding byte. The higher four bits are `1111`, the further
+    /// 3 bits are `011`, and the last remaining bit is the boolean
+    /// value itself.
+    Boolean = 0b1111_0110,
+    /// A custom embedded value. For example, a custom data structure
+    /// which data can be embedded into the entry header's last bit.
+    CustomEmbeddedValue = 0b1111_1000,
+    /// A custom extended value, whose data is stored in the data block.
+    /// The maximum length of the extended value is not limited by the
+    /// encoding type, but by the maximum size of the data block. The
+    /// interpretation of the data stored is up to the user.
+    ///
+    /// The extended value layout is as follows:
+    ///
+    /// <1 encoding byte> <1 byte count of the data length> <length> <data> <total-element-length>
+    ///
+    /// In case the data length is 0, the extended value layout is:
+    ///
+    /// <1 encoding byte> <0> <total-element-length>
+    ///
+    /// So the data and the length of the data are not stored at all,
+    /// which saves space. In case the data length is of one byte:
+    ///
+    /// <1 encoding byte> <1> <1 byte data length> <data> <total-element-length>
+    ///
+    /// Let's say we store a string "Hello":
+    ///
+    /// <0b1111_1010> <0b0000_0001> <0b0000_0101> "Hello" <total-element-length>
+    CustomExtendedValue = 0b1111_1010,
 }
 
 impl Encode for ListpackEntrySubencodingType {
     fn encode(&self) -> Result<Vec<u8>> {
-        Ok(vec![*self as u8])
+        // Handle the special cases of the internal encoding types.
+        match self {
+            // Only boolean and the custom embedded value have the value
+            // embedded into the encoding byte itself.
+            Self::Boolean => Ok(vec![0b1111_0110]),
+            Self::CustomEmbeddedValue => Ok(vec![0b1111_1000]),
+            _ => Ok(vec![*self as u8]),
+        }
     }
 }
 
@@ -66,15 +108,19 @@ impl TryFrom<u8> for ListpackEntrySubencodingType {
 
     fn try_from(encoding_byte: u8) -> Result<Self> {
         match encoding_byte {
-            0b11110000 => Ok(Self::LargeString),
-            0b11110001 => Ok(Self::SignedInteger16Bit),
-            0b11110010 => Ok(Self::SignedInteger24Bit),
-            0b11110011 => Ok(Self::SignedInteger32Bit),
-            0b11110100 => Ok(Self::SignedInteger64Bit),
+            0b1111_0101 => Ok(Self::FloatingPoint64Bit),
+            0b1111_0110 | 0b1111_0111 => Ok(Self::Boolean),
+            0b1111_1000 | 0b1111_1001 => Ok(Self::CustomEmbeddedValue),
+            0b1111_1010 => Ok(Self::CustomExtendedValue),
+            0b1111_0000 => Ok(Self::LargeString),
+            0b1111_0001 => Ok(Self::SignedInteger16Bit),
+            0b1111_0010 => Ok(Self::SignedInteger24Bit),
+            0b1111_0011 => Ok(Self::SignedInteger32Bit),
+            0b1111_0100 => Ok(Self::SignedInteger64Bit),
             _ => {
-                if encoding_byte & 0b11100000 == 0b11000000 {
+                if encoding_byte & 0b1110_0000 == 0b1100_0000 {
                     Ok(Self::SignedInteger13Bit)
-                } else if encoding_byte & 0b11110000 == 0b11100000 {
+                } else if encoding_byte & 0b1111_0000 == 0b1110_0000 {
                     Ok(Self::MediumString)
                 } else {
                     Err(crate::error::Error::UnknownEncodingType { encoding_byte })
@@ -91,12 +137,12 @@ pub enum ListpackEntryEncodingType {
     /// A small integer is encoded within the byte itself (the
     /// remaining 7 bits, meaning the values from 0 to 127 (a 7-bit
     /// unsigned integer)).
-    SmallUnsignedInteger = 0b00000000,
+    SmallUnsignedInteger = 0b0000_0000,
     /// A small string is encoded within the data block (the one
     /// following the encoding byte). The length of such a small string
     /// is encoded within the 6 lower bits of the encoding byte, so the
     /// maximum length of a small string is 63 bytes (ASCII characters).
-    SmallString = 0b10000000,
+    SmallString = 0b1000_0000,
     /// If the higher 2 bits of the encoding byte are 11, the entry is
     /// of a complex type, which may only be known after parsing the
     /// following lower bits of the encoding type.
@@ -115,14 +161,14 @@ impl TryFrom<u8> for ListpackEntryEncodingType {
     fn try_from(encoding_byte: u8) -> Result<Self> {
         // Compare the highest two bits of the encoding byte, then if
         // those aren't matched, delegate to the subencoding type.
-        match encoding_byte & 0b11000000 {
+        match encoding_byte & 0b1100_0000 {
             // If the first bit is unset, it's a small unsigned integer.
-            0b00000000 | 0b01000000 => Ok(Self::SmallUnsignedInteger),
+            0b0000_0000 | 0b0100_0000 => Ok(Self::SmallUnsignedInteger),
             // If the first bit is set, following the second bit which
             // is unset, it's a small string.
-            0b10000000 => Ok(Self::SmallString),
+            0b1000_0000 => Ok(Self::SmallString),
             // If the first two bits are set, it's a complex type.
-            0b11000000 => Ok(Self::ComplexType(ListpackEntrySubencodingType::try_from(
+            0b1100_0000 => Ok(Self::ComplexType(ListpackEntrySubencodingType::try_from(
                 encoding_byte,
             )?)),
             // Ideally, this branch should never be reached.
@@ -134,16 +180,20 @@ impl TryFrom<u8> for ListpackEntryEncodingType {
 impl From<ListpackEntryEncodingType> for u8 {
     fn from(encoding_type: ListpackEntryEncodingType) -> u8 {
         match encoding_type {
-            ListpackEntryEncodingType::SmallUnsignedInteger => 0b00000000,
-            ListpackEntryEncodingType::SmallString => 0b10000000,
+            ListpackEntryEncodingType::SmallUnsignedInteger => 0b0000_0000,
+            ListpackEntryEncodingType::SmallString => 0b1000_0000,
             ListpackEntryEncodingType::ComplexType(subencoding_type) => match subencoding_type {
-                ListpackEntrySubencodingType::SignedInteger13Bit => 0b11000000,
-                ListpackEntrySubencodingType::MediumString => 0b11100000,
-                ListpackEntrySubencodingType::LargeString => 0b11110000,
-                ListpackEntrySubencodingType::SignedInteger16Bit => 0b11110001,
-                ListpackEntrySubencodingType::SignedInteger24Bit => 0b11110010,
-                ListpackEntrySubencodingType::SignedInteger32Bit => 0b11110011,
-                ListpackEntrySubencodingType::SignedInteger64Bit => 0b11110100,
+                ListpackEntrySubencodingType::SignedInteger13Bit => 0b1100_0000,
+                ListpackEntrySubencodingType::MediumString => 0b1110_0000,
+                ListpackEntrySubencodingType::LargeString => 0b1111_0000,
+                ListpackEntrySubencodingType::SignedInteger16Bit => 0b1111_0001,
+                ListpackEntrySubencodingType::SignedInteger24Bit => 0b1111_0010,
+                ListpackEntrySubencodingType::SignedInteger32Bit => 0b1111_0011,
+                ListpackEntrySubencodingType::SignedInteger64Bit => 0b1111_0100,
+                ListpackEntrySubencodingType::FloatingPoint64Bit => 0b1111_0101,
+                ListpackEntrySubencodingType::Boolean => 0b1111_0110,
+                ListpackEntrySubencodingType::CustomEmbeddedValue => 0b1111_1000,
+                ListpackEntrySubencodingType::CustomExtendedValue => 0b1111_1010,
             },
         }
     }
@@ -170,6 +220,14 @@ pub enum ListpackEntryData<'a> {
     SignedInteger32Bit(i32),
     /// See [`ListpackEntrySubencodingType::SignedInteger64Bit`].
     SignedInteger64Bit(i64),
+    /// See [`ListpackEntrySubencodingType::FloatingPoint64Bit`].
+    FloatingPoint64Bit(f64),
+    /// See [`ListpackEntrySubencodingType::Boolean`].
+    Boolean(bool),
+    /// See [`ListpackEntrySubencodingType::CustomEmbeddedValue`].
+    CustomEmbeddedValue(u8),
+    /// See [`ListpackEntrySubencodingType::CustomExtendedValue`].
+    CustomExtendedValue(&'a [u8]),
 }
 
 impl ListpackEntryData<'_> {
@@ -200,6 +258,18 @@ impl ListpackEntryData<'_> {
             ),
             ListpackEntryData::SignedInteger64Bit(_) => ListpackEntryEncodingType::ComplexType(
                 ListpackEntrySubencodingType::SignedInteger64Bit,
+            ),
+            ListpackEntryData::FloatingPoint64Bit(_) => ListpackEntryEncodingType::ComplexType(
+                ListpackEntrySubencodingType::FloatingPoint64Bit,
+            ),
+            ListpackEntryData::Boolean(_) => {
+                ListpackEntryEncodingType::ComplexType(ListpackEntrySubencodingType::Boolean)
+            }
+            ListpackEntryData::CustomEmbeddedValue(_) => ListpackEntryEncodingType::ComplexType(
+                ListpackEntrySubencodingType::CustomEmbeddedValue,
+            ),
+            ListpackEntryData::CustomExtendedValue(_) => ListpackEntryEncodingType::ComplexType(
+                ListpackEntrySubencodingType::CustomExtendedValue,
             ),
         }
     }
@@ -286,6 +356,99 @@ impl ListpackEntryData<'_> {
         }
     }
 
+    /// Attempts to extract a 64-bit floating point value from the
+    /// entry.
+    pub fn get_f64(&self) -> Option<f64> {
+        match self {
+            ListpackEntryData::FloatingPoint64Bit(f) => Some(*f),
+            _ => None,
+        }
+    }
+
+    /// Attempts to extract a boolean value from the entry.
+    pub fn get_bool(&self) -> Option<bool> {
+        match self {
+            ListpackEntryData::Boolean(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// Attempts to extract a custom embedded value from the entry.
+    pub fn get_custom_embedded(&self) -> Option<u8> {
+        match self {
+            ListpackEntryData::CustomEmbeddedValue(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Attempts to extract a custom embedded value from the entry.
+    ///
+    /// The provided type `T` must implement the `From<&[u8]>` trait.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::ListpackEntryData;
+    ///
+    /// #[repr(transparent)]
+    /// #[derive(Debug, PartialEq, Eq)]
+    /// struct CustomValue(String);
+    /// impl From<&[u8]> for CustomValue {
+    ///    fn from(data: &[u8]) -> Self {
+    ///       Self(String::from_utf8_lossy(data).to_string())
+    ///   }
+    /// }
+    ///
+    /// let s = CustomValue("Hello, World!".to_owned());
+    /// let entry = ListpackEntryData::CustomExtendedValue(s.0.as_bytes());
+    /// let value = entry.get_custom_extended::<CustomValue>().unwrap();
+    ///
+    /// assert_eq!(value, s);
+    /// ```
+    pub fn get_custom_extended<'a, T>(&'a self) -> Option<T>
+    where
+        T: From<&'a [u8]>,
+    {
+        match self {
+            ListpackEntryData::CustomExtendedValue(v) => Some(T::from(v)),
+            _ => None,
+        }
+    }
+
+    /// Returns the raw data of the custom extended value.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::ListpackEntryData;
+    ///
+    /// let entry = ListpackEntryData::CustomExtendedValue(&[1, 2, 3, 4]);
+    /// let value = entry.get_custom_extended_raw().unwrap();
+    ///
+    /// assert_eq!(value, &[1, 2, 3, 4]);
+    /// ```
+    pub fn get_custom_extended_raw(&self) -> Option<&[u8]> {
+        match self {
+            ListpackEntryData::CustomExtendedValue(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if the entry is a boolean.
+    pub fn is_bool(&self) -> bool {
+        self.get_bool().is_some()
+    }
+
+    /// Returns `true` if the entry is a custom embedded value.
+    pub fn is_custom_embedded(&self) -> bool {
+        self.get_custom_embedded().is_some()
+    }
+
+    /// Returns `true` if the entry is a custom extended value.
+    pub fn is_custom_extended(&self) -> bool {
+        matches!(self, ListpackEntryData::CustomExtendedValue(_))
+    }
+
     /// Returns `true` if the entry is a small unsigned integer.
     pub fn is_u7(&self) -> bool {
         self.get_u7().is_some()
@@ -329,6 +492,11 @@ impl ListpackEntryData<'_> {
     /// Returns `true` if the entry is a signed 64-bit integer.
     pub fn is_i64(&self) -> bool {
         self.get_i64().is_some()
+    }
+
+    /// Returns `true` if the entry is a 64-bit floating point value.
+    pub fn is_f64(&self) -> bool {
+        self.get_f64().is_some()
     }
 
     /// Attempts to extract an integer from the entry.
@@ -388,8 +556,8 @@ fn encode_total_element_length(length: usize) -> Result<Vec<u8>> {
         // the value.
         0..=127 => vec![length as u8],
         128..=16383 => {
-            let mut data = vec![(length >> 7) as u8, (length & 0b01111111) as u8];
-            data[1] |= 0b10000000;
+            let mut data = vec![(length >> 7) as u8, (length & 0b0111_1111) as u8];
+            data[1] |= 0b1000_0000;
             data
         }
         16384..=2097151 => {
@@ -398,34 +566,34 @@ fn encode_total_element_length(length: usize) -> Result<Vec<u8>> {
                 ((length >> 7) & 0b01111111) as u8,
                 (length & 0b01111111) as u8,
             ];
-            data[1] |= 0b10000000;
-            data[2] |= 0b10000000;
+            data[1] |= 0b1000_0000;
+            data[2] |= 0b1000_0000;
             data
         }
         2097152..=268435455 => {
             let mut data = vec![
                 (length >> 21) as u8,
-                ((length >> 14) & 0b01111111) as u8,
-                ((length >> 7) & 0b01111111) as u8,
-                (length & 0b01111111) as u8,
+                ((length >> 14) & 0b0111_1111) as u8,
+                ((length >> 7) & 0b0111_1111) as u8,
+                (length & 0b0111_1111) as u8,
             ];
-            data[1] |= 0b10000000;
-            data[2] |= 0b10000000;
-            data[3] |= 0b10000000;
+            data[1] |= 0b1000_0000;
+            data[2] |= 0b1000_0000;
+            data[3] |= 0b1000_0000;
             data
         }
         268435456..=34359738367 => {
             let mut data = vec![
                 (length >> 28) as u8,
-                ((length >> 21) & 0b01111111) as u8,
-                ((length >> 14) & 0b01111111) as u8,
-                ((length >> 7) & 0b01111111) as u8,
-                (length & 0b01111111) as u8,
+                ((length >> 21) & 0b0111_1111) as u8,
+                ((length >> 14) & 0b0111_1111) as u8,
+                ((length >> 7) & 0b0111_1111) as u8,
+                (length & 0b0111_1111) as u8,
             ];
-            data[1] |= 0b10000000;
-            data[2] |= 0b10000000;
-            data[3] |= 0b10000000;
-            data[4] |= 0b10000000;
+            data[1] |= 0b1000_0000;
+            data[2] |= 0b1000_0000;
+            data[3] |= 0b1000_0000;
+            data[4] |= 0b1000_0000;
             data
         }
         _ => {
@@ -443,11 +611,23 @@ fn calculate_total_element_length(object_length: usize) -> usize {
     // We need to take the "len" and count how many times we can split
     // it into 7-bit integers.
 
+    count_shifts(object_length, 7)
+}
+
+/// Returns the number of fully-utilised bytes required to store a value
+/// in the `number`.
+fn count_bytes_in_number(number: usize) -> usize {
+    count_shifts(number, 8)
+}
+
+/// Returns the number of bytes required to store a value in the
+/// `number`, when shifted by `shift_by`.
+fn count_shifts(number: usize, shift_by: u8) -> usize {
     let mut count = 1;
-    let mut remainder = object_length;
+    let mut remainder = number;
 
     loop {
-        remainder >>= 7;
+        remainder >>= shift_by;
 
         if remainder > 0 {
             count += 1;
@@ -485,7 +665,7 @@ impl<'a> Encode for ListpackEntryData<'a> {
             // The small unsigned integer is embedded into the encoding
             // byte itself, so appending only the total-element-length
             // byte which equals to one: the encoding byte itself.
-            Self::SmallUnsignedInteger(u) => vec![u & 0b01111111, 1],
+            Self::SmallUnsignedInteger(u) => vec![u & 0b0111_1111, 1],
             Self::SignedInteger13Bit(i) => {
                 let mut block = vec![encoding_type_byte | ((i >> 8) as u8), (*i as u8)];
 
@@ -594,6 +774,54 @@ impl<'a> Encode for ListpackEntryData<'a> {
                 block.append(&mut length);
                 block
             }
+            Self::FloatingPoint64Bit(f) => {
+                let mut block = vec![encoding_type_byte];
+
+                let mut data = f.to_le_bytes().to_vec();
+                block.append(&mut data);
+
+                let mut length = encode_total_element_length(block.len())?;
+                block.append(&mut length);
+                block
+            }
+            Self::Boolean(b) => {
+                let mut block = vec![encoding_type_byte | (*b as u8)];
+
+                let mut length = encode_total_element_length(block.len())?;
+                block.append(&mut length);
+                block
+            }
+            Self::CustomEmbeddedValue(v) => {
+                let mut block = vec![encoding_type_byte | *v];
+
+                let mut length = encode_total_element_length(block.len())?;
+                block.append(&mut length);
+                block
+            }
+            Self::CustomExtendedValue(v) => {
+                let mut block = vec![encoding_type_byte];
+
+                let data_length = v.len();
+
+                if data_length > 0 {
+                    let data_length_length = count_bytes_in_number(data_length) as u8;
+                    block.push(data_length_length);
+
+                    let mut data_length_length_bytes = data_length.to_le_bytes().to_vec();
+                    while let Some(0) = data_length_length_bytes.last() {
+                        data_length_length_bytes.pop();
+                    }
+
+                    block.append(&mut data_length_length_bytes);
+                    block.append(&mut v.to_vec());
+                } else {
+                    block.push(0);
+                }
+
+                let mut length = encode_total_element_length(block.len())?;
+                block.append(&mut length);
+                block
+            }
         })
     }
 }
@@ -616,6 +844,10 @@ impl std::fmt::Display for ListpackEntryData<'_> {
             ListpackEntryData::SignedInteger24Bit(i) => write!(f, "{i}"),
             ListpackEntryData::SignedInteger32Bit(i) => write!(f, "{i}"),
             ListpackEntryData::SignedInteger64Bit(i) => write!(f, "{i}"),
+            ListpackEntryData::FloatingPoint64Bit(v) => write!(f, "{v}"),
+            ListpackEntryData::Boolean(b) => write!(f, "{b}"),
+            ListpackEntryData::CustomEmbeddedValue(v) => write!(f, "{v}"),
+            ListpackEntryData::CustomExtendedValue(v) => write!(f, "{v:?}"),
         }
     }
 }
@@ -628,6 +860,14 @@ impl<'a> TryFrom<&'a ListpackEntryData<'a>> for ListpackEntryInsert<'a> {
             Ok(Self::String(data))
         } else if let Some(data) = data.get_i64() {
             Ok(Self::Integer(data))
+        } else if let Some(data) = data.get_f64() {
+            Ok(Self::Float(data))
+        } else if let Some(data) = data.get_bool() {
+            Ok(Self::Boolean(data))
+        } else if let Some(data) = data.get_custom_embedded() {
+            Ok(Self::CustomEmbeddedValue(data))
+        } else if let Some(data) = data.get_custom_extended() {
+            Ok(Self::CustomExtendedValue(data))
         } else {
             Err(crate::error::Error::UnknownEncodingType {
                 encoding_byte: data.encoding_type().into(),
@@ -636,7 +876,7 @@ impl<'a> TryFrom<&'a ListpackEntryData<'a>> for ListpackEntryInsert<'a> {
     }
 }
 
-macro_rules! impl_listpack_entry_data_from_number {
+macro_rules! impl_listpack_entry_data_from_integer {
     ($($t:ty),*) => {
         $(
             impl From<$t> for ListpackEntryData<'_> {
@@ -714,7 +954,7 @@ macro_rules! impl_listpack_entry_data_from_number {
     };
 }
 
-impl_listpack_entry_data_from_number!(i8, i16, i32, i64, u8, u16, u32, u64);
+impl_listpack_entry_data_from_integer!(i8, i16, i32, i64, u8, u16, u32, u64);
 
 impl<'a> From<&'a str> for ListpackEntryData<'a> {
     fn from(s: &'a str) -> Self {
@@ -735,11 +975,33 @@ impl<'a> From<&'a String> for ListpackEntryData<'a> {
     }
 }
 
+impl From<f64> for ListpackEntryData<'_> {
+    fn from(f: f64) -> Self {
+        Self::FloatingPoint64Bit(f)
+    }
+}
+
+impl From<bool> for ListpackEntryData<'_> {
+    fn from(b: bool) -> Self {
+        Self::Boolean(b)
+    }
+}
+
+impl<'a> From<&'a [u8]> for ListpackEntryData<'a> {
+    fn from(v: &'a [u8]) -> Self {
+        Self::CustomExtendedValue(v)
+    }
+}
+
 impl<'a> From<ListpackEntryInsert<'a>> for ListpackEntryData<'a> {
     fn from(insert: ListpackEntryInsert<'a>) -> Self {
         match insert {
             ListpackEntryInsert::String(s) => Self::from(s),
             ListpackEntryInsert::Integer(i) => Self::from(i),
+            ListpackEntryInsert::Float(f) => Self::from(f),
+            ListpackEntryInsert::Boolean(b) => Self::from(b),
+            ListpackEntryInsert::CustomEmbeddedValue(v) => Self::CustomEmbeddedValue(v),
+            ListpackEntryInsert::CustomExtendedValue(v) => Self::from(v),
         }
     }
 }
@@ -748,7 +1010,7 @@ impl<'a> From<ListpackEntryInsert<'a>> for ListpackEntryData<'a> {
 /// zero-sized object, which designates a reference to the actual
 /// listpack entry.
 #[repr(transparent)]
-pub struct ListpackEntry;
+pub struct ListpackEntry(());
 
 impl ListpackEntry {
     const ENCODING_TYPE_BYTE_LENGTH: usize = std::mem::size_of::<u8>();
@@ -873,7 +1135,7 @@ impl ListpackEntry {
                 Some((unsafe { std::slice::from_raw_parts(ptr, 1) }, 2))
             }
             ListpackEntryEncodingType::SmallString => {
-                let len = (encoding_type_byte & 0b00111111) as usize;
+                let len = (encoding_type_byte & 0b0011_1111) as usize;
                 let data = unsafe {
                     let data = std::slice::from_raw_parts(ptr, len);
                     let total_bytes = len + Self::ENCODING_TYPE_BYTE_LENGTH + 1;
@@ -895,7 +1157,8 @@ impl ListpackEntry {
                 }
                 ListpackEntrySubencodingType::MediumString => {
                     let data = unsafe {
-                        let len = ((encoding_type_byte & 0b00001111) as usize) << 8 | *ptr as usize;
+                        let len =
+                            ((encoding_type_byte & 0b0000_1111) as usize) << 8 | *ptr as usize;
                         let ptr = ptr.add(1);
                         let data = std::slice::from_raw_parts(ptr, len);
                         // One extra byte for the length of the data block.
@@ -948,13 +1211,44 @@ impl ListpackEntry {
                     };
                     Some(data)
                 }
-                ListpackEntrySubencodingType::SignedInteger64Bit => {
+                // These two share the same structure.
+                ListpackEntrySubencodingType::SignedInteger64Bit
+                | ListpackEntrySubencodingType::FloatingPoint64Bit => {
                     let data = unsafe {
                         let data = std::slice::from_raw_parts(ptr, 8);
                         let total_bytes = Self::ENCODING_TYPE_BYTE_LENGTH + 8 + 1;
                         (data, total_bytes)
                     };
                     Some(data)
+                }
+                ListpackEntrySubencodingType::CustomExtendedValue => {
+                    let data = unsafe {
+                        let extended_length = *ptr.add(0) as usize;
+
+                        let mut data_len = 0;
+
+                        for i in 0..extended_length {
+                            data_len = (data_len << 8) | (*ptr.add(1 + i) as usize);
+                        }
+
+                        if data_len == 0 {
+                            return Some((&[], 3));
+                        }
+
+                        let ptr = ptr.add(extended_length);
+                        let data = std::slice::from_raw_parts(ptr.add(1), data_len);
+                        let extra_length = Self::ENCODING_TYPE_BYTE_LENGTH + extended_length;
+                        let object_length = data_len + extra_length;
+                        let total_bytes =
+                            object_length + calculate_total_element_length(object_length);
+                        (data, total_bytes)
+                    };
+                    Some(data)
+                }
+                // The value is stored in the entry header itself.
+                ListpackEntrySubencodingType::Boolean
+                | ListpackEntrySubencodingType::CustomEmbeddedValue => {
+                    Some((unsafe { std::slice::from_raw_parts(ptr, 1) }, 2))
                 }
             },
         }
@@ -1022,7 +1316,7 @@ impl ListpackEntry {
 
         Ok(match encoding_type {
             ListpackEntryEncodingType::SmallUnsignedInteger => {
-                let value = encoding_type_byte & 0b01111111;
+                let value = encoding_type_byte & 0b0111_1111;
                 ListpackEntryData::SmallUnsignedInteger(value)
             }
             ListpackEntryEncodingType::SmallString => {
@@ -1038,7 +1332,7 @@ impl ListpackEntry {
                     let data = self
                         .get_data_raw()
                         .ok_or(crate::error::Error::MissingDataBlock)?;
-                    let n = (((encoding_type_byte & 0b00011111) as i16) << 8) | (data[0] as i16);
+                    let n = (((encoding_type_byte & 0b0001_1111) as i16) << 8) | (data[0] as i16);
                     ListpackEntryData::SignedInteger13Bit(n)
                 }
                 ListpackEntrySubencodingType::MediumString => {
@@ -1093,6 +1387,27 @@ impl ListpackEntry {
                         | (data[0] as i64);
                     ListpackEntryData::SignedInteger64Bit(n)
                 }
+                ListpackEntrySubencodingType::FloatingPoint64Bit => {
+                    let data = self
+                        .get_data_raw()
+                        .ok_or(crate::error::Error::MissingDataBlock)?;
+                    let n = f64::from_le_bytes(data.try_into().unwrap());
+                    ListpackEntryData::FloatingPoint64Bit(n)
+                }
+                ListpackEntrySubencodingType::Boolean => {
+                    let value = encoding_type_byte & 0b0000_0001 == 1;
+                    ListpackEntryData::Boolean(value)
+                }
+                ListpackEntrySubencodingType::CustomEmbeddedValue => {
+                    let value = encoding_type_byte & 0b0000_0001;
+                    ListpackEntryData::CustomEmbeddedValue(value)
+                }
+                ListpackEntrySubencodingType::CustomExtendedValue => {
+                    let data = self
+                        .get_data_raw()
+                        .ok_or(crate::error::Error::MissingDataBlock)?;
+                    ListpackEntryData::CustomExtendedValue(data)
+                }
             },
         })
     }
@@ -1131,11 +1446,47 @@ impl PartialEq<i64> for ListpackEntry {
     }
 }
 
+impl PartialEq<f64> for ListpackEntry {
+    fn eq(&self, other: &f64) -> bool {
+        self.data()
+            .map(|data| data.get_f64() == Some(*other))
+            .unwrap_or(false)
+    }
+}
+
+impl PartialEq<bool> for ListpackEntry {
+    fn eq(&self, other: &bool) -> bool {
+        self.data()
+            .map(|data| data.get_bool() == Some(*other))
+            .unwrap_or(false)
+    }
+}
+
+impl PartialEq<u8> for ListpackEntry {
+    fn eq(&self, other: &u8) -> bool {
+        self.data()
+            .map(|data| data.get_custom_embedded() == Some(*other))
+            .unwrap_or(false)
+    }
+}
+
+impl PartialEq<&[u8]> for ListpackEntry {
+    fn eq(&self, other: &&[u8]) -> bool {
+        self.data()
+            .map(|data| data.get_custom_extended() == Some(*other))
+            .unwrap_or(false)
+    }
+}
+
 impl PartialEq<ListpackEntryInsert<'_>> for ListpackEntry {
     fn eq(&self, other: &ListpackEntryInsert) -> bool {
         match other {
             ListpackEntryInsert::String(s) => self == *s,
             ListpackEntryInsert::Integer(n) => self == n,
+            ListpackEntryInsert::Float(f) => self == f,
+            ListpackEntryInsert::Boolean(b) => self == b,
+            ListpackEntryInsert::CustomEmbeddedValue(v) => *self == *v,
+            ListpackEntryInsert::CustomExtendedValue(v) => *self == *v,
         }
     }
 }
@@ -1145,6 +1496,10 @@ impl PartialEq<ListpackEntryInsert<'_>> for &ListpackEntry {
         match other {
             ListpackEntryInsert::String(s) => *self == *s,
             ListpackEntryInsert::Integer(n) => *self == n,
+            ListpackEntryInsert::Float(f) => *self == f,
+            ListpackEntryInsert::Boolean(b) => *self == b,
+            ListpackEntryInsert::CustomEmbeddedValue(v) => **self == *v,
+            ListpackEntryInsert::CustomExtendedValue(v) => **self == *v,
         }
     }
 }
@@ -1171,13 +1526,157 @@ impl std::fmt::Display for ListpackEntry {
     }
 }
 
+impl MemoryConsumption for ListpackEntry {
+    fn memory_consumption(&self) -> usize {
+        self.total_bytes()
+    }
+}
+
+impl TryFrom<&ListpackEntry> for String {
+    type Error = crate::error::Error;
+
+    fn try_from(entry: &ListpackEntry) -> Result<Self, Self::Error> {
+        let encoding_type = entry.encoding_type()?;
+
+        entry
+            .data()?
+            .get_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                crate::error::Error::from(crate::error::TypeConversionError::wrong_types::<Self>(
+                    encoding_type,
+                ))
+            })
+    }
+}
+
+impl TryFrom<&ListpackEntry> for f64 {
+    type Error = crate::error::Error;
+
+    fn try_from(entry: &ListpackEntry) -> Result<Self, Self::Error> {
+        let encoding_type = entry.encoding_type()?;
+
+        entry.data()?.get_f64().ok_or_else(|| {
+            crate::error::Error::from(crate::error::TypeConversionError::wrong_types::<Self>(
+                encoding_type,
+            ))
+        })
+    }
+}
+
+impl TryFrom<&ListpackEntry> for i64 {
+    type Error = crate::error::Error;
+
+    fn try_from(entry: &ListpackEntry) -> Result<Self, Self::Error> {
+        let encoding_type = entry.encoding_type()?;
+
+        entry.data()?.get_integer().ok_or_else(|| {
+            crate::error::Error::from(crate::error::TypeConversionError::wrong_types::<Self>(
+                encoding_type,
+            ))
+        })
+    }
+}
+
+impl TryFrom<&ListpackEntry> for i32 {
+    type Error = crate::error::Error;
+
+    fn try_from(entry: &ListpackEntry) -> Result<Self, Self::Error> {
+        let encoding_type = entry.encoding_type()?;
+        let integer: i64 = entry.data()?.get_integer().ok_or_else(|| {
+            crate::error::Error::from(crate::error::TypeConversionError::wrong_types::<Self>(
+                encoding_type,
+            ))
+        })?;
+
+        if ((Self::MIN as i64)..=(Self::MAX as i64)).contains(&integer) {
+            Ok(integer as Self)
+        } else {
+            Err(crate::error::Error::from(
+                crate::error::TypeConversionError::wrong_types::<Self>(encoding_type),
+            ))
+        }
+    }
+}
+
+impl TryFrom<&ListpackEntry> for i16 {
+    type Error = crate::error::Error;
+
+    fn try_from(entry: &ListpackEntry) -> Result<Self, Self::Error> {
+        let encoding_type = entry.encoding_type()?;
+        let integer: i64 = entry.data()?.get_integer().ok_or_else(|| {
+            crate::error::Error::from(crate::error::TypeConversionError::wrong_types::<Self>(
+                encoding_type,
+            ))
+        })?;
+
+        if ((Self::MIN as i64)..=(Self::MAX as i64)).contains(&integer) {
+            Ok(integer as Self)
+        } else {
+            Err(crate::error::Error::from(
+                crate::error::TypeConversionError::wrong_types::<Self>(encoding_type),
+            ))
+        }
+    }
+}
+
+impl TryFrom<&ListpackEntry> for i8 {
+    type Error = crate::error::Error;
+
+    fn try_from(entry: &ListpackEntry) -> Result<Self, Self::Error> {
+        let encoding_type = entry.encoding_type()?;
+        let integer: i64 = entry.data()?.get_integer().ok_or_else(|| {
+            crate::error::Error::from(crate::error::TypeConversionError::wrong_types::<Self>(
+                encoding_type,
+            ))
+        })?;
+
+        if ((Self::MIN as i64)..=(Self::MAX as i64)).contains(&integer) {
+            Ok(integer as Self)
+        } else {
+            Err(crate::error::Error::from(
+                crate::error::TypeConversionError::wrong_types::<Self>(encoding_type),
+            ))
+        }
+    }
+}
+
+impl TryFrom<&ListpackEntry> for u8 {
+    type Error = crate::error::Error;
+
+    fn try_from(entry: &ListpackEntry) -> Result<Self, Self::Error> {
+        let encoding_type = entry.encoding_type()?;
+        let integer: i64 = entry.data()?.get_integer().ok_or_else(|| {
+            crate::error::Error::from(crate::error::TypeConversionError::wrong_types::<Self>(
+                encoding_type,
+            ))
+        })?;
+
+        if ((Self::MIN as i64)..=(Self::MAX as i64)).contains(&integer) {
+            Ok(integer as Self)
+        } else {
+            Err(crate::error::Error::from(
+                crate::error::TypeConversionError::wrong_types::<Self>(encoding_type),
+            ))
+        }
+    }
+}
+
 /// The allowed types to be inserted into a listpack.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]
 pub enum ListpackEntryInsert<'a> {
     /// A string to insert into a listpack.
     String(&'a str),
     /// An integer to insert into a listpack.
     Integer(i64),
+    /// A float to insert into a listpack.
+    Float(f64),
+    /// A boolean to insert into a listpack.
+    Boolean(bool),
+    /// A custom value to be embedded into an entry in a listpack.
+    CustomEmbeddedValue(u8),
+    /// A bigger custom value to be inserted into a listpack.
+    CustomExtendedValue(&'a [u8]),
 }
 
 impl ListpackEntryInsert<'_> {
@@ -1253,6 +1752,36 @@ impl ListpackEntryInsert<'_> {
                     10
                 }
             }
+            Self::Float(_) => {
+                // 1: encoding byte.
+                // 8: 64-bit float.
+                // 1: total-byte-length of one byte.
+                10
+            }
+            Self::Boolean(_) => {
+                // 1: encoding byte and the boolean value.
+                // 1: total-byte-length of one byte.
+                2
+            }
+            Self::CustomEmbeddedValue(_) => {
+                // 1: encoding byte and the custom value.
+                // 1: total-byte-length of one byte.
+                2
+            }
+            Self::CustomExtendedValue(v) => {
+                // 1: encoding byte.
+                // 1: the length of the extended value (m).
+                // 1-m: the extended value length.
+                // n: the extended value.
+                // 1: total-byte-length of one byte.
+                if v.is_empty() {
+                    3
+                } else {
+                    let data_length = v.len();
+                    let extended_length = count_bytes_in_number(data_length);
+                    2 + extended_length + data_length + 1
+                }
+            }
         }
     }
 }
@@ -1281,6 +1810,18 @@ impl<'a> From<&'a String> for ListpackEntryInsert<'a> {
     }
 }
 
+impl From<bool> for ListpackEntryInsert<'_> {
+    fn from(value: bool) -> Self {
+        Self::Boolean(value)
+    }
+}
+
+impl<'a> From<&'a bool> for ListpackEntryInsert<'a> {
+    fn from(value: &'a bool) -> Self {
+        Self::Boolean(*value)
+    }
+}
+
 macro_rules! impl_listpack_entry_insert_from_number {
     ($($t:ty),*) => {
         $(
@@ -1302,12 +1843,20 @@ macro_rules! impl_listpack_entry_insert_from_number {
 impl_listpack_entry_insert_from_number!(i8, i16, i32, i64, u8, u16, u32, u64);
 
 /// The listpack entry which is removed from listpack.
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
 pub enum ListpackEntryRemoved {
     /// A string which was removed from a listpack.
     String(String),
     /// An integer which was removed from a listpack.
     Integer(i64),
+    /// A floating point value which was removed from a listpack.
+    Float(f64),
+    /// A boolean value which was removed from a listpack.
+    Boolean(bool),
+    /// A custom embedded value which was removed from a listpack.
+    CustomEmbeddedValue(u8),
+    /// A custom extended value which was removed from a listpack.
+    CustomExtendedValue(Vec<u8>),
 }
 
 impl ListpackEntryRemoved {
@@ -1353,6 +1902,10 @@ impl std::fmt::Display for ListpackEntryRemoved {
         match self {
             Self::String(s) => write!(f, "{s}"),
             Self::Integer(n) => write!(f, "{n}"),
+            Self::Float(n) => write!(f, "{n}"),
+            Self::CustomEmbeddedValue(v) => write!(f, "{:?}", v),
+            Self::CustomExtendedValue(v) => write!(f, "{:?}", v),
+            Self::Boolean(b) => write!(f, "{b}"),
         }
     }
 }
@@ -1371,20 +1924,7 @@ impl From<&String> for ListpackEntryRemoved {
 
 impl From<NonNull<u8>> for ListpackEntryRemoved {
     fn from(ptr: NonNull<u8>) -> Self {
-        let entry = ListpackEntry::ref_from_ptr(ptr);
-        let data = entry.data().unwrap();
-
-        match data {
-            ListpackEntryData::SmallString(s)
-            | ListpackEntryData::MediumString(s)
-            | ListpackEntryData::LargeString(s) => Self::String(s.to_owned()),
-            ListpackEntryData::SignedInteger13Bit(n) => Self::Integer(n as i64),
-            ListpackEntryData::SignedInteger16Bit(n) => Self::Integer(n as i64),
-            ListpackEntryData::SignedInteger24Bit(n) => Self::Integer(n as i64),
-            ListpackEntryData::SignedInteger32Bit(n) => Self::Integer(n as i64),
-            ListpackEntryData::SignedInteger64Bit(n) => Self::Integer(n),
-            ListpackEntryData::SmallUnsignedInteger(u) => Self::Integer(u as i64),
-        }
+        Self::from(ListpackEntry::ref_from_ptr(ptr))
     }
 }
 
@@ -1408,6 +1948,10 @@ impl From<&ListpackEntry> for ListpackEntryRemoved {
             ListpackEntryData::SignedInteger32Bit(n) => Self::Integer(n as i64),
             ListpackEntryData::SignedInteger64Bit(n) => Self::Integer(n),
             ListpackEntryData::SmallUnsignedInteger(u) => Self::Integer(u as i64),
+            ListpackEntryData::FloatingPoint64Bit(n) => Self::Float(n),
+            ListpackEntryData::Boolean(b) => Self::Boolean(b),
+            ListpackEntryData::CustomEmbeddedValue(v) => Self::CustomEmbeddedValue(v),
+            ListpackEntryData::CustomExtendedValue(v) => Self::CustomExtendedValue(v.to_vec()),
         }
     }
 }
@@ -1417,6 +1961,10 @@ impl<'a> From<&'a ListpackEntryRemoved> for ListpackEntryInsert<'a> {
         match removed {
             ListpackEntryRemoved::String(s) => Self::String(s),
             ListpackEntryRemoved::Integer(n) => Self::Integer(*n),
+            ListpackEntryRemoved::Float(n) => Self::Float(*n),
+            ListpackEntryRemoved::Boolean(b) => Self::Boolean(*b),
+            ListpackEntryRemoved::CustomEmbeddedValue(v) => Self::CustomEmbeddedValue(*v),
+            ListpackEntryRemoved::CustomExtendedValue(v) => Self::CustomExtendedValue(v),
         }
     }
 }
@@ -1564,6 +2112,103 @@ mod tests {
                 encode_total_element_length(34359738367).unwrap(),
                 vec![0b01111111, 0b11111111, 0b11111111, 0b11111111, 0b11111111]
             );
+        }
+
+        #[test]
+        fn entry_bool() {
+            let entry = ListpackEntryInsert::Boolean(false);
+            let encoded = entry.encode().unwrap();
+            let decoded = ListpackEntry::ref_from_slice(encoded.as_slice());
+            let ty = decoded.encoding_type().unwrap();
+            assert_eq!(
+                ty,
+                ListpackEntryEncodingType::ComplexType(ListpackEntrySubencodingType::Boolean)
+            );
+            assert!(!decoded.data().unwrap().get_bool().unwrap());
+
+            let entry = ListpackEntryInsert::Boolean(true);
+            let encoded = entry.encode().unwrap();
+            let decoded = ListpackEntry::ref_from_slice(encoded.as_slice());
+            assert!(decoded.data().unwrap().get_bool().unwrap());
+        }
+
+        #[test]
+        fn entry_f64() {
+            let entry = ListpackEntryInsert::Float(55.66f64);
+            let encoded = entry.encode().unwrap();
+            let decoded = ListpackEntry::ref_from_slice(encoded.as_slice());
+            let ty = decoded.encoding_type().unwrap();
+            assert_eq!(
+                ty,
+                ListpackEntryEncodingType::ComplexType(
+                    ListpackEntrySubencodingType::FloatingPoint64Bit
+                )
+            );
+            assert_eq!(decoded.data().unwrap().get_f64().unwrap(), 55.66f64);
+        }
+
+        #[test]
+        fn entry_custom_embedded() {
+            let entry = ListpackEntryInsert::CustomEmbeddedValue(0);
+            let encoded = entry.encode().unwrap();
+            let decoded = ListpackEntry::ref_from_slice(encoded.as_slice());
+            let ty = decoded.encoding_type().unwrap();
+            assert_eq!(
+                ty,
+                ListpackEntryEncodingType::ComplexType(
+                    ListpackEntrySubencodingType::CustomEmbeddedValue
+                )
+            );
+            assert_eq!(decoded.data().unwrap().get_custom_embedded().unwrap(), 0);
+        }
+
+        #[test]
+        fn entry_custom_extended_non_empty() {
+            let array = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+            let entry = ListpackEntryInsert::CustomExtendedValue(&array);
+            let encoded = entry.encode().unwrap();
+            let decoded = ListpackEntry::ref_from_slice(encoded.as_slice());
+            let ty = decoded.encoding_type().unwrap();
+            assert_eq!(
+                ty,
+                ListpackEntryEncodingType::ComplexType(
+                    ListpackEntrySubencodingType::CustomExtendedValue
+                )
+            );
+            assert_eq!(
+                decoded
+                    .data()
+                    .unwrap()
+                    .get_custom_extended::<'_, &[u8]>()
+                    .unwrap(),
+                &array
+            );
+            assert_eq!(decoded.total_bytes(), 13);
+        }
+
+        #[test]
+        fn entry_custom_extended_empty() {
+            let array = [];
+            let entry = ListpackEntryInsert::CustomExtendedValue(&array);
+            let encoded = entry.encode().unwrap();
+            let decoded = ListpackEntry::ref_from_slice(encoded.as_slice());
+            let ty = decoded.encoding_type().unwrap();
+            assert_eq!(
+                ty,
+                ListpackEntryEncodingType::ComplexType(
+                    ListpackEntrySubencodingType::CustomExtendedValue
+                )
+            );
+
+            assert_eq!(
+                decoded
+                    .data()
+                    .unwrap()
+                    .get_custom_extended::<'_, &[u8]>()
+                    .unwrap(),
+                &array
+            );
+            assert_eq!(decoded.total_bytes(), 3);
         }
 
         #[test]

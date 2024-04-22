@@ -116,6 +116,47 @@ impl std::fmt::Display for AllocationError {
 
 impl std::error::Error for AllocationError {}
 
+/// An error happening during the conversion of the listpack elements
+/// (entries) to another type.
+#[derive(Debug, Copy, Clone)]
+pub enum TypeConversionError {
+    /// An error indicating that the types are not compatible.
+    WrongTypes {
+        /// The name of the type that was attempted to convert to.
+        target_type: &'static str,
+        /// The type that was in the listpack.
+        encoding_type: crate::ListpackEntryEncodingType,
+    },
+}
+
+impl TypeConversionError {
+    /// Creates a new type conversion error with the provided types.
+    pub fn wrong_types<ToType>(encoding_type: crate::ListpackEntryEncodingType) -> Self {
+        Self::WrongTypes {
+            target_type: std::any::type_name::<ToType>(),
+            encoding_type,
+        }
+    }
+}
+
+impl std::fmt::Display for TypeConversionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::WrongTypes {
+                target_type,
+                encoding_type,
+            } => {
+                write!(
+                    f,
+                    "Wrong types: couldn't convert {encoding_type:?} to {target_type}."
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for TypeConversionError {}
+
 /// The error type for the listpack crate.
 #[derive(Debug, Copy, Clone)]
 pub enum Error {
@@ -154,6 +195,8 @@ pub enum Error {
     Insertion(InsertionError),
     /// An error related to the deletion from the listpack.
     Deletion(DeletionError),
+    /// An error related to the type conversion.
+    TypeConversion(TypeConversionError),
 }
 
 impl From<AllocationError> for Error {
@@ -171,6 +214,12 @@ impl From<InsertionError> for Error {
 impl From<DeletionError> for Error {
     fn from(e: DeletionError) -> Self {
         Error::Deletion(e)
+    }
+}
+
+impl From<TypeConversionError> for Error {
+    fn from(e: TypeConversionError) -> Self {
+        Error::TypeConversion(e)
     }
 }
 
@@ -195,6 +244,7 @@ impl std::fmt::Display for Error {
             Self::Allocation(e) => write!(f, "Allocation error: {e}"),
             Self::Insertion(e) => write!(f, "Insertion error: {e}"),
             Self::Deletion(e) => write!(f, "Deletion error: {e}"),
+            Self::TypeConversion(e) => write!(f, "Type conversion error: {e}"),
         }
     }
 }

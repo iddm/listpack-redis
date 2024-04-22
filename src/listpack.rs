@@ -23,6 +23,7 @@ use crate::{
     },
     error::{AllocationError, Result},
     iter::{ListpackChunks, ListpackIntoIter, ListpackIter, ListpackWindows},
+    ListpackEntryEncodingType,
 };
 
 /// The last byte of the allocator for the listpack should always be
@@ -570,16 +571,15 @@ where
             .map(ListpackEntryInsert::full_encoded_size)
             .sum();
         let mut listpack = Listpack::with_capacity(elements_size);
-        let mut ptr = listpack.allocation.data_start_ptr();
+        let ptr = listpack.allocation.data_start_ptr();
 
-        for item in items {
-            let mut encoded = item.encode().expect("Encoded value");
+        let encoded: Vec<u8> = items
+            .iter()
+            .flat_map(|item| item.encode().expect("Encoded value"))
+            .collect();
 
-            unsafe {
-                std::ptr::copy_nonoverlapping(encoded.as_mut_ptr(), ptr.cast_mut(), encoded.len());
-            }
-
-            ptr = unsafe { ptr.add(encoded.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), ptr.cast_mut(), encoded.len());
         }
 
         listpack.set_num_elements(slice.len() as u16);
@@ -607,19 +607,66 @@ where
             .sum();
 
         let mut listpack = Listpack::with_capacity(elements_size);
-        let mut ptr = listpack.allocation.data_start_ptr();
+        let ptr = listpack.allocation.data_start_ptr();
 
-        for item in items {
-            let mut encoded = item.encode().expect("Encoded value");
+        let encoded: Vec<u8> = items
+            .iter()
+            .flat_map(|item| item.encode().expect("Encoded value"))
+            .collect();
 
-            unsafe {
-                std::ptr::copy_nonoverlapping(encoded.as_mut_ptr(), ptr.cast_mut(), encoded.len());
-            }
-
-            ptr = unsafe { ptr.add(encoded.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), ptr.cast_mut(), encoded.len());
         }
 
         listpack.set_num_elements(N as u16);
+        listpack
+    }
+}
+
+/// Allows to create a listpack from an iterator of insertable entries.
+///
+/// # Example
+///
+/// ```
+/// use listpack_redis::Listpack;
+///
+/// let listpack: Listpack = vec!["Hello", "World"].into_iter().collect();
+/// assert_eq!(listpack, &["Hello", "World"]);
+///
+/// let listpack: Listpack = (0..10).collect();
+/// assert_eq!(listpack.len(), 10);
+/// assert_eq!(listpack, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+/// ```
+impl<'a, T, Allocator> FromIterator<T> for Listpack<Allocator>
+where
+    ListpackEntryInsert<'a>: From<T>,
+    Allocator: ListpackAllocator,
+    <Allocator as CustomAllocator>::Error: Debug,
+{
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let items = iter
+            .into_iter()
+            .map(ListpackEntryInsert::from)
+            .collect::<Vec<_>>();
+        let elements_size: usize = items
+            .iter()
+            .map(ListpackEntryInsert::full_encoded_size)
+            .sum();
+        let items_len = items.len();
+
+        let mut listpack = Listpack::with_capacity(elements_size);
+        let ptr = listpack.allocation.data_start_ptr();
+
+        let encoded: Vec<u8> = items
+            .iter()
+            .flat_map(|item| item.encode().expect("Encoded value"))
+            .collect();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), ptr.cast_mut(), encoded.len());
+        }
+
+        listpack.set_num_elements(items_len as u16);
         listpack
     }
 }
@@ -639,8 +686,14 @@ impl<Allocator> Listpack<Allocator>
 where
     Allocator: CustomAllocator,
 {
-    /// Returns true if the listpack is homogeneous, that is, all the
-    /// elements have the same type.
+    /// Returns `true` if the listpack is homogeneous, that is, all the
+    /// elements have the same type. The type is meant to be the
+    /// encoding type of the elements. That said, there is a difference
+    /// between the small strings, large strings, and integers, and the
+    /// other types, as the [`ListpackEntryEncodingType::SmallString`]
+    /// and [`ListpackEntryEncodingType::LargeString`] are considered
+    /// to be of different types, while the actual data they store is
+    /// the same (still a string).
     ///
     /// In case the listpack is empty, it is considered homogeneous.
     ///
@@ -659,6 +712,9 @@ where
     /// listpack.push(1);
     /// assert!(!listpack.is_homogeneous());
     /// ```
+    ///
+    /// To know the types of the elements, use the
+    /// [`Listpack::get_element_types`] method.
     pub fn is_homogeneous(&self) -> bool {
         if self.is_empty() {
             return true;
@@ -668,6 +724,50 @@ where
         let first = iter.next().map(|e| e.encoding_type().unwrap()).unwrap();
 
         iter.all(|e| e.encoding_type().unwrap() == first)
+    }
+
+    /// Returns the encoding types of the elements of the listpack.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::{Listpack, ListpackEntryEncodingType};
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello");
+    /// listpack.push(1);
+    ///
+    /// let types = listpack.get_element_types();
+    /// assert_eq!(types, vec![ListpackEntryEncodingType::SmallString, ListpackEntryEncodingType::SmallUnsignedInteger]);
+    /// ```
+    pub fn get_element_types(&self) -> Vec<ListpackEntryEncodingType> {
+        self.iter().map(|e| e.encoding_type().unwrap()).collect()
+    }
+
+    /// Returns a vector of elements of the listpack. The elements are
+    /// converted to the type `T` using the [`From`] trait.
+    /// If the listpack is not homogeneous, returns [`None`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello");
+    /// listpack.push("World");
+    ///
+    /// let vec: Vec<String> = listpack.get_homogenous_vec().unwrap();
+    /// assert_eq!(vec, vec!["Hello", "World"]);
+    ///
+    /// listpack.push(1);
+    /// assert!(listpack.get_homogenous_vec::<String>().is_err());
+    /// ```
+    pub fn get_homogenous_vec<'a, T>(&'a self) -> Result<Vec<T>, T::Error>
+    where
+        T: TryFrom<&'a ListpackEntry>,
+    {
+        self.iter().map(T::try_from).collect::<Result<_, _>>()
     }
 
     /// Returns the allocator of the listpack.
@@ -3225,6 +3325,12 @@ mod tests {
             ListpackEntryInsert::Integer(4_088_608),
             ListpackEntryInsert::Integer(1_047_483_648),
             ListpackEntryInsert::Integer(4_023_372_036_854_775_807),
+            ListpackEntryInsert::Boolean(true),
+            ListpackEntryInsert::Boolean(false),
+            ListpackEntryInsert::Float(42.23f64),
+            ListpackEntryInsert::CustomEmbeddedValue(0),
+            ListpackEntryInsert::CustomEmbeddedValue(1),
+            ListpackEntryInsert::CustomExtendedValue(&[0, 1, 2, 3]),
         ];
 
         for object in &objects {
@@ -3241,6 +3347,30 @@ mod tests {
                 }
                 ListpackEntryInsert::String(string) => {
                     assert_eq!(data.get_str().unwrap(), *string, "with object: {object:?}");
+                }
+                ListpackEntryInsert::Boolean(boolean) => {
+                    assert_eq!(
+                        data.get_bool().unwrap(),
+                        *boolean,
+                        "with object: {object:?}"
+                    );
+                }
+                ListpackEntryInsert::Float(float) => {
+                    assert_eq!(data.get_f64().unwrap(), *float, "with object: {object:?}");
+                }
+                ListpackEntryInsert::CustomEmbeddedValue(value) => {
+                    assert_eq!(
+                        data.get_custom_embedded().unwrap(),
+                        *value,
+                        "with object: {object:?}"
+                    );
+                }
+                ListpackEntryInsert::CustomExtendedValue(value) => {
+                    assert_eq!(
+                        data.get_custom_extended::<'_, &[u8]>().unwrap(),
+                        *value,
+                        "with object: {object:?}"
+                    );
                 }
             }
         }
