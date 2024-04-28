@@ -19,7 +19,7 @@ use redis_custom_allocator::{CustomAllocator, MemoryConsumption};
 use crate::{
     allocator::ListpackAllocator,
     entry::{
-        Encode, ListpackEntry, ListpackEntryInsert, ListpackEntryMutable, ListpackEntryRemoved,
+        Encode, ListpackEntryInsert, ListpackEntryMutable, ListpackEntryRef, ListpackEntryRemoved,
     },
     error::{AllocationError, Result},
     iter::{ListpackChunks, ListpackIntoIter, ListpackIter, ListpackWindows},
@@ -765,7 +765,7 @@ where
     /// ```
     pub fn get_homogenous_vec<'a, T>(&'a self) -> Result<Vec<T>, T::Error>
     where
-        T: TryFrom<&'a ListpackEntry>,
+        T: TryFrom<&'a ListpackEntryRef>,
     {
         self.iter().map(T::try_from).collect::<Result<_, _>>()
     }
@@ -956,7 +956,7 @@ where
     pub fn can_fit_entry(
         &self,
         entry: &ListpackEntryInsert,
-        entry_to_replace: Option<&ListpackEntry>,
+        entry_to_replace: Option<&ListpackEntryRef>,
     ) -> Result<FittingRequirement> {
         let object_to_replace_size = entry_to_replace
             .map(|e| e.total_bytes())
@@ -989,13 +989,13 @@ where
 
     /// Returns the first element of the listpack, or [`None`] if it is
     /// empty.
-    pub fn first(&self) -> Option<&ListpackEntry> {
+    pub fn first(&self) -> Option<&ListpackEntryRef> {
         self.get(0)
     }
 
     /// Returns the last element of the listpack, or [`None`] if it is
     /// empty.
-    pub fn last(&self) -> Option<&ListpackEntry> {
+    pub fn last(&self) -> Option<&ListpackEntryRef> {
         self.get(self.len() - 1)
     }
 
@@ -1357,7 +1357,7 @@ where
     /// listpack.push("World");
     /// assert_eq!(listpack.strip_prefix(&["Hello"]), vec!["World"]);
     /// ```
-    pub fn strip_prefix<'a, 'b, T>(&'b self, prefix: &'a [T]) -> Vec<&'b ListpackEntry>
+    pub fn strip_prefix<'a, 'b, T>(&'b self, prefix: &'a [T]) -> Vec<&'b ListpackEntryRef>
     where
         ListpackEntryInsert<'a>: std::convert::From<&'a T>,
     {
@@ -1387,7 +1387,7 @@ where
     /// listpack.push("World");
     /// assert_eq!(listpack.strip_suffix(&["World"]), vec!["Hello"]);
     /// ```
-    pub fn strip_suffix<'a, 'b, T>(&'b mut self, suffix: &'a [T]) -> Vec<&'b ListpackEntry>
+    pub fn strip_suffix<'a, 'b, T>(&'b mut self, suffix: &'a [T]) -> Vec<&'b ListpackEntryRef>
     where
         ListpackEntryInsert<'a>: std::convert::From<&'a T>,
     {
@@ -1827,7 +1827,7 @@ where
             },
         )?;
 
-        let referred_element = ListpackEntry::ref_from_ptr(referred_element_ptr);
+        let referred_element = ListpackEntryRef::ref_from_ptr(referred_element_ptr);
 
         let referred_element_offset_from_start = unsafe {
             referred_element_ptr
@@ -2080,7 +2080,7 @@ where
     /// ```
     pub fn retain<F>(&mut self, mut f: F)
     where
-        F: FnMut(&ListpackEntry) -> bool,
+        F: FnMut(&ListpackEntryRef) -> bool,
     {
         let mut index = 0;
         while index < self.len() {
@@ -2454,9 +2454,9 @@ where
     /// assert_eq!(listpack.get(1).unwrap().data().unwrap().get_small_str().unwrap(), "World");
     /// assert!(listpack.get(2).is_none());
     /// ```
-    pub fn get(&self, index: usize) -> Option<&ListpackEntry> {
+    pub fn get(&self, index: usize) -> Option<&ListpackEntryRef> {
         self.get_internal_entry_ptr(index)
-            .map(ListpackEntry::ref_from_ptr)
+            .map(ListpackEntryRef::ref_from_ptr)
     }
 
     /// Returns a mutable reference to element of the listpack at the
@@ -2476,7 +2476,7 @@ where
     /// ```
     pub fn get_mut(&mut self, index: usize) -> Option<ListpackEntryMutable<Allocator>> {
         self.get_internal_entry_ptr(index).map(|ptr| {
-            let entry = ListpackEntry::ref_from_ptr(ptr);
+            let entry = ListpackEntryRef::ref_from_ptr(ptr);
             ListpackEntryMutable::new(self, entry, index)
         })
     }
@@ -2486,7 +2486,7 @@ impl<Allocator> Index<usize> for Listpack<Allocator>
 where
     Allocator: CustomAllocator,
 {
-    type Output = ListpackEntry;
+    type Output = ListpackEntryRef;
 
     fn index(&self, index: usize) -> &Self::Output {
         self.get(index).expect("Index out of bounds.")
@@ -2538,7 +2538,7 @@ where
                 return Err(crate::error::Error::UnexpectedEndMarker);
             }
 
-            let entry = ListpackEntry::ref_from_slice(data);
+            let entry = ListpackEntryRef::ref_from_slice(data);
             data = &data[entry.total_bytes()..];
             current += 1;
         }
@@ -2594,7 +2594,7 @@ where
                 return None;
             }
 
-            let entry = ListpackEntry::ref_from_slice(data);
+            let entry = ListpackEntryRef::ref_from_slice(data);
             data = data[entry.total_bytes()..].try_into().unwrap();
             current += 1;
         }
@@ -2725,7 +2725,7 @@ where
                 }
 
                 let entry =
-                    ListpackEntry::ref_from_ptr(unsafe { NonNull::new_unchecked(till_ptr) });
+                    ListpackEntryRef::ref_from_ptr(unsafe { NonNull::new_unchecked(till_ptr) });
 
                 till_ptr = unsafe { till_ptr.add(entry.total_bytes()) };
                 bytes += entry.total_bytes();

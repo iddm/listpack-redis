@@ -2,7 +2,7 @@
 
 use redis_custom_allocator::CustomAllocator;
 
-use crate::{Listpack, ListpackEntry, ListpackEntryRemoved};
+use crate::{Listpack, ListpackEntryRef, ListpackEntryRemoved};
 
 /// An iterator over the elements of a listpack.
 ///
@@ -32,7 +32,7 @@ impl<'a, Allocator> Iterator for ListpackIter<'a, Allocator>
 where
     Allocator: CustomAllocator,
 {
-    type Item = &'a ListpackEntry;
+    type Item = &'a ListpackEntryRef;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index >= self.listpack.len() {
@@ -180,7 +180,7 @@ impl<'a, Allocator> Iterator for ListpackWindows<'a, Allocator>
 where
     Allocator: CustomAllocator,
 {
-    type Item = Vec<&'a ListpackEntry>;
+    type Item = Vec<&'a ListpackEntryRef>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index + self.size > self.listpack.len() {
@@ -278,7 +278,7 @@ impl<'a, Allocator> Iterator for ListpackChunks<'a, Allocator>
 where
     Allocator: CustomAllocator,
 {
-    type Item = Vec<&'a ListpackEntry>;
+    type Item = Vec<&'a ListpackEntryRef>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index >= self.listpack.len() {
