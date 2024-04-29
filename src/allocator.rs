@@ -41,12 +41,6 @@ impl CustomAllocator for DefaultAllocator {
     }
 }
 
-// /// The allocator requirements for the listpack allocator.
-// pub trait ListpackAllocator<AllocatorError: Debug>:
-//     CustomAllocator<Error = AllocatorError> + Default + Debug + Clone
-// {
-// }
-
 /// The allocator requirements for the listpack allocator.
 pub trait ListpackAllocator: CustomAllocator + Default + Debug + Clone
 where
@@ -54,4 +48,11 @@ where
 {
 }
 
-impl ListpackAllocator for DefaultAllocator {}
+/// Automatically implement the [`ListpackAllocator`] trait for all
+/// types that are suitable to be used as such.
+impl<T> ListpackAllocator for T
+where
+    T: CustomAllocator + Default + Debug + Clone,
+    <T as CustomAllocator>::Error: Debug,
+{
+}

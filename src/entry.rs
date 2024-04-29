@@ -1427,7 +1427,7 @@ impl ListpackEntryRef {
 
 /// An owned, allowed-to-be-cloned version of the [`ListpackEntryRef`].
 #[repr(transparent)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ListpackEntry(NonNull<[u8]>);
 
 impl ListpackEntry {
@@ -1455,6 +1455,12 @@ impl Deref for ListpackEntry {
 
 impl Borrow<ListpackEntryRef> for ListpackEntry {
     fn borrow(&self) -> &ListpackEntryRef {
+        ListpackEntryRef::ref_from_ptr(self.0.cast())
+    }
+}
+
+impl AsRef<ListpackEntryRef> for ListpackEntry {
+    fn as_ref(&self) -> &ListpackEntryRef {
         ListpackEntryRef::ref_from_ptr(self.0.cast())
     }
 }
