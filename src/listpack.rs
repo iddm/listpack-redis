@@ -2692,6 +2692,10 @@ where
     pub fn try_remove_range(&mut self, range: std::ops::Range<usize>) -> Result {
         let length = range.len();
 
+        if range.is_empty() {
+            return Ok(());
+        }
+
         if range.end > self.len() {
             return Err(crate::error::DeletionError::IndexOutOfBounds {
                 start_index: range.start,
@@ -2764,6 +2768,36 @@ where
         self.set_num_elements((self.len() - range.count()) as u16);
 
         Ok(())
+    }
+
+    /// Removes all the elements outside of the range provided. Sort of
+    /// an inverse of [`Self::try_remove_range`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use listpack_redis::Listpack;
+    ///
+    /// let mut listpack: Listpack = Listpack::default();
+    /// listpack.push("Hello, world!");
+    /// listpack.push("Hello!");
+    /// listpack.push("World!");
+    ///
+    /// listpack.keep_range(1..3);
+    ///
+    /// assert_eq!(listpack.len(), 2);
+    /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello!");
+    /// assert_eq!(listpack.get(1).unwrap().to_string(), "World!");
+    /// ```
+    pub fn try_keep_range(&mut self, range: std::ops::Range<usize>) -> Result {
+        self.try_remove_range(range.end..self.len())
+            .and_then(|_| self.try_remove_range(0..range.start))
+    }
+
+    /// A safe version of [`Self::keep_range`].
+    pub fn keep_range(&mut self, range: std::ops::Range<usize>) {
+        self.try_keep_range(range)
+            .expect("Keep the range of elements.");
     }
 
     /// Inserts an element at the given index into the listpack, after
