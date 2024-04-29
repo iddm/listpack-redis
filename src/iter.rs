@@ -372,8 +372,7 @@ where
     Allocator: CustomAllocator,
 {
     fn drop(&mut self) {
-        self.listpack
-            .remove_range(self.start, self.end - self.start);
+        self.listpack.remove_range(self.start..self.end);
     }
 }
 //

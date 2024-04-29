@@ -1670,8 +1670,8 @@ where
         }
 
         let start = len;
-        let length = self.len() - len;
-        self.remove_range(start, length);
+        let end = self.len();
+        self.remove_range(start..end);
     }
 
     /// Clears the entire listpack. Same as calling [`Self::truncate()`]
@@ -2052,7 +2052,7 @@ where
     /// ```
     pub fn remove(&mut self, index: usize) -> ListpackEntryRemoved {
         let removed = self.get(index).unwrap().into();
-        self.remove_range(index, 1);
+        self.remove_range(index..(index + 1));
         removed
     }
 
@@ -2207,7 +2207,7 @@ where
             .map(ListpackEntryRemoved::from)
             .collect::<Vec<_>>();
 
-        self.remove_range(start, length);
+        self.remove_range(start..end);
 
         removed_elements.into_iter()
     }
@@ -2678,21 +2678,23 @@ where
     /// listpack.push("World!");
     /// assert_eq!(listpack.len(), 3);
     /// assert_eq!(listpack.get_storage_bytes(), 38);
-    /// listpack.remove_range(1, 2);
+    /// listpack.remove_range(1..3);
     /// assert_eq!(listpack.len(), 1);
     /// assert_eq!(listpack.get_storage_bytes(), 22);
     /// assert_eq!(listpack.get(0).unwrap().to_string(), "Hello, world!");
     /// ```
-    pub fn remove_range(&mut self, start: usize, length: usize) {
-        self.try_remove_range(start, length)
+    pub fn remove_range(&mut self, range: std::ops::Range<usize>) {
+        self.try_remove_range(range)
             .expect("Remove the range of elements.");
     }
 
     /// A safe version of [`Self::remove_range`].
-    pub fn try_remove_range(&mut self, start: usize, length: usize) -> Result {
-        if start + length > self.len() {
+    pub fn try_remove_range(&mut self, range: std::ops::Range<usize>) -> Result {
+        let length = range.len();
+
+        if range.end > self.len() {
             return Err(crate::error::DeletionError::IndexOutOfBounds {
-                start_index: start,
+                start_index: range.start,
                 delete_count: length,
                 length: self.len(),
             }
@@ -2701,10 +2703,10 @@ where
 
         // 1. Position a pointer to the start of the range.
         let start_element_ptr =
-            self.get_internal_entry_ptr(start)
+            self.get_internal_entry_ptr(range.start)
                 .ok_or(crate::error::Error::Deletion(
                     crate::error::DeletionError::IndexOutOfBounds {
-                        start_index: start,
+                        start_index: range.start,
                         delete_count: length,
                         length: self.len(),
                     },
@@ -2759,7 +2761,7 @@ where
                 size: length_to_delete,
             })?;
 
-        self.set_num_elements((self.len() - length) as u16);
+        self.set_num_elements((self.len() - range.count()) as u16);
 
         Ok(())
     }
