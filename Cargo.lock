@@ -214,7 +214,7 @@ dependencies = [
 [[package]]
 name = "redis-custom-allocator"
 version = "0.1.0"
-source = "git+https://github.com/iddm/redis-custom-allocator#0f0f8ca089af41dc9feb6761ea13ec426e7342d6"
+source = "git+https://github.com/iddm/redis-custom-allocator#661d1ec0b0924ecd40a17f0bde3049caca5fb1f8"
 
 [[package]]
 name = "regex"
