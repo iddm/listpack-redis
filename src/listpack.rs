@@ -10,6 +10,7 @@
 use std::{
     alloc::Layout,
     fmt::{Debug, Write},
+    hash::Hash,
     ops::{Deref, DerefMut, Index, RangeBounds},
     ptr::NonNull,
 };
@@ -272,7 +273,7 @@ impl ListpackHeaderRef<'_> {
 
 /// A pointer to the allocation of the listpack. It will contain the
 /// header, the data block (including the elements), and the end marker.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 struct ListpackAllocationPointer(NonNull<[u8]>, Layout);
 
 impl ListpackAllocationPointer {
@@ -421,6 +422,15 @@ where
 {
     fn default() -> Self {
         Self::with_capacity(0)
+    }
+}
+
+impl<Allocator> Hash for Listpack<Allocator>
+where
+    Allocator: CustomAllocator,
+{
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.allocation.hash(state);
     }
 }
 
@@ -3366,11 +3376,11 @@ mod tests {
             ListpackEntryInsert::Float(42.23f64),
             ListpackEntryInsert::CustomEmbeddedValue(0),
             ListpackEntryInsert::CustomEmbeddedValue(1),
-            ListpackEntryInsert::CustomExtendedValue(&[0, 1, 2, 3]),
+            ListpackEntryInsert::CustomExtendedValueSlice(&[0, 1, 2, 3]),
         ];
 
         for object in &objects {
-            listpack.replace(0, *object);
+            listpack.replace(0, object.clone());
             let entry = listpack.get(0).unwrap();
             let data = entry.data().unwrap();
             match object {
@@ -3401,7 +3411,14 @@ mod tests {
                         "with object: {object:?}"
                     );
                 }
-                ListpackEntryInsert::CustomExtendedValue(value) => {
+                ListpackEntryInsert::CustomExtendedValueSlice(value) => {
+                    assert_eq!(
+                        data.get_custom_extended::<'_, &[u8]>().unwrap(),
+                        *value,
+                        "with object: {object:?}"
+                    );
+                }
+                ListpackEntryInsert::CustomExtendedValueOwned(value) => {
                     assert_eq!(
                         data.get_custom_extended::<'_, &[u8]>().unwrap(),
                         *value,

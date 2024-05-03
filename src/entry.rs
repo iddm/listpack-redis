@@ -200,7 +200,7 @@ impl From<ListpackEntryEncodingType> for u8 {
 }
 
 /// The meaning of the encoding byte.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub enum ListpackEntryData<'a> {
     /// See [`ListpackEntryEncodingType::SmallUnsignedInteger`].
     SmallUnsignedInteger(u8),
@@ -227,7 +227,15 @@ pub enum ListpackEntryData<'a> {
     /// See [`ListpackEntrySubencodingType::CustomEmbeddedValue`].
     CustomEmbeddedValue(u8),
     /// See [`ListpackEntrySubencodingType::CustomExtendedValue`].
-    CustomExtendedValue(&'a [u8]),
+    CustomExtendedValueSlice(&'a [u8]),
+    /// See [`ListpackEntrySubencodingType::CustomExtendedValue`].
+    /// The difference between this and the `CustomExtendedValueSlice`
+    /// is that this variant owns the data, while the other borrows it.
+    ///
+    /// This is useful when the data is not available anymore after the
+    /// encoding, or when the data is not available at the time of the
+    /// encoding.
+    CustomExtendedValueOwned(Vec<u8>),
 }
 
 impl ListpackEntryData<'_> {
@@ -268,9 +276,12 @@ impl ListpackEntryData<'_> {
             ListpackEntryData::CustomEmbeddedValue(_) => ListpackEntryEncodingType::ComplexType(
                 ListpackEntrySubencodingType::CustomEmbeddedValue,
             ),
-            ListpackEntryData::CustomExtendedValue(_) => ListpackEntryEncodingType::ComplexType(
-                ListpackEntrySubencodingType::CustomExtendedValue,
-            ),
+            ListpackEntryData::CustomExtendedValueSlice(_)
+            | ListpackEntryData::CustomExtendedValueOwned(_) => {
+                ListpackEntryEncodingType::ComplexType(
+                    ListpackEntrySubencodingType::CustomExtendedValue,
+                )
+            }
         }
     }
 
@@ -400,7 +411,7 @@ impl ListpackEntryData<'_> {
     /// }
     ///
     /// let s = CustomValue("Hello, World!".to_owned());
-    /// let entry = ListpackEntryData::CustomExtendedValue(s.0.as_bytes());
+    /// let entry = ListpackEntryData::CustomExtendedValueSlice(s.0.as_bytes());
     /// let value = entry.get_custom_extended::<CustomValue>().unwrap();
     ///
     /// assert_eq!(value, s);
@@ -410,7 +421,7 @@ impl ListpackEntryData<'_> {
         T: From<&'a [u8]>,
     {
         match self {
-            ListpackEntryData::CustomExtendedValue(v) => Some(T::from(v)),
+            ListpackEntryData::CustomExtendedValueSlice(v) => Some(T::from(v)),
             _ => None,
         }
     }
@@ -422,14 +433,14 @@ impl ListpackEntryData<'_> {
     /// ```
     /// use listpack_redis::ListpackEntryData;
     ///
-    /// let entry = ListpackEntryData::CustomExtendedValue(&[1, 2, 3, 4]);
+    /// let entry = ListpackEntryData::CustomExtendedValueSlice(&[1, 2, 3, 4]);
     /// let value = entry.get_custom_extended_raw().unwrap();
     ///
     /// assert_eq!(value, &[1, 2, 3, 4]);
     /// ```
     pub fn get_custom_extended_raw(&self) -> Option<&[u8]> {
         match self {
-            ListpackEntryData::CustomExtendedValue(v) => Some(v),
+            ListpackEntryData::CustomExtendedValueSlice(v) => Some(v),
             _ => None,
         }
     }
@@ -446,7 +457,7 @@ impl ListpackEntryData<'_> {
 
     /// Returns `true` if the entry is a custom extended value.
     pub fn is_custom_extended(&self) -> bool {
-        matches!(self, ListpackEntryData::CustomExtendedValue(_))
+        matches!(self, ListpackEntryData::CustomExtendedValueSlice(_))
     }
 
     /// Returns `true` if the entry is a small unsigned integer.
@@ -798,7 +809,31 @@ impl<'a> Encode for ListpackEntryData<'a> {
                 block.append(&mut length);
                 block
             }
-            Self::CustomExtendedValue(v) => {
+            Self::CustomExtendedValueSlice(v) => {
+                let mut block = vec![encoding_type_byte];
+
+                let data_length = v.len();
+
+                if data_length > 0 {
+                    let data_length_length = count_bytes_in_number(data_length) as u8;
+                    block.push(data_length_length);
+
+                    let mut data_length_length_bytes = data_length.to_le_bytes().to_vec();
+                    while let Some(0) = data_length_length_bytes.last() {
+                        data_length_length_bytes.pop();
+                    }
+
+                    block.append(&mut data_length_length_bytes);
+                    block.append(&mut v.to_vec());
+                } else {
+                    block.push(0);
+                }
+
+                let mut length = encode_total_element_length(block.len())?;
+                block.append(&mut length);
+                block
+            }
+            Self::CustomExtendedValueOwned(v) => {
                 let mut block = vec![encoding_type_byte];
 
                 let data_length = v.len();
@@ -835,19 +870,20 @@ impl From<ListpackEntryData<'_>> for ListpackEntryEncodingType {
 impl std::fmt::Display for ListpackEntryData<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ListpackEntryData::SmallUnsignedInteger(u) => write!(f, "{u}"),
-            ListpackEntryData::SmallString(s) => write!(f, "{s}"),
-            ListpackEntryData::SignedInteger13Bit(i) => write!(f, "{i}"),
-            ListpackEntryData::MediumString(s) => write!(f, "{s}"),
-            ListpackEntryData::LargeString(s) => write!(f, "{s}"),
-            ListpackEntryData::SignedInteger16Bit(i) => write!(f, "{i}"),
-            ListpackEntryData::SignedInteger24Bit(i) => write!(f, "{i}"),
-            ListpackEntryData::SignedInteger32Bit(i) => write!(f, "{i}"),
-            ListpackEntryData::SignedInteger64Bit(i) => write!(f, "{i}"),
-            ListpackEntryData::FloatingPoint64Bit(v) => write!(f, "{v}"),
-            ListpackEntryData::Boolean(b) => write!(f, "{b}"),
-            ListpackEntryData::CustomEmbeddedValue(v) => write!(f, "{v}"),
-            ListpackEntryData::CustomExtendedValue(v) => write!(f, "{v:?}"),
+            Self::SmallUnsignedInteger(u) => write!(f, "{u}"),
+            Self::SmallString(s) => write!(f, "{s}"),
+            Self::SignedInteger13Bit(i) => write!(f, "{i}"),
+            Self::MediumString(s) => write!(f, "{s}"),
+            Self::LargeString(s) => write!(f, "{s}"),
+            Self::SignedInteger16Bit(i) => write!(f, "{i}"),
+            Self::SignedInteger24Bit(i) => write!(f, "{i}"),
+            Self::SignedInteger32Bit(i) => write!(f, "{i}"),
+            Self::SignedInteger64Bit(i) => write!(f, "{i}"),
+            Self::FloatingPoint64Bit(v) => write!(f, "{v}"),
+            Self::Boolean(b) => write!(f, "{b}"),
+            Self::CustomEmbeddedValue(v) => write!(f, "{v}"),
+            Self::CustomExtendedValueSlice(v) => write!(f, "{v:?}"),
+            Self::CustomExtendedValueOwned(v) => write!(f, "{v:?}"),
         }
     }
 }
@@ -867,7 +903,7 @@ impl<'a> TryFrom<&'a ListpackEntryData<'a>> for ListpackEntryInsert<'a> {
         } else if let Some(data) = data.get_custom_embedded() {
             Ok(Self::CustomEmbeddedValue(data))
         } else if let Some(data) = data.get_custom_extended() {
-            Ok(Self::CustomExtendedValue(data))
+            Ok(Self::CustomExtendedValueSlice(data))
         } else {
             Err(crate::error::Error::UnknownEncodingType {
                 encoding_byte: data.encoding_type().into(),
@@ -989,7 +1025,13 @@ impl From<bool> for ListpackEntryData<'_> {
 
 impl<'a> From<&'a [u8]> for ListpackEntryData<'a> {
     fn from(v: &'a [u8]) -> Self {
-        Self::CustomExtendedValue(v)
+        Self::CustomExtendedValueSlice(v)
+    }
+}
+
+impl From<Vec<u8>> for ListpackEntryData<'_> {
+    fn from(v: Vec<u8>) -> Self {
+        Self::CustomExtendedValueOwned(v)
     }
 }
 
@@ -1001,7 +1043,22 @@ impl<'a> From<ListpackEntryInsert<'a>> for ListpackEntryData<'a> {
             ListpackEntryInsert::Float(f) => Self::from(f),
             ListpackEntryInsert::Boolean(b) => Self::from(b),
             ListpackEntryInsert::CustomEmbeddedValue(v) => Self::CustomEmbeddedValue(v),
-            ListpackEntryInsert::CustomExtendedValue(v) => Self::from(v),
+            ListpackEntryInsert::CustomExtendedValueSlice(v) => Self::from(v),
+            ListpackEntryInsert::CustomExtendedValueOwned(v) => Self::from(v),
+        }
+    }
+}
+
+impl<'a> From<&'a ListpackEntryInsert<'a>> for ListpackEntryData<'a> {
+    fn from(insert: &'a ListpackEntryInsert<'a>) -> Self {
+        match insert {
+            ListpackEntryInsert::String(s) => Self::from(*s),
+            ListpackEntryInsert::Integer(i) => Self::from(*i),
+            ListpackEntryInsert::Float(f) => Self::from(*f),
+            ListpackEntryInsert::Boolean(b) => Self::from(*b),
+            ListpackEntryInsert::CustomEmbeddedValue(v) => Self::CustomEmbeddedValue(*v),
+            ListpackEntryInsert::CustomExtendedValueSlice(v) => Self::from(*v),
+            ListpackEntryInsert::CustomExtendedValueOwned(v) => Self::from(v.to_owned()),
         }
     }
 }
@@ -1409,7 +1466,7 @@ impl ListpackEntryRef {
                     let data = self
                         .get_data_raw()
                         .ok_or(crate::error::Error::MissingDataBlock)?;
-                    ListpackEntryData::CustomExtendedValue(data)
+                    ListpackEntryData::CustomExtendedValueSlice(data)
                 }
             },
         })
@@ -1537,7 +1594,8 @@ impl PartialEq<ListpackEntryInsert<'_>> for ListpackEntryRef {
             ListpackEntryInsert::Float(f) => self == f,
             ListpackEntryInsert::Boolean(b) => self == b,
             ListpackEntryInsert::CustomEmbeddedValue(v) => *self == *v,
-            ListpackEntryInsert::CustomExtendedValue(v) => *self == *v,
+            ListpackEntryInsert::CustomExtendedValueSlice(v) => *self == *v,
+            ListpackEntryInsert::CustomExtendedValueOwned(v) => *self == &v[..],
         }
     }
 }
@@ -1550,7 +1608,8 @@ impl PartialEq<ListpackEntryInsert<'_>> for &ListpackEntryRef {
             ListpackEntryInsert::Float(f) => *self == f,
             ListpackEntryInsert::Boolean(b) => *self == b,
             ListpackEntryInsert::CustomEmbeddedValue(v) => **self == *v,
-            ListpackEntryInsert::CustomExtendedValue(v) => **self == *v,
+            ListpackEntryInsert::CustomExtendedValueSlice(v) => **self == *v,
+            ListpackEntryInsert::CustomExtendedValueOwned(v) => **self == &v[..],
         }
     }
 }
@@ -1714,7 +1773,7 @@ impl TryFrom<&ListpackEntryRef> for u8 {
 }
 
 /// The allowed types to be inserted into a listpack.
-#[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
 pub enum ListpackEntryInsert<'a> {
     /// A string to insert into a listpack.
     String(&'a str),
@@ -1726,8 +1785,10 @@ pub enum ListpackEntryInsert<'a> {
     Boolean(bool),
     /// A custom value to be embedded into an entry in a listpack.
     CustomEmbeddedValue(u8),
-    /// A bigger custom value to be inserted into a listpack.
-    CustomExtendedValue(&'a [u8]),
+    /// A bigger custom value to be inserted into a listpack (a slice).
+    CustomExtendedValueSlice(&'a [u8]),
+    /// A bigger custom value to be inserted into a listpack (owned).
+    CustomExtendedValueOwned(Vec<u8>),
 }
 
 impl ListpackEntryInsert<'_> {
@@ -1819,7 +1880,21 @@ impl ListpackEntryInsert<'_> {
                 // 1: total-byte-length of one byte.
                 2
             }
-            Self::CustomExtendedValue(v) => {
+            Self::CustomExtendedValueSlice(v) => {
+                // 1: encoding byte.
+                // 1: the length of the extended value (m).
+                // 1-m: the extended value length.
+                // n: the extended value.
+                // 1: total-byte-length of one byte.
+                if v.is_empty() {
+                    3
+                } else {
+                    let data_length = v.len();
+                    let extended_length = count_bytes_in_number(data_length);
+                    2 + extended_length + data_length + 1
+                }
+            }
+            Self::CustomExtendedValueOwned(v) => {
                 // 1: encoding byte.
                 // 1: the length of the extended value (m).
                 // 1-m: the extended value length.
@@ -1839,7 +1914,7 @@ impl ListpackEntryInsert<'_> {
 
 impl<'a> Encode for ListpackEntryInsert<'a> {
     fn encode(&self) -> Result<Vec<u8>> {
-        ListpackEntryData::from(*self).encode()
+        ListpackEntryData::from(self).encode()
     }
 }
 
@@ -2002,7 +2077,8 @@ impl From<&ListpackEntryRef> for ListpackEntryRemoved {
             ListpackEntryData::FloatingPoint64Bit(n) => Self::Float(n),
             ListpackEntryData::Boolean(b) => Self::Boolean(b),
             ListpackEntryData::CustomEmbeddedValue(v) => Self::CustomEmbeddedValue(v),
-            ListpackEntryData::CustomExtendedValue(v) => Self::CustomExtendedValue(v.to_vec()),
+            ListpackEntryData::CustomExtendedValueSlice(v) => Self::CustomExtendedValue(v.to_vec()),
+            ListpackEntryData::CustomExtendedValueOwned(v) => Self::CustomExtendedValue(v),
         }
     }
 }
@@ -2015,7 +2091,7 @@ impl<'a> From<&'a ListpackEntryRemoved> for ListpackEntryInsert<'a> {
             ListpackEntryRemoved::Float(n) => Self::Float(*n),
             ListpackEntryRemoved::Boolean(b) => Self::Boolean(*b),
             ListpackEntryRemoved::CustomEmbeddedValue(v) => Self::CustomEmbeddedValue(*v),
-            ListpackEntryRemoved::CustomExtendedValue(v) => Self::CustomExtendedValue(v),
+            ListpackEntryRemoved::CustomExtendedValue(v) => Self::CustomExtendedValueSlice(v),
         }
     }
 }
@@ -2232,7 +2308,7 @@ mod tests {
         #[test]
         fn entry_custom_extended_non_empty() {
             let array = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-            let entry = ListpackEntryInsert::CustomExtendedValue(&array);
+            let entry = ListpackEntryInsert::CustomExtendedValueSlice(&array);
             let encoded = entry.encode().unwrap();
             let decoded = ListpackEntryRef::ref_from_slice(encoded.as_slice());
             let ty = decoded.encoding_type().unwrap();
@@ -2256,7 +2332,7 @@ mod tests {
         #[test]
         fn entry_custom_extended_empty() {
             let array = [];
-            let entry = ListpackEntryInsert::CustomExtendedValue(&array);
+            let entry = ListpackEntryInsert::CustomExtendedValueSlice(&array);
             let encoded = entry.encode().unwrap();
             let decoded = ListpackEntryRef::ref_from_slice(encoded.as_slice());
             let ty = decoded.encoding_type().unwrap();
