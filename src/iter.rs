@@ -375,7 +375,7 @@ where
         self.listpack.remove_range(self.start..self.end);
     }
 }
-//
+
 // /// A mutable iterator over the elements of a listpack.
 // ///
 // /// # Example
@@ -398,7 +398,7 @@ where
 // }
 
 // impl<'a> Iterator for ListpackIterMut<'a> {
-//     type Item = ListpackEntryMutable<'a>;
+//     type Item = ListpackEntryRef<'a>;
 
 //     fn next(&mut self) -> Option<Self::Item> {
 //         if self.index >= self.listpack.len() {

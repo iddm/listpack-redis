@@ -19,12 +19,11 @@ use redis_custom_allocator::{CustomAllocator, MemoryConsumption};
 
 use crate::{
     allocator::ListpackAllocator,
-    compression::Encode,
     compression::TryEncode,
-    entry::{ListpackEntryInsert, ListpackEntryMutable, ListpackEntryRef, ListpackEntryRemoved},
+    entry::{ListpackEntryInsert, ListpackEntryRef, ListpackEntryRemoved},
     error::{AllocationError, Result},
     iter::{ListpackChunks, ListpackIntoIter, ListpackIter, ListpackWindows},
-    ListpackEntryEncodingType,
+    ListpackEntryEncodingType, ListpackEntryMutable,
 };
 
 /// The last byte of the allocator for the listpack should always be
@@ -2430,7 +2429,7 @@ where
     //     cloned
     // }
 
-    // // TODO: doc
+    // TODO: implement
     // /// Returns an iterator over the elements of the listpack.
     // pub fn iter_mut(&mut self) -> ListpackIterMut {
     //     ListpackIterMut {

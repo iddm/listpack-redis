@@ -5,7 +5,7 @@ use std::{borrow::Borrow, ops::Deref, ptr::NonNull};
 use redis_custom_allocator::{CustomAllocator, MemoryConsumption};
 
 use crate::{
-    compression::{Encode, TryEncode},
+    compression::{AsSevenBitVariableLengthIntegerReversed, Encode, TryEncode},
     error::Result,
     Listpack,
 };
@@ -538,12 +538,9 @@ fn encode_total_element_length(length: usize) -> Result<Vec<u8>> {
         });
     }
 
-    length.try_encode().map(|mut bytes| {
-        // The total-element-length byte(s) are encoded from right to
-        // left, so we need to reverse the bytes.
-        bytes.reverse();
-        bytes
-    })
+    Ok(length
+        .as_seven_bit_variable_length_integer_reversed()
+        .get_bytes())
 }
 
 /// Returns the number of bytes the `total-element-length` part of the
@@ -1242,6 +1239,17 @@ impl ListpackEntryRef {
                 }
             },
         }
+    }
+
+    /// Returns `true` if this entry can be replaced in place with a new
+    /// data block of the same or smaller size. The unused space, if
+    /// any, will be unused.
+    pub fn can_be_replace_in_place(&self, new_data_length: usize) -> bool {
+        let current_data_length = self.get_data_raw().map(|data| data.len()).unwrap_or(0);
+        let current_total_bytes = self.total_bytes();
+        let new_total_bytes = current_total_bytes + new_data_length - current_data_length;
+
+        new_total_bytes <= current_total_bytes
     }
 
     /// Returns the dedicated data block of the entry, if there is one.
@@ -2080,6 +2088,20 @@ where
         self.listpack.replace(self.index, entry);
     }
 
+    // /// Attempts to replace an entry without a reallocation.
+    // pub fn replace_in_place<T>(&mut self, value: T) -> bool
+    // where
+    //     ListpackEntryInsert<'a>: std::convert::From<T>,
+    // {
+    //     let entry = ListpackEntryInsert::from(value);
+    //     if self.can_be_replace_in_place(entry.full_encoded_size()) {
+    //         self.listpack.replace_in_place(self.index, entry);
+    //         true
+    //     } else {
+    //         false
+    //     }
+    // }
+
     /// Returns a reference to this entry.
     pub fn get(&self) -> &ListpackEntryRef {
         self.entry
@@ -2366,5 +2388,17 @@ mod tests {
                 large_string,
             );
         }
+    }
+
+    #[test]
+    fn can_be_replaced_in_place() {
+        let large_string = "a".repeat(MEDIUM_STRING_MAXIMUM_LENGTH + 1);
+        let entry = ListpackEntryInsert::String(&large_string);
+        let encoded = entry.try_encode().unwrap();
+        let decoded = ListpackEntryRef::ref_from_slice(encoded.as_slice());
+        assert!(decoded.can_be_replace_in_place(0));
+        assert!(decoded.can_be_replace_in_place(1));
+        assert!(decoded.can_be_replace_in_place(MEDIUM_STRING_MAXIMUM_LENGTH - 1));
+        assert!(decoded.can_be_replace_in_place(MEDIUM_STRING_MAXIMUM_LENGTH));
     }
 }
