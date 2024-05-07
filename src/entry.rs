@@ -12,6 +12,7 @@ use crate::{
 
 const SMALL_STRING_MAXIMUM_LENGTH: usize = 63;
 const MEDIUM_STRING_MAXIMUM_LENGTH: usize = 4095;
+const MAXIMUM_TOTAL_ELEMENT_LENGTH: usize = 34359738367;
 
 /// The subencoding type of a listpack entry.
 /// The subencoding is the encoding of a listpack entry, which is
@@ -527,90 +528,21 @@ impl ListpackEntryData<'_> {
 ///
 /// The value does not include the total-element-length byte(s) itself.
 fn encode_total_element_length(length: usize) -> Result<Vec<u8>> {
-    Ok(match length {
-        // 1. If it fits into a 7-bit integer, store it as a single byte.
-        //
-        // 2. If it doesn't fit into 7 bits, but fits into 14 bits, store
-        // it as a two-byte integer, with the first byte having the
-        // highest bit set to zero and the highest 7 bits of the value,
-        // and the second byte having the highest bit set to 1 and the
-        // lowest 7 bits of the value.
-        //
-        // 3. If it doesn't fit into 14 bits, but fits into 21 bits, store
-        // it as a three-byte integer, with the first byte having the
-        // highest bit set to 0 and the lowest 7 bits to the highest 7
-        // bits of the value, the second byte having the highest bit set
-        // to 1 and the further lowest 7 bits of the value, and the
-        // third byte having the highest bit set to 1 and the lowest 7
-        // bits of the value.
-        //
-        // 4. If it doesn't fit into 21 bits, but fits into 28 bits,
-        // store it as a four-byte integer, with the first byte having
-        // the highest bit set to 0 and the lowest 7 bits to the highest
-        // 7 bits of the value, the second byte having the highest bit
-        // set to 1 and the further lowest 7 bits of the value, the third
-        // byte having the highest bit set to 1 and the further lowest 7
-        // bits of the value, and the fourth byte having the highest bit
-        // set to 1 and the lowest 7 bits of the value.
-        //
-        // 5. If it doesn't fit into 28 bits, but fits into 35 bits, store
-        // it as a five-byte integer, with the first byte having the
-        // highest bit set to 0 and the lowest 7 bits to the highest 7
-        // bits of the value, the second byte having the highest bit set
-        // to 1 and the further lowest 7 bits of the value, the third
-        // byte having the highest bit set to 1 and the further lowest 7
-        // bits of the value, the fourth byte having the highest bit set
-        // to 1 and the further lowest 7 bits of the value, and the fifth
-        // byte having the highest bit set to 1 and the lowest 7 bits of
-        // the value.
-        0..=127 => vec![length as u8],
-        128..=16383 => {
-            let mut data = vec![(length >> 7) as u8, (length & 0b0111_1111) as u8];
-            data[1] |= 0b1000_0000;
-            data
-        }
-        16384..=2097151 => {
-            let mut data = vec![
-                (length >> 14) as u8,
-                ((length >> 7) & 0b01111111) as u8,
-                (length & 0b01111111) as u8,
-            ];
-            data[1] |= 0b1000_0000;
-            data[2] |= 0b1000_0000;
-            data
-        }
-        2097152..=268435455 => {
-            let mut data = vec![
-                (length >> 21) as u8,
-                ((length >> 14) & 0b0111_1111) as u8,
-                ((length >> 7) & 0b0111_1111) as u8,
-                (length & 0b0111_1111) as u8,
-            ];
-            data[1] |= 0b1000_0000;
-            data[2] |= 0b1000_0000;
-            data[3] |= 0b1000_0000;
-            data
-        }
-        268435456..=34359738367 => {
-            let mut data = vec![
-                (length >> 28) as u8,
-                ((length >> 21) & 0b0111_1111) as u8,
-                ((length >> 14) & 0b0111_1111) as u8,
-                ((length >> 7) & 0b0111_1111) as u8,
-                (length & 0b0111_1111) as u8,
-            ];
-            data[1] |= 0b1000_0000;
-            data[2] |= 0b1000_0000;
-            data[3] |= 0b1000_0000;
-            data[4] |= 0b1000_0000;
-            data
-        }
-        _ => {
-            return Err(crate::error::Error::ObjectIsTooBigForEncoding {
-                size: length,
-                max_size: 34359738367,
-            })
-        }
+    // According to the original specification, we must limit the
+    // encoding of a total element length greater than the allowed
+    // value.
+    if length > MAXIMUM_TOTAL_ELEMENT_LENGTH {
+        return Err(crate::error::Error::ObjectIsTooBigForEncoding {
+            size: length,
+            max_size: MAXIMUM_TOTAL_ELEMENT_LENGTH,
+        });
+    }
+
+    length.try_encode().map(|mut bytes| {
+        // The total-element-length byte(s) are encoded from right to
+        // left, so we need to reverse the bytes.
+        bytes.reverse();
+        bytes
     })
 }
 
