@@ -272,20 +272,19 @@ impl ListpackHeaderRef<'_> {
 
 /// A pointer to the allocation of the listpack. It will contain the
 /// header, the data block (including the elements), and the end marker.
+#[repr(transparent)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-struct ListpackAllocationPointer(NonNull<[u8]>, Layout);
+struct ListpackAllocationPointer(NonNull<[u8]>);
 
 impl ListpackAllocationPointer {
     /// Finds out the layout of the listpack by looking for the end
     /// marker.
     fn from_ptr(ptr: NonNull<[u8]>) -> Result<Self> {
-        let layout = Layout::from_size_align(ptr.len(), 1).expect("Could not create layout");
-
         if unsafe { ptr.as_ref() }.last() != Some(&END_MARKER) {
             return Err(crate::error::Error::MissingEndMarker);
         }
 
-        Ok(Self(ptr, layout))
+        Ok(Self(ptr))
     }
 
     fn ptr(&self) -> NonNull<u8> {
@@ -293,7 +292,7 @@ impl ListpackAllocationPointer {
     }
 
     fn layout(&self) -> Layout {
-        self.1
+        Layout::from_size_align(self.0.len(), 1).expect("Could not create layout")
     }
 
     fn as_slice(&self) -> &[u8] {
@@ -315,7 +314,7 @@ impl ListpackAllocationPointer {
 
     /// Returns a pointer pointing to the end marker.
     fn data_end_ptr(&self) -> *const u8 {
-        unsafe { self.ptr().as_ptr().add(self.layout().size() - 1) }
+        unsafe { self.ptr().as_ptr().add(self.total_bytes() - 1) }
     }
 
     /// Sets the last byte of the listpack to the end marker.
@@ -326,8 +325,6 @@ impl ListpackAllocationPointer {
     }
 
     fn get_header(&self) -> &ListpackHeader {
-        // unsafe { self.ptr().as_ptr().cast().as_ref().unwrap() }
-
         unsafe {
             self.ptr()
                 .as_ptr()
@@ -347,15 +344,14 @@ impl ListpackAllocationPointer {
         }
     }
 
-    /// Sets a new layout.
+    /// Sets a new size.
     ///
     /// # Safety
     ///
-    /// The user of this function must ensure that the layout is
+    /// The user of this function must ensure that the new size is
     /// correct.
-    unsafe fn set_layout(&mut self, layout: Layout) {
-        self.1 = layout;
-        self.get_header_mut().set_total_bytes(layout.size() as u32);
+    unsafe fn set_new_size(&mut self, size: usize) {
+        self.get_header_mut().set_total_bytes(size as u32);
         self.set_end_marker();
     }
 }
@@ -1548,7 +1544,7 @@ where
             };
         }
 
-        let mut pointer = ListpackAllocationPointer(ptr, layout);
+        let mut pointer = ListpackAllocationPointer(ptr);
 
         pointer.set_end_marker();
 
@@ -1619,7 +1615,7 @@ where
                 new_layout,
             )?;
 
-            self.allocation.set_layout(new_layout);
+            self.allocation.set_new_size(new_layout.size());
         }
 
         Ok(())
@@ -1652,7 +1648,7 @@ where
                 new_layout,
             )?;
 
-            self.allocation.set_layout(new_layout);
+            self.allocation.set_new_size(new_layout.size());
         }
 
         Ok(())
@@ -3196,32 +3192,32 @@ mod tests {
         const LARGER_STRING: &str = "abc";
 
         let mut listpack: Listpack = Listpack::default();
-        assert_eq!(listpack.memory_consumption(), 39);
+        assert_eq!(listpack.memory_consumption(), 23);
         listpack.validate().unwrap();
 
         listpack.push(MIDDLE_STRING);
         listpack.validate().unwrap();
-        assert_eq!(listpack.memory_consumption(), 43);
+        assert_eq!(listpack.memory_consumption(), 27);
         assert_eq!(&listpack.get(0).unwrap().to_string(), MIDDLE_STRING);
         assert_eq!(listpack.len(), 1);
 
         // Downsize to a smaller string.
         listpack.replace(0, SMALLER_STRING);
-        assert_eq!(listpack.memory_consumption(), 42);
+        assert_eq!(listpack.memory_consumption(), 26);
         assert_eq!(listpack.len(), 1);
         assert_eq!(listpack.get(0).unwrap().to_string(), SMALLER_STRING);
         listpack.validate().unwrap();
 
         // Upsize to a larger string.
         listpack.replace(0, LARGER_STRING);
-        assert_eq!(listpack.memory_consumption(), 44);
+        assert_eq!(listpack.memory_consumption(), 28);
         assert_eq!(listpack.len(), 1);
         assert_eq!(listpack.get(0).unwrap().to_string(), LARGER_STRING);
         listpack.validate().unwrap();
 
         // Replace to the same string.
         listpack.replace(0, LARGER_STRING);
-        assert_eq!(listpack.memory_consumption(), 44);
+        assert_eq!(listpack.memory_consumption(), 28);
         assert_eq!(listpack.len(), 1);
         assert_eq!(listpack.get(0).unwrap().to_string(), LARGER_STRING);
         listpack.validate().unwrap();
@@ -3509,5 +3505,14 @@ mod tests {
 
         assert_eq!(listpack[0].to_string(), "World");
         assert_eq!(listpack[1].to_string(), "Hello");
+    }
+
+    #[test]
+    fn data_end_ptr_is_valid() {
+        let listpack: Listpack = Listpack::default();
+        let data_end_ptr = listpack.allocation.data_end_ptr();
+
+        assert!(!data_end_ptr.is_null());
+        assert_eq!(unsafe { *data_end_ptr }, 0xff);
     }
 }
