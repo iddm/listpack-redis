@@ -3186,6 +3186,24 @@ mod tests {
     }
 
     #[test]
+    fn memory_consumption() {
+        let mut listpack: Listpack = Listpack::default();
+        assert_eq!(listpack.memory_consumption(), 23);
+
+        listpack.push("Hello");
+        assert_eq!(listpack.memory_consumption(), 30);
+
+        listpack.push("World");
+        assert_eq!(listpack.memory_consumption(), 37);
+
+        listpack.pop();
+        assert_eq!(listpack.memory_consumption(), 30);
+
+        listpack.pop();
+        assert_eq!(listpack.memory_consumption(), 23);
+    }
+
+    #[test]
     fn replace() {
         const SMALLER_STRING: &str = "a";
         const MIDDLE_STRING: &str = "ab";
