@@ -19,9 +19,9 @@ use redis_custom_allocator::{CustomAllocator, MemoryConsumption};
 
 use crate::{
     allocator::ListpackAllocator,
-    entry::{
-        Encode, ListpackEntryInsert, ListpackEntryMutable, ListpackEntryRef, ListpackEntryRemoved,
-    },
+    compression::Encode,
+    compression::TryEncode,
+    entry::{ListpackEntryInsert, ListpackEntryMutable, ListpackEntryRef, ListpackEntryRemoved},
     error::{AllocationError, Result},
     iter::{ListpackChunks, ListpackIntoIter, ListpackIter, ListpackWindows},
     ListpackEntryEncodingType,
@@ -585,7 +585,7 @@ where
 
         let encoded: Vec<u8> = items
             .iter()
-            .flat_map(|item| item.encode().expect("Encoded value"))
+            .flat_map(|item| item.try_encode().expect("Encoded value"))
             .collect();
 
         unsafe {
@@ -621,7 +621,7 @@ where
 
         let encoded: Vec<u8> = items
             .iter()
-            .flat_map(|item| item.encode().expect("Encoded value"))
+            .flat_map(|item| item.try_encode().expect("Encoded value"))
             .collect();
 
         unsafe {
@@ -669,7 +669,7 @@ where
 
         let encoded: Vec<u8> = items
             .iter()
-            .flat_map(|item| item.encode().expect("Encoded value"))
+            .flat_map(|item| item.try_encode().expect("Encoded value"))
             .collect();
 
         unsafe {
@@ -1828,7 +1828,7 @@ where
             .into());
         }
 
-        let encoded_value = entry.encode()?;
+        let encoded_value = entry.try_encode()?;
 
         let referred_element_ptr = self.get_internal_entry_ptr(index).ok_or(
             crate::error::InsertionError::IndexOutOfBounds {
@@ -2030,7 +2030,7 @@ where
             }
         }
 
-        let encoded_value = entry.encode()?;
+        let encoded_value = entry.try_encode()?;
 
         unsafe {
             let ptr = self.allocation.ptr().as_ptr().add(old_end_offset);
@@ -3432,7 +3432,7 @@ mod tests {
     #[test]
     fn calculate_element_length_from_the_end() {
         let entry = ListpackEntryInsert::from("Hello");
-        let encoded = entry.encode().unwrap();
+        let encoded = entry.try_encode().unwrap();
         let ptr = unsafe { encoded.as_ptr().add(encoded.len() - 1) };
         let length = Listpack::<DefaultAllocator>::read_element_length_from_the_end(ptr);
 
@@ -3443,7 +3443,7 @@ mod tests {
 
         let string = "a".repeat(2usize.pow(12));
         let entry = ListpackEntryInsert::from(&string);
-        let encoded = entry.encode().unwrap();
+        let encoded = entry.try_encode().unwrap();
         let ptr = unsafe { encoded.as_ptr().add(encoded.len() - 1) };
         let length = Listpack::<DefaultAllocator>::read_element_length_from_the_end(ptr);
 

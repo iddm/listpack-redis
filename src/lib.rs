@@ -50,6 +50,7 @@
 #![deny(missing_docs)]
 
 pub mod allocator;
+pub mod compression;
 pub mod entry;
 pub mod error;
 pub mod iter;

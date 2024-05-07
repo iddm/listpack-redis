@@ -4,16 +4,14 @@ use std::{borrow::Borrow, ops::Deref, ptr::NonNull};
 
 use redis_custom_allocator::{CustomAllocator, MemoryConsumption};
 
-use crate::{error::Result, Listpack};
+use crate::{
+    compression::{Encode, TryEncode},
+    error::Result,
+    Listpack,
+};
 
 const SMALL_STRING_MAXIMUM_LENGTH: usize = 63;
 const MEDIUM_STRING_MAXIMUM_LENGTH: usize = 4095;
-
-/// The encoded presentation of the object as a byte array.
-pub trait Encode {
-    /// Return a byte representation of the object.
-    fn encode(&self) -> Result<Vec<u8>>;
-}
 
 /// The subencoding type of a listpack entry.
 /// The subencoding is the encoding of a listpack entry, which is
@@ -91,14 +89,14 @@ pub enum ListpackEntrySubencodingType {
 }
 
 impl Encode for ListpackEntrySubencodingType {
-    fn encode(&self) -> Result<Vec<u8>> {
+    fn encode(&self) -> Vec<u8> {
         // Handle the special cases of the internal encoding types.
         match self {
             // Only boolean and the custom embedded value have the value
             // embedded into the encoding byte itself.
-            Self::Boolean => Ok(vec![0b1111_0110]),
-            Self::CustomEmbeddedValue => Ok(vec![0b1111_1000]),
-            _ => Ok(vec![*self as u8]),
+            Self::Boolean => vec![0b1111_0110],
+            Self::CustomEmbeddedValue => vec![0b1111_1000],
+            _ => vec![*self as u8],
         }
     }
 }
@@ -150,8 +148,8 @@ pub enum ListpackEntryEncodingType {
 }
 
 impl Encode for ListpackEntryEncodingType {
-    fn encode(&self) -> Result<Vec<u8>> {
-        Ok(vec![u8::from(*self)])
+    fn encode(&self) -> Vec<u8> {
+        vec![u8::from(*self)]
     }
 }
 
@@ -650,7 +648,7 @@ fn count_shifts(number: usize, shift_by: u8) -> usize {
     count
 }
 
-impl<'a> Encode for ListpackEntryData<'a> {
+impl<'a> TryEncode for ListpackEntryData<'a> {
     /// The encoding of the data block is as follows:
     ///
     /// 1. If the data block is a small unsigned integer, the encoding
@@ -667,7 +665,7 @@ impl<'a> Encode for ListpackEntryData<'a> {
     /// The total-element-length byte(s) is(are) located behind the data
     /// block, and is encoded as a variable-length integer from right
     /// to left.
-    fn encode(&self) -> Result<Vec<u8>> {
+    fn try_encode(&self) -> Result<Vec<u8>> {
         let encoding_type_byte: u8 = self.encoding_type().into();
 
         // TODO: can be optimised without an allocation to a vec, but
@@ -1912,9 +1910,9 @@ impl ListpackEntryInsert<'_> {
     }
 }
 
-impl<'a> Encode for ListpackEntryInsert<'a> {
-    fn encode(&self) -> Result<Vec<u8>> {
-        ListpackEntryData::from(self).encode()
+impl<'a> TryEncode for ListpackEntryInsert<'a> {
+    fn try_encode(&self) -> Result<Vec<u8>> {
+        ListpackEntryData::from(self).try_encode()
     }
 }
 
@@ -2244,7 +2242,7 @@ mod tests {
         #[test]
         fn entry_bool() {
             let entry = ListpackEntryInsert::Boolean(false);
-            let encoded = entry.encode().unwrap();
+            let encoded = entry.try_encode().unwrap();
             let decoded = ListpackEntryRef::ref_from_slice(encoded.as_slice());
             let ty = decoded.encoding_type().unwrap();
             assert_eq!(
@@ -2254,7 +2252,7 @@ mod tests {
             assert!(!decoded.data().unwrap().get_bool().unwrap());
 
             let entry = ListpackEntryInsert::Boolean(true);
-            let encoded = entry.encode().unwrap();
+            let encoded = entry.try_encode().unwrap();
             let decoded = ListpackEntryRef::ref_from_slice(encoded.as_slice());
             assert!(decoded.data().unwrap().get_bool().unwrap());
         }
@@ -2262,7 +2260,7 @@ mod tests {
         #[test]
         fn entry_f64() {
             let entry = ListpackEntryInsert::Float(55.66f64);
-            let encoded = entry.encode().unwrap();
+            let encoded = entry.try_encode().unwrap();
             let decoded = ListpackEntryRef::ref_from_slice(encoded.as_slice());
             let ty = decoded.encoding_type().unwrap();
             assert_eq!(
@@ -2277,7 +2275,7 @@ mod tests {
         #[test]
         fn entry_owned_f64() {
             let entry = ListpackEntryInsert::Float(55.66f64);
-            let encoded = entry.encode().unwrap();
+            let encoded = entry.try_encode().unwrap();
             let decoded = ListpackEntryRef::ref_from_slice(encoded.as_slice());
             let owned = decoded.to_owned();
             let ty = owned.encoding_type().unwrap();
@@ -2293,7 +2291,7 @@ mod tests {
         #[test]
         fn entry_custom_embedded() {
             let entry = ListpackEntryInsert::CustomEmbeddedValue(0);
-            let encoded = entry.encode().unwrap();
+            let encoded = entry.try_encode().unwrap();
             let decoded = ListpackEntryRef::ref_from_slice(encoded.as_slice());
             let ty = decoded.encoding_type().unwrap();
             assert_eq!(
@@ -2309,7 +2307,7 @@ mod tests {
         fn entry_custom_extended_non_empty() {
             let array = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
             let entry = ListpackEntryInsert::CustomExtendedValueSlice(&array);
-            let encoded = entry.encode().unwrap();
+            let encoded = entry.try_encode().unwrap();
             let decoded = ListpackEntryRef::ref_from_slice(encoded.as_slice());
             let ty = decoded.encoding_type().unwrap();
             assert_eq!(
@@ -2333,7 +2331,7 @@ mod tests {
         fn entry_custom_extended_empty() {
             let array = [];
             let entry = ListpackEntryInsert::CustomExtendedValueSlice(&array);
-            let encoded = entry.encode().unwrap();
+            let encoded = entry.try_encode().unwrap();
             let decoded = ListpackEntryRef::ref_from_slice(encoded.as_slice());
             let ty = decoded.encoding_type().unwrap();
             assert_eq!(
@@ -2357,7 +2355,7 @@ mod tests {
         #[test]
         fn entry_u7() {
             let entry = ListpackEntryInsert::Integer(15);
-            let encoded = entry.encode().unwrap();
+            let encoded = entry.try_encode().unwrap();
             let decoded = ListpackEntryRef::ref_from_slice(encoded.as_slice());
             assert_eq!(decoded.data().unwrap().get_u7().unwrap(), 15);
         }
@@ -2365,7 +2363,7 @@ mod tests {
         #[test]
         fn entry_i13() {
             let entry = ListpackEntryInsert::Integer(4095);
-            let encoded = entry.encode().unwrap();
+            let encoded = entry.try_encode().unwrap();
             let decoded = ListpackEntryRef::ref_from_slice(encoded.as_slice());
             assert_eq!(decoded.data().unwrap().get_i13().unwrap(), 4095);
         }
@@ -2373,7 +2371,7 @@ mod tests {
         #[test]
         fn entry_i16() {
             let entry = ListpackEntryInsert::Integer(10000);
-            let encoded = entry.encode().unwrap();
+            let encoded = entry.try_encode().unwrap();
             let decoded = ListpackEntryRef::ref_from_slice(encoded.as_slice());
             assert_eq!(decoded.data().unwrap().get_i16().unwrap(), 10000);
         }
@@ -2381,7 +2379,7 @@ mod tests {
         #[test]
         fn entry_i24() {
             let entry = ListpackEntryInsert::Integer(8388607);
-            let encoded = entry.encode().unwrap();
+            let encoded = entry.try_encode().unwrap();
             let decoded = ListpackEntryRef::ref_from_slice(encoded.as_slice());
             assert_eq!(decoded.data().unwrap().get_i24().unwrap(), 8388607);
         }
@@ -2389,7 +2387,7 @@ mod tests {
         #[test]
         fn entry_i32() {
             let entry = ListpackEntryInsert::Integer(2147483647);
-            let encoded = entry.encode().unwrap();
+            let encoded = entry.try_encode().unwrap();
             let decoded = ListpackEntryRef::ref_from_slice(encoded.as_slice());
             assert_eq!(decoded.data().unwrap().get_i32().unwrap(), 2147483647);
         }
@@ -2397,7 +2395,7 @@ mod tests {
         #[test]
         fn entry_i64() {
             let entry = ListpackEntryInsert::Integer(2147483648);
-            let encoded = entry.encode().unwrap();
+            let encoded = entry.try_encode().unwrap();
             let decoded = ListpackEntryRef::ref_from_slice(encoded.as_slice());
             assert_eq!(decoded.data().unwrap().get_i64().unwrap(), 2147483648);
         }
@@ -2405,7 +2403,7 @@ mod tests {
         #[test]
         fn entry_small_string() {
             let entry = ListpackEntryInsert::String("Hello, world!");
-            let encoded = entry.encode().unwrap();
+            let encoded = entry.try_encode().unwrap();
             let decoded = ListpackEntryRef::ref_from_slice(encoded.as_slice());
             assert_eq!(
                 decoded.data().unwrap().get_small_str().unwrap(),
@@ -2417,7 +2415,7 @@ mod tests {
         fn entry_medium_string() {
             let medium_string = "a".repeat(MEDIUM_STRING_MAXIMUM_LENGTH - 1);
             let entry = ListpackEntryInsert::String(&medium_string);
-            let encoded = entry.encode().unwrap();
+            let encoded = entry.try_encode().unwrap();
             let decoded = ListpackEntryRef::ref_from_slice(encoded.as_slice());
             assert_eq!(
                 decoded.data().unwrap().get_medium_str().unwrap(),
@@ -2429,7 +2427,7 @@ mod tests {
         fn entry_large_string() {
             let large_string = "a".repeat(MEDIUM_STRING_MAXIMUM_LENGTH + 1);
             let entry = ListpackEntryInsert::String(&large_string);
-            let encoded = entry.encode().unwrap();
+            let encoded = entry.try_encode().unwrap();
             let decoded = ListpackEntryRef::ref_from_slice(encoded.as_slice());
             assert_eq!(
                 decoded.data().unwrap().get_large_str().unwrap(),
