@@ -102,7 +102,12 @@ impl SevenBitVariableLengthIntegerReversed {
     /// (reversed) encoding from a pointer to a byte sequence.
     ///
     /// The pointer is read from right to left.
-    pub fn from_ptr(ptr: *const u8) -> Self {
+    ///
+    /// # Safety
+    ///
+    /// The pointer must point to a valid byte sequence that is
+    /// correctly encoded as a seven-bit variable-length integer.
+    pub unsafe fn from_ptr(ptr: *const u8) -> Self {
         let mut bytes = Vec::new();
         let mut ptr = ptr;
 
@@ -136,7 +141,7 @@ impl SevenBitVariableLengthIntegerReversed {
     /// The maximum number allowed by the variable length integer. As
     /// this is the maximum value, it is always possible to get it back
     /// from the encoded byte sequence.
-    fn get_u128(&self) -> u128 {
+    pub fn get_u128(&self) -> u128 {
         let mut value = 0u128;
         let mut shift = 0;
 
@@ -150,8 +155,19 @@ impl SevenBitVariableLengthIntegerReversed {
         value
     }
 
+    /// Attempts to return a `usize` value from the encoded bytes.
+    pub fn try_get_usize(&self) -> Option<usize> {
+        let value = self.get_u128();
+
+        if value > usize::MAX as u128 {
+            return None;
+        }
+
+        Some(value as usize)
+    }
+
     /// Attempts to return a `u64` value from the encoded bytes.
-    fn try_get_u64(&self) -> Option<u64> {
+    pub fn try_get_u64(&self) -> Option<u64> {
         let value = self.get_u128();
 
         if value > u64::MAX as u128 {
@@ -161,7 +177,8 @@ impl SevenBitVariableLengthIntegerReversed {
         Some(value as u64)
     }
 
-    fn try_get_u32(&self) -> Option<u32> {
+    /// Attempts to return a `u32` value from the encoded bytes.
+    pub fn try_get_u32(&self) -> Option<u32> {
         let value = self.get_u128();
 
         if value > u32::MAX as u128 {
@@ -171,7 +188,8 @@ impl SevenBitVariableLengthIntegerReversed {
         Some(value as u32)
     }
 
-    fn try_get_u16(&self) -> Option<u16> {
+    /// Attempts to return a `u16` value from the encoded bytes.
+    pub fn try_get_u16(&self) -> Option<u16> {
         let value = self.get_u128();
 
         if value > u16::MAX as u128 {
@@ -181,7 +199,8 @@ impl SevenBitVariableLengthIntegerReversed {
         Some(value as u16)
     }
 
-    fn try_get_u8(&self) -> Option<u8> {
+    /// Attempts to return a `u8` value from the encoded bytes.
+    pub fn try_get_u8(&self) -> Option<u8> {
         let value = self.get_u128();
 
         if value > u8::MAX as u128 {
@@ -219,7 +238,12 @@ impl Default for SevenBitVariableLengthInteger {
 impl SevenBitVariableLengthInteger {
     /// Creates a new instance of the seven-bit variable-length integer
     /// encoding from a pointer to a byte sequence.
-    pub fn from_ptr(ptr: *const u8) -> Self {
+    ///
+    /// # Safety
+    ///
+    /// The pointer must point to a valid byte sequence that is
+    /// correctly encoded as a seven-bit variable-length integer.
+    pub unsafe fn from_ptr(ptr: *const u8) -> Self {
         let mut bytes = Vec::new();
         let mut ptr = ptr;
 
@@ -252,7 +276,7 @@ impl SevenBitVariableLengthInteger {
     /// The maximum number allowed by the variable length integer. As
     /// this is the maximum value, it is always possible to get it back
     /// from the encoded byte sequence.
-    fn get_u128(&self) -> u128 {
+    pub fn get_u128(&self) -> u128 {
         let mut value = 0u128;
         let mut shift = 0;
 
@@ -264,8 +288,19 @@ impl SevenBitVariableLengthInteger {
         value
     }
 
+    /// Attempts to return a `usize` value from the encoded bytes.
+    pub fn try_get_usize(&self) -> Option<usize> {
+        let value = self.get_u128();
+
+        if value > usize::MAX as u128 {
+            return None;
+        }
+
+        Some(value as usize)
+    }
+
     /// Attempts to return a `u64` value from the encoded bytes.
-    fn try_get_u64(&self) -> Option<u64> {
+    pub fn try_get_u64(&self) -> Option<u64> {
         let value = self.get_u128();
 
         if value > u64::MAX as u128 {
@@ -275,7 +310,8 @@ impl SevenBitVariableLengthInteger {
         Some(value as u64)
     }
 
-    fn try_get_u32(&self) -> Option<u32> {
+    /// Attempts to return a `u32` value from the encoded bytes.
+    pub fn try_get_u32(&self) -> Option<u32> {
         let value = self.get_u128();
 
         if value > u32::MAX as u128 {
@@ -285,7 +321,8 @@ impl SevenBitVariableLengthInteger {
         Some(value as u32)
     }
 
-    fn try_get_u16(&self) -> Option<u16> {
+    /// Attempts to return a `u16` value from the encoded bytes.
+    pub fn try_get_u16(&self) -> Option<u16> {
         let value = self.get_u128();
 
         if value > u16::MAX as u128 {
@@ -295,7 +332,8 @@ impl SevenBitVariableLengthInteger {
         Some(value as u16)
     }
 
-    fn try_get_u8(&self) -> Option<u8> {
+    /// Attempts to return a `u8` value from the encoded bytes.
+    pub fn try_get_u8(&self) -> Option<u8> {
         let value = self.get_u128();
 
         if value > u8::MAX as u128 {
@@ -314,6 +352,9 @@ impl Deref for SevenBitVariableLengthInteger {
     }
 }
 
+// TODO: many of the methods can be sometimes be done in-place, instead
+// of creating new objects (and allocating those). This might be a good
+// optimization to do in the future.
 /// Implements the Rust primitive integer traits.
 macro_rules! impl_primitive_traits {
     ($($type:ty),*) => {
