@@ -39,7 +39,7 @@ pub trait AsSevenBitVariableLengthInteger {
 }
 
 /// Allows to convert the implementing type into a seven-bit variable
-/// length integer in the reversed format.
+/// length integer in the reversed format (from right-to-left).
 pub trait AsSevenBitVariableLengthIntegerReversed {
     /// Converts the object into a seven-bit variable length integer.
     fn as_seven_bit_variable_length_integer_reversed(
@@ -92,12 +92,37 @@ impl From<SevenBitVariableLengthIntegerReversed> for SevenBitVariableLengthInteg
 }
 
 impl SevenBitVariableLengthIntegerReversed {
-    /// Return a slice of bytes of the encoded value.
+    /// Creates a new instance of the seven-bit variable-length integer
+    /// (reversed) encoding from a pointer to a byte sequence.
+    ///
+    /// The pointer is read from right to left.
+    pub fn from_ptr(ptr: *const u8) -> Self {
+        let mut bytes = Vec::new();
+        let mut ptr = ptr;
+
+        loop {
+            let byte = unsafe { *ptr };
+
+            bytes.insert(0, byte);
+
+            // If the highest bit is not set, then this is the last
+            // byte.
+            if byte & 0x80 == 0 {
+                break;
+            }
+
+            ptr = unsafe { ptr.sub(1) };
+        }
+
+        Self(bytes)
+    }
+
+    /// Returns a slice of bytes of the encoded value.
     pub fn get_byte_slice(&self) -> &[u8] {
         &self.0
     }
 
-    /// Return a vector of bytes of the encoded value.
+    /// Returns a vector of bytes of the encoded value.
     pub fn get_bytes(&self) -> Vec<u8> {
         self.0.clone()
     }
@@ -109,7 +134,9 @@ impl SevenBitVariableLengthIntegerReversed {
         let mut value = 0u128;
         let mut shift = 0;
 
-        for byte in self.get_byte_slice() {
+        // We walk in the reversed order, since the value is stored in
+        // the reversed order.
+        for byte in self.get_byte_slice().iter().rev() {
             value |= ((byte & 0x7F) as u128) << shift;
             shift += 7;
         }
@@ -165,6 +192,8 @@ impl SevenBitVariableLengthIntegerReversed {
 /// the integer value, and the highest bit to indicate that there are
 /// more bytes to come.
 ///
+/// The value is stored in the left-to-right order.
+///
 /// An example usage of the encoding is to compress the length of an
 /// entry in the listpack data structure (see
 /// [`crate::entry::ListpackEntry`]).
@@ -182,9 +211,36 @@ impl Default for SevenBitVariableLengthInteger {
 }
 
 impl SevenBitVariableLengthInteger {
-    /// Return a slice of bytes of the encoded value.
-    pub fn get_bytes(&self) -> &[u8] {
+    /// Creates a new instance of the seven-bit variable-length integer
+    /// encoding from a pointer to a byte sequence.
+    pub fn from_ptr(ptr: *const u8) -> Self {
+        let mut bytes = Vec::new();
+        let mut ptr = ptr;
+
+        loop {
+            let byte = unsafe { *ptr };
+
+            bytes.push(byte);
+
+            // If the higher bit is not set, then it is the last byte.
+            if byte & 0x80 == 0 {
+                break;
+            }
+
+            ptr = unsafe { ptr.add(1) };
+        }
+
+        Self(bytes)
+    }
+
+    /// Returns a slice of bytes of the encoded value.
+    pub fn get_bytes_slice(&self) -> &[u8] {
         &self.0
+    }
+
+    /// Returns a vector of bytes of the encoded value.
+    pub fn get_bytes(&self) -> Vec<u8> {
+        self.0.clone()
     }
 
     /// The maximum number allowed by the variable length integer. As
@@ -194,7 +250,7 @@ impl SevenBitVariableLengthInteger {
         let mut value = 0u128;
         let mut shift = 0;
 
-        for byte in self.get_bytes() {
+        for byte in self.get_bytes_slice() {
             value |= ((byte & 0x7F) as u128) << shift;
             shift += 7;
         }
@@ -405,7 +461,7 @@ mod tests {
         #[test]
         fn encode_zero() {
             assert_eq!(
-                0u8.as_seven_bit_variable_length_integer().get_bytes(),
+                0u8.as_seven_bit_variable_length_integer().get_bytes_slice(),
                 vec![0]
             );
         }
@@ -413,7 +469,9 @@ mod tests {
         #[test]
         fn encode_small_number() {
             assert_eq!(
-                127u8.as_seven_bit_variable_length_integer().get_bytes(),
+                127u8
+                    .as_seven_bit_variable_length_integer()
+                    .get_bytes_slice(),
                 vec![127]
             );
         }
@@ -421,7 +479,9 @@ mod tests {
         #[test]
         fn encode_medium_number() {
             assert_eq!(
-                128u8.as_seven_bit_variable_length_integer().get_bytes(),
+                128u8
+                    .as_seven_bit_variable_length_integer()
+                    .get_bytes_slice(),
                 vec![0x80, 1]
             );
         }
@@ -429,7 +489,9 @@ mod tests {
         #[test]
         fn encode_large_number() {
             assert_eq!(
-                16383u16.as_seven_bit_variable_length_integer().get_bytes(),
+                16383u16
+                    .as_seven_bit_variable_length_integer()
+                    .get_bytes_slice(),
                 vec![0xFF, 0x7F]
             );
         }
@@ -439,7 +501,7 @@ mod tests {
             assert_eq!(
                 2097151u32
                     .as_seven_bit_variable_length_integer()
-                    .get_bytes(),
+                    .get_bytes_slice(),
                 vec![0xFF, 0xFF, 0x7F]
             );
         }
@@ -449,7 +511,7 @@ mod tests {
             assert_eq!(
                 268435455u64
                     .as_seven_bit_variable_length_integer()
-                    .get_bytes(),
+                    .get_bytes_slice(),
                 vec![0xFF, 0xFF, 0xFF, 0x7F]
             );
         }
@@ -459,9 +521,26 @@ mod tests {
             assert_eq!(
                 34359738367u64
                     .as_seven_bit_variable_length_integer()
-                    .get_bytes(),
+                    .get_bytes_slice(),
                 vec![0xFF, 0xFF, 0xFF, 0xFF, 0x7F]
             );
+        }
+
+        #[test]
+        fn read_from_ptr() {
+            let bytes = vec![0x80, 1];
+            let ptr = bytes.as_ptr();
+
+            let encoded = SevenBitVariableLengthInteger::from_ptr(ptr);
+            assert_eq!(encoded.get_bytes_slice(), bytes);
+            assert_eq!(encoded.get_u128(), 128);
+
+            let bytes = vec![1];
+            let ptr = bytes.as_ptr();
+
+            let encoded = SevenBitVariableLengthInteger::from_ptr(ptr);
+            assert_eq!(encoded.get_bytes_slice(), bytes);
+            assert_eq!(encoded.get_u128(), 1);
         }
     }
 
@@ -553,6 +632,23 @@ mod tests {
                     .get_bytes(),
                 vec![0x7F, 0xFF, 0xFF, 0xFF]
             );
+        }
+
+        #[test]
+        fn read_from_ptr() {
+            let bytes = vec![1, 0x80];
+            let ptr = unsafe { bytes.as_ptr().add(1) };
+
+            let encoded = SevenBitVariableLengthIntegerReversed::from_ptr(ptr);
+            assert_eq!(encoded.get_bytes(), bytes);
+            assert_eq!(encoded.get_u128(), 128);
+
+            let bytes = vec![1];
+            let ptr = bytes.as_ptr();
+
+            let encoded = SevenBitVariableLengthIntegerReversed::from_ptr(ptr);
+            assert_eq!(encoded.get_bytes(), bytes);
+            assert_eq!(encoded.get_u128(), 1);
         }
     }
 }
