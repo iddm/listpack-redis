@@ -3,7 +3,13 @@
 // Allowing the dead code as it might be used as a library.
 #![allow(dead_code)]
 
-use std::ops::Deref;
+use std::{
+    iter::Product,
+    ops::{
+        Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Deref, Div,
+        DivAssign, Mul, MulAssign, Not, Rem, RemAssign, Sub, SubAssign,
+    },
+};
 
 use crate::error::Result;
 
@@ -308,6 +314,199 @@ impl Deref for SevenBitVariableLengthInteger {
     }
 }
 
+/// Implements the Rust primitive integer traits.
+macro_rules! impl_primitive_traits {
+    ($($type:ty),*) => {
+        $(
+        impl<T> Add<T> for $type
+        where
+            T: Into<$type>,
+        {
+            type Output = Self;
+
+            fn add(self, other: T) -> Self::Output {
+                Self::from(self.get_u128() + other.into().get_u128())
+            }
+        }
+
+        impl<T> AddAssign<T> for $type
+        where
+            T: Into<Self>,
+        {
+            fn add_assign(&mut self, other: T) {
+                *self = self.clone().add(other);
+            }
+        }
+
+        impl<T> BitAnd<T> for $type
+        where
+            T: Into<Self>,
+        {
+            type Output = Self;
+
+            fn bitand(self, other: T) -> Self::Output {
+                Self::from(self.get_u128() & other.into().get_u128())
+            }
+        }
+
+        impl<T> BitAndAssign<T> for $type
+        where
+            T: Into<Self>,
+        {
+            fn bitand_assign(&mut self, other: T) {
+                *self = self.clone().bitand(other);
+            }
+        }
+
+        impl<T> BitOr<T> for $type
+        where
+            T: Into<Self>,
+        {
+            type Output = Self;
+
+            fn bitor(self, other: T) -> Self::Output {
+                Self::from(self.get_u128() | other.into().get_u128())
+            }
+        }
+
+        impl<T> BitOrAssign<T> for $type
+        where
+            T: Into<Self>,
+        {
+            fn bitor_assign(&mut self, other: T) {
+                *self = self.clone().bitor(other);
+            }
+        }
+
+        impl<T> BitXor<T> for $type
+        where
+            T: Into<Self>,
+        {
+            type Output = Self;
+
+            fn bitxor(self, other: T) -> Self::Output {
+                Self::from(self.get_u128() ^ other.into().get_u128())
+            }
+        }
+
+        impl<T> BitXorAssign<T> for $type
+        where
+            T: Into<Self>,
+        {
+            fn bitxor_assign(&mut self, other: T) {
+                *self = self.clone().bitxor(other);
+            }
+        }
+
+        impl<T> Div<T> for $type
+        where
+            T: Into<Self>,
+        {
+            type Output = Self;
+
+            fn div(self, other: T) -> Self::Output {
+                Self::from(self.get_u128() / other.into().get_u128())
+            }
+        }
+
+        impl<T> DivAssign<T> for $type
+        where
+            T: Into<Self>,
+        {
+            fn div_assign(&mut self, other: T) {
+                *self = self.clone().div(other);
+            }
+        }
+
+        impl<T> Mul<T> for $type
+        where
+            T: Into<Self>,
+        {
+            type Output = Self;
+
+            fn mul(self, other: T) -> Self::Output {
+                Self::from(self.get_u128() * other.into().get_u128())
+            }
+        }
+
+        impl<T> MulAssign<T> for $type
+        where
+            T: Into<Self>,
+        {
+            fn mul_assign(&mut self, other: T) {
+                *self = self.clone().mul(other);
+            }
+        }
+
+        impl<T> Sub<T> for $type
+        where
+            T: Into<Self>,
+        {
+            type Output = Self;
+
+            fn sub(self, other: T) -> Self::Output {
+                Self::from(self.get_u128() - other.into().get_u128())
+            }
+        }
+
+        impl<T> SubAssign<T> for $type
+        where
+            T: Into<Self>,
+        {
+            fn sub_assign(&mut self, other: T) {
+                *self = self.clone().sub(other);
+            }
+        }
+
+        impl Not for $type {
+            type Output = Self;
+
+            fn not(self) -> Self::Output {
+                Self::from(!self.get_u128())
+            }
+        }
+
+        impl<T> Product<T> for $type
+        where
+            T: Into<Self>,
+        {
+            fn product<I>(iter: I) -> Self
+            where
+                I: Iterator<Item = T>,
+            {
+                let mut product = 1u128;
+
+                for item in iter {
+                    product *= item.into().get_u128();
+                }
+
+                Self::from(product)
+            }
+        }
+
+        impl<T> Rem<T> for $type
+        where
+            T: Into<Self>,
+        {
+            type Output = Self;
+
+            fn rem(self, other: T) -> Self::Output {
+                Self::from(self.get_u128() % other.into().get_u128())
+            }
+        }
+
+        impl<T> RemAssign<T> for $type
+        where
+            T: Into<Self>,
+        {
+            fn rem_assign(&mut self, other: T) {
+                *self = self.clone().rem(other);
+            }
+        }
+        )*
+    };
+}
+
 macro_rules! impl_from_for_unsigned_integers {
     ($($type:ty),*) => {
         $(
@@ -412,6 +611,10 @@ macro_rules! impl_try_from_for_unsigned_integers_from_seven_bit_variable_length_
     };
 }
 
+impl_primitive_traits!(
+    SevenBitVariableLengthInteger,
+    SevenBitVariableLengthIntegerReversed
+);
 impl_from_for_unsigned_integers!(u8, u16, u32, u64, u128, usize);
 impl_try_from_for_unsigned_integers_from_seven_bit_variable_length_integer!(
     u8, u16, u32, u64, u128, usize
@@ -542,6 +745,249 @@ mod tests {
             assert_eq!(encoded.get_bytes_slice(), bytes);
             assert_eq!(encoded.get_u128(), 1);
         }
+
+        #[test]
+        fn add() {
+            let value = 127u8.as_seven_bit_variable_length_integer();
+            let other = 1u8.as_seven_bit_variable_length_integer();
+            let sum = value + other;
+            assert_eq!(sum.get_u128(), 128);
+
+            let value = 16383u16.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+
+            let sum = value + other;
+            assert_eq!(sum.get_u128(), 16384);
+        }
+
+        #[test]
+        fn add_assign() {
+            let mut value = 127u8.as_seven_bit_variable_length_integer();
+            let other = 1u8.as_seven_bit_variable_length_integer();
+            value += other;
+            assert_eq!(value.get_u128(), 128);
+
+            let mut value = 16383u16.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+
+            value += other;
+            assert_eq!(value.get_u128(), 16384);
+        }
+
+        #[test]
+        fn bit_and() {
+            let value = 0u8.as_seven_bit_variable_length_integer();
+            let other = 1u8.as_seven_bit_variable_length_integer();
+            let result = value & other;
+            assert_eq!(result.get_u128(), 0);
+
+            let value = 16383u16.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+
+            let result = value & other;
+            assert_eq!(result.get_u128(), 1);
+        }
+
+        #[test]
+        fn bit_and_assign() {
+            let mut value = 0u8.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+            value &= other;
+            assert_eq!(value.get_u128(), 0);
+
+            let mut value = 16383u16.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+
+            value &= other;
+            assert_eq!(value.get_u128(), 1);
+        }
+
+        #[test]
+        fn bit_or() {
+            let value = 0u8.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+            let result = value | other;
+            assert_eq!(result.get_u128(), 1);
+
+            let value = 16383u16.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+
+            let result = value | other;
+            assert_eq!(result.get_u128(), 16383);
+        }
+
+        #[test]
+        fn bit_or_assign() {
+            let mut value = 0u8.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+            value |= other;
+            assert_eq!(value.get_u128(), 1);
+
+            let mut value = 16383u16.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+
+            value |= other;
+            assert_eq!(value.get_u128(), 16383);
+        }
+
+        #[test]
+        fn bit_xor() {
+            let value = 0u8.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+            let result = value ^ other;
+            assert_eq!(result.get_u128(), 1);
+
+            let value = 16383u16.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+
+            let result = value ^ other;
+            assert_eq!(result.get_u128(), 16382);
+        }
+
+        #[test]
+        fn bit_xor_assign() {
+            let mut value = 0u8.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+            value ^= other;
+            assert_eq!(value.get_u128(), 1);
+
+            let mut value = 16383u16.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+
+            value ^= other;
+            assert_eq!(value.get_u128(), 16382);
+        }
+
+        #[test]
+        fn div() {
+            let value = 128u8.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+            let result = value / other;
+            assert_eq!(result.get_u128(), 64);
+
+            let value = 16384u16.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+
+            let result = value / other;
+            assert_eq!(result.get_u128(), 8192);
+        }
+
+        #[test]
+        fn div_assign() {
+            let mut value = 128u8.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+            value /= other;
+            assert_eq!(value.get_u128(), 64);
+
+            let mut value = 16384u16.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+
+            value /= other;
+            assert_eq!(value.get_u128(), 8192);
+        }
+
+        #[test]
+        fn mul() {
+            let value = 128u8.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+            let result = value * other;
+            assert_eq!(result.get_u128(), 256);
+
+            let value = 16384u16.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+
+            let result = value * other;
+            assert_eq!(result.get_u128(), 32768);
+        }
+
+        #[test]
+        fn mul_assign() {
+            let mut value = 128u8.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+            value *= other;
+            assert_eq!(value.get_u128(), 256);
+
+            let mut value = 16384u16.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+
+            value *= other;
+            assert_eq!(value.get_u128(), 32768);
+        }
+
+        #[test]
+        fn sub() {
+            let value = 128u8.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+            let result = value - other;
+            assert_eq!(result.get_u128(), 127);
+
+            let value = 16384u16.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+
+            let result = value - other;
+            assert_eq!(result.get_u128(), 16383);
+        }
+
+        #[test]
+        fn sub_assign() {
+            let mut value = 128u8.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+            value -= other;
+            assert_eq!(value.get_u128(), 127);
+
+            let mut value = 16384u16.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+
+            value -= other;
+            assert_eq!(value.get_u128(), 16383);
+        }
+
+        #[test]
+        fn not() {
+            let value = 128u8.as_seven_bit_variable_length_integer();
+            let result = !value;
+            assert_eq!(result.get_u128(), !128);
+
+            let value = 16384u16.as_seven_bit_variable_length_integer();
+            let result = !value;
+            assert_eq!(result.get_u128(), !16384);
+        }
+
+        #[test]
+        fn product() {
+            let values = vec![128u8, 2u8, 4u8];
+
+            let product = SevenBitVariableLengthInteger::product(values.into_iter());
+            assert_eq!(product.get_u128(), 128 * 2 * 4);
+        }
+
+        #[test]
+        fn rem() {
+            let value = 128u8.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+            let result = value % other;
+            assert_eq!(result.get_u128(), 128 % 2);
+
+            let value = 16384u16.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+
+            let result = value % other;
+            assert_eq!(result.get_u128(), 16384 % 2);
+        }
+
+        #[test]
+        fn rem_assign() {
+            let mut value = 128u8.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+            value %= other;
+            assert_eq!(value.get_u128(), 128 % 2);
+
+            let mut value = 16384u16.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+
+            value %= other;
+            assert_eq!(value.get_u128(), 16384 % 2);
+        }
     }
 
     mod seven_bit_reversed {
@@ -649,6 +1095,249 @@ mod tests {
             let encoded = SevenBitVariableLengthIntegerReversed::from_ptr(ptr);
             assert_eq!(encoded.get_bytes(), bytes);
             assert_eq!(encoded.get_u128(), 1);
+        }
+
+        #[test]
+        fn add() {
+            let value = 127u8.as_seven_bit_variable_length_integer();
+            let other = 1u8.as_seven_bit_variable_length_integer();
+            let sum = value + other;
+            assert_eq!(sum.get_u128(), 128);
+
+            let value = 16383u16.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+
+            let sum = value + other;
+            assert_eq!(sum.get_u128(), 16384);
+        }
+
+        #[test]
+        fn add_assign() {
+            let mut value = 127u8.as_seven_bit_variable_length_integer();
+            let other = 1u8.as_seven_bit_variable_length_integer();
+            value += other;
+            assert_eq!(value.get_u128(), 128);
+
+            let mut value = 16383u16.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+
+            value += other;
+            assert_eq!(value.get_u128(), 16384);
+        }
+
+        #[test]
+        fn bit_and() {
+            let value = 0u8.as_seven_bit_variable_length_integer();
+            let other = 1u8.as_seven_bit_variable_length_integer();
+            let result = value & other;
+            assert_eq!(result.get_u128(), 0);
+
+            let value = 16383u16.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+
+            let result = value & other;
+            assert_eq!(result.get_u128(), 1);
+        }
+
+        #[test]
+        fn bit_and_assign() {
+            let mut value = 0u8.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+            value &= other;
+            assert_eq!(value.get_u128(), 0);
+
+            let mut value = 16383u16.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+
+            value &= other;
+            assert_eq!(value.get_u128(), 1);
+        }
+
+        #[test]
+        fn bit_or() {
+            let value = 0u8.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+            let result = value | other;
+            assert_eq!(result.get_u128(), 1);
+
+            let value = 16383u16.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+
+            let result = value | other;
+            assert_eq!(result.get_u128(), 16383);
+        }
+
+        #[test]
+        fn bit_or_assign() {
+            let mut value = 0u8.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+            value |= other;
+            assert_eq!(value.get_u128(), 1);
+
+            let mut value = 16383u16.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+
+            value |= other;
+            assert_eq!(value.get_u128(), 16383);
+        }
+
+        #[test]
+        fn bit_xor() {
+            let value = 0u8.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+            let result = value ^ other;
+            assert_eq!(result.get_u128(), 1);
+
+            let value = 16383u16.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+
+            let result = value ^ other;
+            assert_eq!(result.get_u128(), 16382);
+        }
+
+        #[test]
+        fn bit_xor_assign() {
+            let mut value = 0u8.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+            value ^= other;
+            assert_eq!(value.get_u128(), 1);
+
+            let mut value = 16383u16.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+
+            value ^= other;
+            assert_eq!(value.get_u128(), 16382);
+        }
+
+        #[test]
+        fn div() {
+            let value = 128u8.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+            let result = value / other;
+            assert_eq!(result.get_u128(), 64);
+
+            let value = 16384u16.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+
+            let result = value / other;
+            assert_eq!(result.get_u128(), 8192);
+        }
+
+        #[test]
+        fn div_assign() {
+            let mut value = 128u8.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+            value /= other;
+            assert_eq!(value.get_u128(), 64);
+
+            let mut value = 16384u16.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+
+            value /= other;
+            assert_eq!(value.get_u128(), 8192);
+        }
+
+        #[test]
+        fn mul() {
+            let value = 128u8.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+            let result = value * other;
+            assert_eq!(result.get_u128(), 256);
+
+            let value = 16384u16.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+
+            let result = value * other;
+            assert_eq!(result.get_u128(), 32768);
+        }
+
+        #[test]
+        fn mul_assign() {
+            let mut value = 128u8.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+            value *= other;
+            assert_eq!(value.get_u128(), 256);
+
+            let mut value = 16384u16.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+
+            value *= other;
+            assert_eq!(value.get_u128(), 32768);
+        }
+
+        #[test]
+        fn sub() {
+            let value = 128u8.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+            let result = value - other;
+            assert_eq!(result.get_u128(), 127);
+
+            let value = 16384u16.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+
+            let result = value - other;
+            assert_eq!(result.get_u128(), 16383);
+        }
+
+        #[test]
+        fn sub_assign() {
+            let mut value = 128u8.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+            value -= other;
+            assert_eq!(value.get_u128(), 127);
+
+            let mut value = 16384u16.as_seven_bit_variable_length_integer();
+            let other = 1u8;
+
+            value -= other;
+            assert_eq!(value.get_u128(), 16383);
+        }
+
+        #[test]
+        fn not() {
+            let value = 128u8.as_seven_bit_variable_length_integer();
+            let result = !value;
+            assert_eq!(result.get_u128(), !128);
+
+            let value = 16384u16.as_seven_bit_variable_length_integer();
+            let result = !value;
+            assert_eq!(result.get_u128(), !16384);
+        }
+
+        #[test]
+        fn product() {
+            let values = vec![128u8, 2u8, 4u8];
+
+            let product = SevenBitVariableLengthInteger::product(values.into_iter());
+            assert_eq!(product.get_u128(), 128 * 2 * 4);
+        }
+
+        #[test]
+        fn rem() {
+            let value = 128u8.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+            let result = value % other;
+            assert_eq!(result.get_u128(), 128 % 2);
+
+            let value = 16384u16.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+
+            let result = value % other;
+            assert_eq!(result.get_u128(), 16384 % 2);
+        }
+
+        #[test]
+        fn rem_assign() {
+            let mut value = 128u8.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+            value %= other;
+            assert_eq!(value.get_u128(), 128 % 2);
+
+            let mut value = 16384u16.as_seven_bit_variable_length_integer();
+            let other = 2u8;
+
+            value %= other;
+            assert_eq!(value.get_u128(), 16384 % 2);
         }
     }
 }
