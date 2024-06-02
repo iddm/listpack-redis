@@ -775,14 +775,14 @@ mod tests {
             let bytes = vec![0x80, 1];
             let ptr = bytes.as_ptr();
 
-            let encoded = SevenBitVariableLengthInteger::from_ptr(ptr);
+            let encoded = unsafe { SevenBitVariableLengthInteger::from_ptr(ptr) };
             assert_eq!(encoded.get_bytes_slice(), bytes);
             assert_eq!(encoded.get_u128(), 128);
 
             let bytes = vec![1];
             let ptr = bytes.as_ptr();
 
-            let encoded = SevenBitVariableLengthInteger::from_ptr(ptr);
+            let encoded = unsafe { SevenBitVariableLengthInteger::from_ptr(ptr) };
             assert_eq!(encoded.get_bytes_slice(), bytes);
             assert_eq!(encoded.get_u128(), 1);
         }
@@ -1126,14 +1126,14 @@ mod tests {
             let bytes = vec![1, 0x80];
             let ptr = unsafe { bytes.as_ptr().add(1) };
 
-            let encoded = SevenBitVariableLengthIntegerReversed::from_ptr(ptr);
+            let encoded = unsafe { SevenBitVariableLengthIntegerReversed::from_ptr(ptr) };
             assert_eq!(encoded.get_bytes(), bytes);
             assert_eq!(encoded.get_u128(), 128);
 
             let bytes = vec![1];
             let ptr = bytes.as_ptr();
 
-            let encoded = SevenBitVariableLengthIntegerReversed::from_ptr(ptr);
+            let encoded = unsafe { SevenBitVariableLengthIntegerReversed::from_ptr(ptr) };
             assert_eq!(encoded.get_bytes(), bytes);
             assert_eq!(encoded.get_u128(), 1);
         }
