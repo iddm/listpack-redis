@@ -116,7 +116,7 @@ impl From<usize> for FittingRequirement {
 /// The header of the listpack data structure. Can only be obtained
 /// from an existing listpack using the [`Listpack::header_ref`] method.
 #[repr(C, packed(1))]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Ord, PartialOrd, Hash)]
 pub struct ListpackHeader {
     /// An unsigned integer holding the total amount of bytes
     /// representing the listpack. Including the header itself and the
@@ -154,6 +154,11 @@ impl ListpackHeader {
     /// The maximum number of bytes allowed to be used by the elements.
     const MAXIMUM_ELEMENT_BYTES: usize =
         Self::MAXIMUM_TOTAL_BYTES + std::mem::size_of::<u8>() - std::mem::size_of::<Self>();
+
+    /// Returns the header from the given pointer.
+    pub unsafe fn from_ptr<'a>(ptr: *const u8) -> &'a Self {
+        unsafe { ptr.cast::<Self>().as_ref().unwrap() }
+    }
 
     /// Returns the total amount of bytes representing the listpack.
     ///
@@ -3025,6 +3030,16 @@ mod tests {
 
         assert_eq!(listpack.get_header_ref().total_bytes(), 7);
         assert_eq!(listpack.get_header_ref().num_elements(), 0);
+
+        let header = ListpackHeader {
+            total_bytes: 7,
+            num_elements: 0,
+        };
+
+        let header_ref_from_ptr =
+            unsafe { ListpackHeader::from_ptr(&header as *const ListpackHeader as *const u8) };
+
+        assert_eq!(&header, header_ref_from_ptr);
     }
 
     #[test]

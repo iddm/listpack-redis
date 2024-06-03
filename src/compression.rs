@@ -263,6 +263,70 @@ impl SevenBitVariableLengthInteger {
         Self(bytes)
     }
 
+    /// Returns `true` if it was possible to replace the value in `self`
+    /// with the new value without reallocation. If the new value
+    /// requires more bytes than the current value, then it is not
+    /// possible to replace the value without reallocation, and `false`
+    /// is returned.
+    pub fn try_set_new_value_without_reallocation<T: Into<Self>>(&mut self, value: T) -> bool {
+        let new_value = value.into();
+
+        if new_value.len() > self.len() {
+            return false;
+        }
+
+        self.0.copy_from_slice(new_value.get_bytes_slice());
+
+        true
+    }
+
+    /// A thread-unsafe version of the
+    /// [`Self::try_set_new_value_without_reallocation`] method. The
+    /// main difference is the absence of the mutable reference to
+    /// `self`. This method is useful when the runtime context of the
+    /// method is already thread-safe.
+    ///
+    /// # Safety
+    ///
+    /// This method is unsafe because it can lead to a data race in
+    /// a thread-unsafe context.
+    pub unsafe fn try_set_new_value_without_reallocation_thread_unsafe<T: Into<Self>>(
+        &self,
+        value: T,
+    ) -> bool {
+        let new_value = value.into();
+
+        if new_value.len() > self.len() {
+            return false;
+        }
+
+        let ptr = self.0.as_ptr().cast_mut();
+        let new_ptr = new_value.0.as_ptr();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(new_ptr, ptr, new_value.len());
+        }
+
+        true
+    }
+
+    /// Writes the encoded value to the given pointer.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the pointer is valid and points to
+    /// a memory location that is at least `self.len()` bytes long.
+    pub unsafe fn write_to_ptr(&self, ptr: *mut u8) {
+        let mut ptr = ptr;
+
+        for byte in self.get_bytes_slice() {
+            unsafe {
+                *ptr = *byte;
+                ptr = ptr.add(1);
+            }
+        }
+    }
+
     /// Returns a slice of bytes of the encoded value.
     pub fn get_bytes_slice(&self) -> &[u8] {
         &self.0
