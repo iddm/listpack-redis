@@ -156,6 +156,10 @@ impl ListpackHeader {
         Self::MAXIMUM_TOTAL_BYTES + std::mem::size_of::<u8>() - std::mem::size_of::<Self>();
 
     /// Returns the header from the given pointer.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the pointer is valid.
     pub unsafe fn from_ptr<'a>(ptr: *const u8) -> &'a Self {
         unsafe { ptr.cast::<Self>().as_ref().unwrap() }
     }
@@ -734,6 +738,28 @@ where
         let first = iter.next().map(|e| e.encoding_type().unwrap()).unwrap();
 
         iter.all(|e| e.encoding_type().unwrap() == first)
+    }
+
+    /// Returns a reference to the listpack located at the beginning of
+    /// the provided pointer.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the pointer is valid.
+    pub unsafe fn ref_from_ptr<'a>(ptr: *const u8) -> &'a Self {
+        unsafe { &*(ptr as *const Self) }
+    }
+
+    /// Returns a mutable reference to the listpack located at the
+    /// beginning of the provided pointer.
+    ///
+    /// # Safety
+    ///
+    /// 1. The caller must ensure that the pointer is valid.
+    /// 2. Any mutation of the listpack must be done in a safe way,
+    ///    that does not reallocate the listpack.
+    pub unsafe fn ref_mut_from_ptr<'a>(ptr: *mut u8) -> &'a mut Self {
+        unsafe { &mut *(ptr as *mut Self) }
     }
 
     /// Returns the encoding types of the elements of the listpack.
