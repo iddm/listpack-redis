@@ -1762,7 +1762,7 @@ mod tests {
         use super::*;
 
         #[test]
-        fn tag_pointer() {
+        fn tag_raw_pointer() {
             let pointer = 0x00000001 as *mut u8;
 
             let parsed = AllocationPointerTag::from_pointer(pointer);
@@ -1771,6 +1771,42 @@ mod tests {
             let tagged_ptr = AllocationPointerTag::Borrowed.tag_pointer(pointer);
             assert_eq!(
                 tagged_ptr,
+                0b1000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0001
+                    as *mut u8
+            );
+
+            let untagged_ptr = tagged_ptr.remove_tag();
+            assert_eq!(untagged_ptr, pointer);
+        }
+
+        #[test]
+        fn tag_nonnull_pointer() {
+            let pointer = NonNull::new(0x00000001 as *mut u8).unwrap();
+
+            let parsed = AllocationPointerTag::from_pointer(pointer.as_ptr());
+            assert_eq!(parsed, Some(AllocationPointerTag::Owned));
+
+            let tagged_ptr = pointer.tag(AllocationPointerTag::Borrowed);
+            assert_eq!(
+                tagged_ptr.as_ptr(),
+                0b1000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0001
+                    as *mut u8
+            );
+
+            let untagged_ptr = tagged_ptr.remove_tag();
+            assert_eq!(untagged_ptr, pointer);
+        }
+
+        #[test]
+        fn tag_nonnull_array_pointer() {
+            let pointer = NonNull::new(0x00000001 as *mut [u8; 1]).unwrap();
+
+            let parsed = AllocationPointerTag::from_pointer(pointer.as_ptr());
+            assert_eq!(parsed, Some(AllocationPointerTag::Owned));
+
+            let tagged_ptr = pointer.tag(AllocationPointerTag::Borrowed);
+            assert_eq!(
+                tagged_ptr.as_ptr().cast::<u8>(),
                 0b1000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0001
                     as *mut u8
             );
