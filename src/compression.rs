@@ -233,7 +233,7 @@ fn set_higher_bits<T>(ptr: *mut T, bits: usize, bit_length: usize) -> *mut T {
     let bits = (bits & mask) as usize;
 
     // Get the pointer value as a usize
-    let ptr_value = ptr as usize;
+    let ptr_value = ptr as *const u8 as usize;
 
     // Get the number of bits in a usize
     let usize_bits = std::mem::size_of::<usize>() * 8;
@@ -305,47 +305,53 @@ pub trait Taggable<Tag> {
     fn remove_tag_in_place(&mut self);
 }
 
-impl<T> Taggable<AllocationPointerTag> for *mut T {
-    fn tag(&self, tag: AllocationPointerTag) -> Self {
+impl<T, Tag> Taggable<Tag> for *mut T
+where
+    Tag: AbstractPointerTag,
+{
+    fn tag(&self, tag: Tag) -> Self {
         tag_pointer(*self, &tag)
     }
 
-    fn tag_in_place(&mut self, tag: AllocationPointerTag) {
+    fn tag_in_place(&mut self, tag: Tag) {
         *self = tag_pointer(*self, &tag);
     }
 
-    fn get_tag(&self) -> Option<AllocationPointerTag> {
+    fn get_tag(&self) -> Option<Tag> {
         get_pointer_tag(*self)
     }
 
     fn remove_tag(&self) -> Self {
-        untag_pointer::<T, AllocationPointerTag>(*self)
+        untag_pointer::<T, Tag>(*self)
     }
 
     fn remove_tag_in_place(&mut self) {
-        *self = untag_pointer::<T, AllocationPointerTag>(*self);
+        *self = untag_pointer::<T, Tag>(*self);
     }
 }
 
-impl<T> Taggable<AllocationPointerTag> for NonNull<T> {
-    fn tag(&self, tag: AllocationPointerTag) -> Self {
+impl<T, Tag> Taggable<Tag> for NonNull<T>
+where
+    Tag: AbstractPointerTag,
+{
+    fn tag(&self, tag: Tag) -> Self {
         NonNull::new(tag_pointer(self.as_ptr(), &tag)).unwrap()
     }
 
-    fn tag_in_place(&mut self, tag: AllocationPointerTag) {
+    fn tag_in_place(&mut self, tag: Tag) {
         *self = NonNull::new(tag_pointer(self.as_ptr(), &tag)).unwrap();
     }
 
-    fn get_tag(&self) -> Option<AllocationPointerTag> {
+    fn get_tag(&self) -> Option<Tag> {
         get_pointer_tag(self.as_ptr())
     }
 
     fn remove_tag(&self) -> Self {
-        NonNull::new(untag_pointer::<T, AllocationPointerTag>(self.as_ptr())).unwrap()
+        NonNull::new(untag_pointer::<T, Tag>(self.as_ptr())).unwrap()
     }
 
     fn remove_tag_in_place(&mut self) {
-        *self = NonNull::new(untag_pointer::<T, AllocationPointerTag>(self.as_ptr())).unwrap();
+        *self = NonNull::new(untag_pointer::<T, Tag>(self.as_ptr())).unwrap();
     }
 }
 
@@ -1775,7 +1781,7 @@ mod tests {
                     as *mut u8
             );
 
-            let untagged_ptr = tagged_ptr.remove_tag();
+            let untagged_ptr = <*mut u8 as Taggable<AllocationPointerTag>>::remove_tag(&tagged_ptr);
             assert_eq!(untagged_ptr, pointer);
         }
 
@@ -1793,7 +1799,8 @@ mod tests {
                     as *mut u8
             );
 
-            let untagged_ptr = tagged_ptr.remove_tag();
+            let untagged_ptr =
+                <std::ptr::NonNull<u8> as Taggable<AllocationPointerTag>>::remove_tag(&tagged_ptr);
             assert_eq!(untagged_ptr, pointer);
         }
 
@@ -1811,7 +1818,10 @@ mod tests {
                     as *mut u8
             );
 
-            let untagged_ptr = tagged_ptr.remove_tag();
+            let untagged_ptr =
+                <std::ptr::NonNull<[u8; 1]> as Taggable<AllocationPointerTag>>::remove_tag(
+                    &tagged_ptr,
+                );
             assert_eq!(untagged_ptr, pointer);
         }
     }

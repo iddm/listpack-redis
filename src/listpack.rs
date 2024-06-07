@@ -19,7 +19,7 @@ use redis_custom_allocator::{CustomAllocator, MemoryConsumption};
 
 use crate::{
     allocator::ListpackAllocator,
-    compression::TryEncode,
+    compression::{AllocationPointerTag, Taggable, TryEncode},
     entry::{ListpackEntryInsert, ListpackEntryRef, ListpackEntryRemoved},
     error::{AllocationError, Result},
     iter::{ListpackChunks, ListpackIntoIter, ListpackIter, ListpackWindows},
@@ -281,31 +281,118 @@ impl ListpackHeaderRef<'_> {
 
 /// A pointer to the allocation of the listpack. It will contain the
 /// header, the data block (including the elements), and the end marker.
+///
+/// This is simply a container of a pointer to the listpack data, and
+/// the pointer will never be automatically deallocated by
+/// the [`ListpackAllocationPointer`] itself, it is the responsibility
+/// of the user who allocated the memory to deallocate it.
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-struct ListpackAllocationPointer(NonNull<[u8]>);
+struct ListpackAllocationPointer(NonNull<u8>);
 
 impl ListpackAllocationPointer {
     /// Finds out the layout of the listpack by looking for the end
     /// marker.
-    fn from_ptr(ptr: NonNull<[u8]>) -> Result<Self> {
+    fn from_owned_ptr(ptr: NonNull<[u8]>) -> Result<Self> {
         if unsafe { ptr.as_ref() }.last() != Some(&END_MARKER) {
             return Err(crate::error::Error::MissingEndMarker);
         }
 
-        Ok(Self(ptr))
+        Ok(Self(ptr.cast()))
     }
 
+    /// Creates a listpack allocation pointer from a raw pointer. The
+    /// function will return an error if the pointer does not contain a
+    /// valid listpack.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the pointer is valid.
+    unsafe fn from_owned_raw_ptr(ptr: NonNull<u8>) -> Result<Self> {
+        Self::from_owned_ptr(Self::ptr_as_slice(ptr))
+    }
+
+    /// Creates a listpack allocation pointer from a borrowed pointer.
+    /// The pointer is tagged as borrowed.
+    pub fn from_borrowed_ptr(ptr: NonNull<[u8]>) -> Result<Self> {
+        if unsafe { ptr.as_ref() }.last() != Some(&END_MARKER) {
+            return Err(crate::error::Error::MissingEndMarker);
+        }
+
+        let ptr: NonNull<u8> = ptr.cast();
+
+        Ok(Self(ptr.tag(AllocationPointerTag::Borrowed)))
+    }
+
+    /// Creates a lsitpack allocation pointer from a raw borrowed
+    /// pointer. The function will return an error if the pointer does
+    /// not contain a valid listpack.
+    unsafe fn from_borrowed_raw_ptr(ptr: NonNull<u8>) -> Result<Self> {
+        Self::from_borrowed_ptr(Self::ptr_as_slice(ptr))
+    }
+
+    /// Converts a pointer to a slice pointer.
+    fn ptr_as_slice(ptr: NonNull<u8>) -> NonNull<[u8]> {
+        let header = unsafe { ListpackHeader::from_ptr(ptr.as_ptr().cast()) };
+        let total_bytes = header.total_bytes as usize;
+
+        unsafe {
+            NonNull::new_unchecked(std::ptr::slice_from_raw_parts_mut(
+                ptr.as_ptr(),
+                total_bytes,
+            ))
+        }
+    }
+
+    /// Returns [`true`] if the pointer is tagged as borrowed, meaning
+    /// the data allocated and referred to by the pointer is not owned
+    /// by the pointer itself.
+    pub fn is_borrowed(&self) -> bool {
+        self.0.get_tag() == Some(AllocationPointerTag::Borrowed)
+    }
+
+    /// Returns [`true`] if the pointer is tagged as owned, meaning the
+    /// data allocated and referred to by the pointer is owned by the
+    /// pointer itself.
+    pub fn is_owned(&self) -> bool {
+        !self.is_borrowed()
+    }
+
+    /// Returns the pointer to the beginning of the data.
     fn ptr(&self) -> NonNull<u8> {
-        self.0.cast()
+        // if self.is_owned() {
+        //     self.0.cast()
+        // } else {
+        //     <NonNull<u8> as Taggable<AllocationPointerTag>>::remove_tag(&self.0).cast()
+        // }
+        <NonNull<u8> as Taggable<AllocationPointerTag>>::remove_tag(&self.0).cast()
+    }
+
+    /// Returns the length of the listpack accessible by the pointer.
+    fn get_length(&self) -> usize {
+        unsafe { ListpackHeader::from_ptr(self.ptr().as_ptr().cast_const()) }.total_bytes()
     }
 
     fn layout(&self) -> Layout {
-        Layout::from_size_align(self.0.len(), 1).expect("Could not create layout")
+        Layout::from_size_align(self.get_length(), 1).expect("Could not create layout")
     }
 
-    fn as_slice(&self) -> &[u8] {
-        unsafe { self.0.as_ref() }
+    /// Returns a pointer to a slice of bytes.
+    pub fn as_slice_raw_ptr(&self) -> *mut [u8] {
+        let ptr = self.ptr().as_ptr();
+        let length = self.get_length();
+
+        std::ptr::slice_from_raw_parts_mut(ptr, length)
+    }
+
+    /// Returns a pointer to a slice of bytes as a NonNull pointer.
+    pub fn as_slice_ptr(&self) -> NonNull<[u8]> {
+        unsafe { NonNull::new_unchecked(self.as_slice_raw_ptr()) }
+    }
+
+    /// Returns a slice of bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { &*self.as_slice_raw_ptr() }
     }
 
     /// Returns a pointer to the beginning of the data.
@@ -318,7 +405,7 @@ impl ListpackAllocationPointer {
     }
 
     fn data_start_slice(&self) -> &[u8] {
-        unsafe { &self.0.as_ref()[std::mem::size_of::<ListpackHeader>()..] }
+        &self.as_slice()[std::mem::size_of::<ListpackHeader>()..]
     }
 
     /// Returns a pointer pointing to the end marker.
@@ -476,9 +563,15 @@ where
     Allocator: CustomAllocator,
 {
     fn drop(&mut self) {
-        unsafe {
-            self.allocator
-                .deallocate(self.allocation.ptr(), self.allocation.layout())
+        // If the pointer this listpack object was created from is
+        // owned by the allocator, deallocate the memory. If it is not
+        // owned, the allocator should not deallocate the memory.
+
+        if self.allocation.is_owned() {
+            unsafe {
+                self.allocator
+                    .deallocate(self.allocation.ptr(), self.allocation.layout())
+            }
         }
     }
 }
@@ -741,25 +834,37 @@ where
     }
 
     /// Returns a reference to the listpack located at the beginning of
-    /// the provided pointer.
+    /// the provided pointer. The pointer must point exactly to the
+    /// listpack's data: the header, the elements, and the end marker.
+    ///
+    /// The allocator must be provided to the listpack, as it is used
+    /// to deallocate the listpack when it is dropped.
+    ///
+    /// Creating a Listpack object from this function is cheap: there
+    /// are no allocations made except for the pointer and the
+    /// allocator: the pointer to the listpack provided as an argument
+    /// to this method will **NOT** be owned by the returned
+    /// [`Listpack`] object, but will be used for reading. So the user
+    /// is responsible for deallocating the memory pointed to by the
+    /// provided pointer. Once the returned [`Listpack`] object needs to
+    /// allocate more memory, it will use the allocator provided to the
+    /// function to allocate another memory block, which **will be**
+    /// owned by the returning object. When the listpack is dropped, the
+    /// allocator will deallocate the memory.
     ///
     /// # Safety
     ///
     /// The caller must ensure that the pointer is valid.
-    pub unsafe fn ref_from_ptr<'a>(ptr: *const u8) -> &'a Self {
-        unsafe { &*(ptr as *const Self) }
-    }
+    pub unsafe fn from_ptr(ptr: *const u8, allocator: Allocator) -> Self {
+        let allocation = ListpackAllocationPointer::from_borrowed_raw_ptr(NonNull::new_unchecked(
+            ptr.cast_mut(),
+        ))
+        .expect("The listpack is valid.");
 
-    /// Returns a mutable reference to the listpack located at the
-    /// beginning of the provided pointer.
-    ///
-    /// # Safety
-    ///
-    /// 1. The caller must ensure that the pointer is valid.
-    /// 2. Any mutation of the listpack must be done in a safe way,
-    ///    that does not reallocate the listpack.
-    pub unsafe fn ref_mut_from_ptr<'a>(ptr: *mut u8) -> &'a mut Self {
-        unsafe { &mut *(ptr as *mut Self) }
+        Self {
+            allocation,
+            allocator,
+        }
     }
 
     /// Returns the encoding types of the elements of the listpack.
@@ -816,8 +921,8 @@ where
         &mut self.allocator
     }
 
-    /// Returns a raw pointer to the listpack. The returned pointer is
-    /// never null.
+    /// Returns a raw pointer to the listpack data (starting from the
+    /// header). The returned pointer is never null.
     ///
     /// # Example
     ///
@@ -829,7 +934,7 @@ where
     /// assert!(!ptr.is_null());
     /// ```
     pub fn as_ptr(&self) -> *const u8 {
-        self.allocation.0.as_ptr().cast()
+        self.allocation.ptr().as_ptr().cast()
     }
 
     /// Returns a mutable raw pointer to the listpack. The returned
@@ -845,7 +950,7 @@ where
     /// assert!(!ptr.is_null());
     /// ```
     pub fn as_mut_ptr(&mut self) -> *mut [u8] {
-        self.allocation.0.as_ptr()
+        self.allocation.as_slice_raw_ptr()
     }
 
     /// Returns a mutable reference to the listpack header.
@@ -949,7 +1054,8 @@ where
     /// std::mem::forget(old);
     /// ```
     pub unsafe fn from_raw_parts(ptr: NonNull<[u8]>, allocator: Allocator) -> Self {
-        let allocation = ListpackAllocationPointer::from_ptr(ptr).expect("The listpack is valid.");
+        let allocation =
+            ListpackAllocationPointer::from_owned_ptr(ptr).expect("The listpack is valid.");
 
         Self {
             allocation,
@@ -1575,7 +1681,7 @@ where
             };
         }
 
-        let mut pointer = ListpackAllocationPointer(ptr);
+        let mut pointer = ListpackAllocationPointer(ptr.cast());
 
         pointer.set_end_marker();
 
@@ -1640,11 +1746,10 @@ where
     /// block (for the safety).
     fn grow(&mut self, new_layout: Layout) -> Result<(), <Allocator as CustomAllocator>::Error> {
         unsafe {
-            self.allocation.0 = self.allocator.grow(
-                self.allocation.ptr().cast(),
-                self.allocation.layout(),
-                new_layout,
-            )?;
+            self.allocation.0 = self
+                .allocator
+                .grow(self.allocation.ptr(), self.allocation.layout(), new_layout)?
+                .cast();
 
             self.allocation.set_new_size(new_layout.size());
         }
@@ -1673,11 +1778,10 @@ where
                 .expect("Created layout");
 
         unsafe {
-            self.allocation.0 = self.get_allocator().shrink(
-                self.allocation.ptr().cast(),
-                self.allocation.layout(),
-                new_layout,
-            )?;
+            self.allocation.0 = self
+                .get_allocator()
+                .shrink(self.allocation.ptr(), self.allocation.layout(), new_layout)?
+                .cast();
 
             self.allocation.set_new_size(new_layout.size());
         }
@@ -3229,19 +3333,19 @@ mod tests {
     #[test]
     fn memory_consumption() {
         let mut listpack: Listpack = Listpack::default();
-        assert_eq!(listpack.memory_consumption(), 23);
+        assert_eq!(listpack.memory_consumption(), 15);
 
         listpack.push("Hello");
-        assert_eq!(listpack.memory_consumption(), 30);
+        assert_eq!(listpack.memory_consumption(), 22);
 
         listpack.push("World");
-        assert_eq!(listpack.memory_consumption(), 37);
+        assert_eq!(listpack.memory_consumption(), 29);
 
         listpack.pop();
-        assert_eq!(listpack.memory_consumption(), 30);
+        assert_eq!(listpack.memory_consumption(), 22);
 
         listpack.pop();
-        assert_eq!(listpack.memory_consumption(), 23);
+        assert_eq!(listpack.memory_consumption(), 15);
     }
 
     #[test]
@@ -3251,32 +3355,32 @@ mod tests {
         const LARGER_STRING: &str = "abc";
 
         let mut listpack: Listpack = Listpack::default();
-        assert_eq!(listpack.memory_consumption(), 23);
+        assert_eq!(listpack.memory_consumption(), 15);
         listpack.validate().unwrap();
 
         listpack.push(MIDDLE_STRING);
         listpack.validate().unwrap();
-        assert_eq!(listpack.memory_consumption(), 27);
+        assert_eq!(listpack.memory_consumption(), 19);
         assert_eq!(&listpack.get(0).unwrap().to_string(), MIDDLE_STRING);
         assert_eq!(listpack.len(), 1);
 
         // Downsize to a smaller string.
         listpack.replace(0, SMALLER_STRING);
-        assert_eq!(listpack.memory_consumption(), 26);
+        assert_eq!(listpack.memory_consumption(), 18);
         assert_eq!(listpack.len(), 1);
         assert_eq!(listpack.get(0).unwrap().to_string(), SMALLER_STRING);
         listpack.validate().unwrap();
 
         // Upsize to a larger string.
         listpack.replace(0, LARGER_STRING);
-        assert_eq!(listpack.memory_consumption(), 28);
+        assert_eq!(listpack.memory_consumption(), 20);
         assert_eq!(listpack.len(), 1);
         assert_eq!(listpack.get(0).unwrap().to_string(), LARGER_STRING);
         listpack.validate().unwrap();
 
         // Replace to the same string.
         listpack.replace(0, LARGER_STRING);
-        assert_eq!(listpack.memory_consumption(), 28);
+        assert_eq!(listpack.memory_consumption(), 20);
         assert_eq!(listpack.len(), 1);
         assert_eq!(listpack.get(0).unwrap().to_string(), LARGER_STRING);
         listpack.validate().unwrap();
@@ -3573,5 +3677,44 @@ mod tests {
 
         assert!(!data_end_ptr.is_null());
         assert_eq!(unsafe { *data_end_ptr }, 0xff);
+    }
+
+    #[test]
+    fn listpack_allocation_pointer_from_raw_ptr() {
+        // let listpack: Listpack = Listpack::default();
+        // let ptr = listpack.as_ptr().cast_mut();
+        // let allocation_pointer =
+        //     unsafe { ListpackAllocationPointer::from_raw_ptr(NonNull::new_unchecked(ptr)) }
+        //         .unwrap();
+
+        // assert_eq!(
+        //     allocation_pointer.available_bytes(),
+        //     listpack.get_header_ref().available_bytes()
+        // );
+        // assert_eq!(
+        //     allocation_pointer.total_bytes(),
+        //     listpack.get_header_ref().total_bytes()
+        // );
+        // assert_eq!(
+        //     allocation_pointer.num_elements(),
+        //     listpack.get_header_ref().num_elements()
+        // );
+        // assert_eq!(
+        //     allocation_pointer.data_start_ptr(),
+        //     listpack.allocation.data_start_ptr()
+        // );
+        // assert_eq!(
+        //     allocation_pointer.data_end_ptr(),
+        //     listpack.allocation.data_end_ptr()
+        // );
+    }
+
+    #[test]
+    fn listpack_from_ptr() {
+        let listpack: Listpack = Listpack::default();
+        let ptr = listpack.as_ptr().cast_mut();
+        let listpack_from_ptr = unsafe { Listpack::from_ptr(ptr, DefaultAllocator) };
+
+        assert_eq!(listpack, listpack_from_ptr);
     }
 }
