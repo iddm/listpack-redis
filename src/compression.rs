@@ -52,10 +52,14 @@ impl Deref for VirtualMemoryUnusedBitsCount {
 }
 
 impl VirtualMemoryUnusedBitsCount {
-    /// To be on the safe side, the maximum is lowered from 16 unused
-    /// bits to 8 unused bits. This is because the maximum number of
-    /// unused bits depends on the target architecture and the kernel.
-    pub const MAXIMUM_UNUSED_BITS_COUNTS: u8 = 8;
+    /// To be on the safe side, the implementor should consider a lower
+    /// value: the maximum value used by the pointers is 48 bits, but,
+    /// as it depends on the architecture, the implementor must choose
+    /// accordingly how many bytes will be used as a storage to avoid
+    /// corrupting the pointer value.
+    ///
+    /// The maximum number of used bits I've seen was 52.
+    pub const MAXIMUM_UNUSED_BITS_COUNTS: u8 = 16;
 
     /// The minimum number is obviously 1.
     pub const MINIMUM_UNUSED_BITS_COUNTS: u8 = 1;
@@ -80,6 +84,22 @@ impl VirtualMemoryUnusedBitsCount {
     pub const SEVEN: Self = Self(7);
     /// Eight bits unused.
     pub const EIGHT: Self = Self(8);
+    /// Nine bits unused.
+    pub const NINE: Self = Self(9);
+    /// Ten bits unused.
+    pub const TEN: Self = Self(10);
+    /// Eleven bits unused.
+    pub const ELEVEN: Self = Self(11);
+    /// Twelve bits unused.
+    pub const TWELVE: Self = Self(12);
+    /// Thirteen bits unused.
+    pub const THIRTEEN: Self = Self(13);
+    /// Fourteen bits unused.
+    pub const FOURTEEN: Self = Self(14);
+    /// Fifteen bits unused.
+    pub const FIFTEEN: Self = Self(15);
+    /// Sixteen bits unused.
+    pub const SIXTEEN: Self = Self(16);
 
     /// Creates a new instance of the virtual memory unused bytes count.
     pub fn new(count: u8) -> Self {
@@ -105,6 +125,61 @@ impl VirtualMemoryUnusedBitsCount {
     /// [`Self::get_count`]).
     pub fn get_count_usize(self) -> usize {
         self.0 as usize
+    }
+
+    /// Returns the number of bits that are **used** in the virtual
+    /// memory addressing of the current CPU architecture this program
+    /// is running on.
+    pub fn get_actual_virtual_address_size() -> Result<u8, &'static str> {
+        // Read the /proc/cpuinfo file, find there the value for the
+        // "Address sizes" field, and return that number.
+        // An example string:
+        //
+        // "address sizes	: 48 bits physical, 48 bits virtual"
+        //
+        // we return the number 48.
+
+        let address_sizes = std::fs::read_to_string("/proc/cpuinfo")
+            .map_err(|_| "Couldn't read the /proc/cpuinfo file.")?;
+
+        let address_sizes = address_sizes
+            .lines()
+            .find(|line| line.starts_with("address sizes"))
+            .ok_or("The 'address sizes' field is not found in the /proc/cpuinfo file.")?;
+
+        let address_sizes = address_sizes
+            .split(':')
+            .nth(1)
+            .ok_or("The 'address sizes' field is not found in the /proc/cpuinfo file.")?;
+
+        let address_sizes = address_sizes
+            .trim()
+            .split(',')
+            .find(|part| part.contains("virtual"))
+            .ok_or("The 'virtual' part is not found in the 'address sizes' field.")?;
+
+        let address_sizes = address_sizes
+            .split_whitespace()
+            .find(|part| part.parse::<u8>().is_ok())
+            .ok_or("The number of bits is not found in the 'address sizes' field.")?;
+
+        let address_size = address_sizes
+            .parse::<u8>()
+            .map_err(|_| "Couldn't extract the virtual address size value.")?;
+
+        Ok(address_size)
+    }
+
+    /// Returns the number of bits that are **unused** in the virtual
+    /// memory addressing of the current CPU architecture this program
+    /// is running on.
+    pub fn get_actual_unused_virtual_address_size() -> Result<Self, &'static str> {
+        const POINTER_SIZE: usize = std::mem::size_of::<usize>() * 8;
+        let actual_address_size = Self::get_actual_virtual_address_size()?;
+
+        Ok(Self::new(
+            (POINTER_SIZE - actual_address_size as usize) as u8,
+        ))
     }
 }
 
@@ -181,17 +256,6 @@ impl AbstractPointerTag for AllocationPointerTag {
     }
 
     fn from_pointer<T>(pointer: *mut T) -> Option<Self> {
-        // Read the highest (leftmost) bits of the pointer and extract
-        // the tag from there.
-        // let pointer = pointer as usize;
-
-        // let type_tag_mask =
-        //     (1 << (std::mem::size_of::<usize>() * 8 - Self::BIT_LENGTH.get_count_usize())) - 1;
-
-        // let type_tag = pointer & type_tag_mask;
-
-        // Self::from_byte(type_tag as u8)
-
         let bit_length = Self::BIT_LENGTH.get_count_usize();
 
         // Get the number of bits in a usize
@@ -218,11 +282,59 @@ where
     set_higher_bits(ptr, bits as usize, 1)
 }
 
-fn generate_bit_mask_with_ones(bit_length: usize) -> usize {
+/// Generates a bit mask with the given number of bits set to one.
+///
+/// # Arguments
+///
+/// * `bit_length` - The number of bits to set to one.
+///
+/// # Returns
+///
+/// A bit mask with the given number of bits set to one.
+///
+/// # Panics
+///
+/// Panics if the `bit_length` is greater than the number of bits in a
+/// `usize`.
+///
+/// # Example
+///
+/// ```
+/// use listpack_redis::compression::generate_bit_mask_with_ones;
+///
+/// let mask = generate_bit_mask_with_ones(4);
+/// assert_eq!(mask, 0b00001111);
+/// ```
+pub fn generate_bit_mask_with_ones(bit_length: usize) -> usize {
     (1 << bit_length) - 1
 }
 
-fn set_higher_bits<T>(ptr: *mut T, bits: usize, bit_length: usize) -> *mut T {
+/// Sets the higher bits of the pointer to the given bits provided in
+/// the argument. The number of bits to set is determined by the
+/// `bit_length` argument.
+///
+/// # Arguments
+///
+/// * `ptr` - The pointer to set the higher bits.
+/// * `bits` - The bits to set.
+/// * `bit_length` - The number of bits to set.
+///
+/// # Returns
+///
+/// The pointer with the higher bits set.
+///
+/// # Example
+///
+/// ```
+/// use listpack_redis::compression::set_higher_bits;
+///
+/// let ptr = 0x1234 as *mut u8;
+///
+/// let new_ptr = set_higher_bits(ptr, 0b101, 3);
+///
+/// assert_eq!(new_ptr as usize, 0x1234 | 0b101 << (std::mem::size_of::<usize>() * 8 - 3));
+/// ```
+pub fn set_higher_bits<T>(ptr: *mut T, bits: usize, bit_length: usize) -> *mut T {
     if bit_length == 0 {
         return ptr;
     }
@@ -251,7 +363,7 @@ fn set_higher_bits<T>(ptr: *mut T, bits: usize, bit_length: usize) -> *mut T {
     new_ptr_value as *mut T
 }
 
-/// Sets the tag to the pointer.
+/// Sets the tag ([`AbstractPointerTag`]) to the pointer.
 pub fn tag_pointer<T, Tag>(pointer: *mut T, tag: &Tag) -> *mut T
 where
     Tag: AbstractPointerTag,
@@ -260,7 +372,9 @@ where
     set_higher_bits(pointer, tag.as_usize(), Tag::BIT_LENGTH.get_count_usize())
 }
 
-/// Set the highest bits to zeroes.
+/// Set the highest bits to zeroes. The number of the highest bits to
+/// set to zero is determined by the target type's tag's
+/// [`AbstractPointerTag::BIT_LENGTH`] value.
 pub fn untag_pointer<T, Tag>(pointer: *mut T) -> *mut T
 where
     Tag: AbstractPointerTag,
@@ -273,16 +387,6 @@ pub fn get_pointer_tag<T, Tag>(pointer: *mut T) -> Option<Tag>
 where
     Tag: AbstractPointerTag,
 {
-    // // Get the number of bits in a usize
-    // let usize_bits = std::mem::size_of::<usize>() * 8;
-
-    // // Convert the pointer to a usize to perform bitwise operations
-    // let ptr_value = pointer as usize;
-
-    // // Extract the highest two bits and shift them to the lowest two bits position
-    // let mask = generate_bit_mask_with_ones(Tag::BIT_LENGTH);
-    // let tag_byte = (ptr_value >> (usize_bits - Tag::BIT_LENGTH)) & mask;
-
     Tag::from_pointer(pointer)
 }
 
@@ -1824,5 +1928,21 @@ mod tests {
                 );
             assert_eq!(untagged_ptr, pointer);
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn get_actual_virtual_address_size() {
+        assert_eq!(
+            VirtualMemoryUnusedBitsCount::get_actual_unused_virtual_address_size()
+                .unwrap()
+                .get_count(),
+            16,
+        );
+
+        assert_eq!(
+            VirtualMemoryUnusedBitsCount::get_actual_virtual_address_size().unwrap(),
+            48,
+        );
     }
 }
