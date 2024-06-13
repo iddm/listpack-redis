@@ -12,6 +12,8 @@ use std::{
     ptr::NonNull,
 };
 
+use once_cell::sync::Lazy;
+
 use crate::error::Result;
 
 /// The encoded presentation of the object as a byte array. This is
@@ -40,6 +42,7 @@ pub trait Encode {
 
 /// A struct containing the number of bytes that are unused in the
 /// virtual memory addressing.
+#[repr(transparent)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VirtualMemoryUnusedBitsCount(u8);
 
@@ -51,6 +54,22 @@ impl Deref for VirtualMemoryUnusedBitsCount {
     }
 }
 
+impl std::fmt::Display for VirtualMemoryUnusedBitsCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} unused bits", self.0)
+    }
+}
+
+/// The actual maximum number of unused bits in the virtual memory
+/// addressing. This value is determined by the CPU architecture and
+/// the operating system. The value of this object must remain private
+/// and only exposed via the [`VirtualMemoryUnusedBitsCount`] type.
+///
+/// The value is set at compile-time, as the target architecture is
+/// known at compile-time and must not change during the runtime.
+static ACTUAL_MAXIMUM_UNUSED_BITS_COUNTS_AT_COMPILE_TIME: Lazy<VirtualMemoryUnusedBitsCount> =
+    Lazy::new(|| VirtualMemoryUnusedBitsCount::get_actual_unused_virtual_address_size().unwrap());
+
 impl VirtualMemoryUnusedBitsCount {
     /// To be on the safe side, the implementor should consider a lower
     /// value: the maximum value used by the pointers is 48 bits, but,
@@ -59,13 +78,21 @@ impl VirtualMemoryUnusedBitsCount {
     /// corrupting the pointer value.
     ///
     /// The maximum number of used bits I've seen was 52.
-    pub const MAXIMUM_UNUSED_BITS_COUNTS: u8 = 16;
+    pub const MAXIMUM_UNUSED_BITS_COUNTS: Self = Self::SIXTEEN;
+
+    /// This is the maximum safe number of unused bits. This number is
+    /// taken from the current CPU architectures capabilities. One of
+    /// the architectures uses 52 bits of the virtual memory addressing,
+    /// this is where this number comes from.
+    ///
+    /// This number is highly likely to be always safe to use.
+    pub const SAFE_UNUSED_BITS_COUNTS: Self = Self::TWELVE;
 
     /// The minimum number is obviously 1.
-    pub const MINIMUM_UNUSED_BITS_COUNTS: u8 = 1;
+    pub const MINIMUM_UNUSED_BITS_COUNTS: Self = Self::ONE;
 
     /// The range of unused bits.
-    pub const UNUSED_BITS_RANGE: std::ops::RangeInclusive<u8> =
+    pub const UNUSED_BITS_RANGE: std::ops::RangeInclusive<Self> =
         Self::MINIMUM_UNUSED_BITS_COUNTS..=Self::MAXIMUM_UNUSED_BITS_COUNTS;
 
     /// One bit unused.
@@ -103,7 +130,7 @@ impl VirtualMemoryUnusedBitsCount {
 
     /// Creates a new instance of the virtual memory unused bytes count.
     pub fn new(count: u8) -> Self {
-        if Self::UNUSED_BITS_RANGE.contains(&count) {
+        if Self::UNUSED_BITS_RANGE.contains(&Self(count)) {
             Self(count)
         } else {
             panic!(
@@ -129,7 +156,7 @@ impl VirtualMemoryUnusedBitsCount {
 
     /// Returns the number of bits that are **used** in the virtual
     /// memory addressing of the current CPU architecture this program
-    /// is running on.
+    /// is running on. The function runs at runtime.
     pub fn get_actual_virtual_address_size() -> Result<u8, &'static str> {
         // Read the /proc/cpuinfo file, find there the value for the
         // "Address sizes" field, and return that number.
@@ -163,16 +190,15 @@ impl VirtualMemoryUnusedBitsCount {
             .find(|part| part.parse::<u8>().is_ok())
             .ok_or("The number of bits is not found in the 'address sizes' field.")?;
 
-        let address_size = address_sizes
+        address_sizes
             .parse::<u8>()
-            .map_err(|_| "Couldn't extract the virtual address size value.")?;
-
-        Ok(address_size)
+            .map_err(|_| "Couldn't extract the virtual address size value.")
     }
 
     /// Returns the number of bits that are **unused** in the virtual
     /// memory addressing of the current CPU architecture this program
-    /// is running on.
+    /// is running on. The function runs at runtime in the runtime
+    /// environment and reads the CPU capabilities at runtime.
     pub fn get_actual_unused_virtual_address_size() -> Result<Self, &'static str> {
         const POINTER_SIZE: usize = std::mem::size_of::<usize>() * 8;
         let actual_address_size = Self::get_actual_virtual_address_size()?;
@@ -181,16 +207,12 @@ impl VirtualMemoryUnusedBitsCount {
             (POINTER_SIZE - actual_address_size as usize) as u8,
         ))
     }
-}
 
-/// The tag which a pointer can have to store the information regarding
-/// its allocation: whether it needs to be deallocated or not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash)]
-pub enum AllocationPointerTag {
-    /// Means the pointer is owned and should be deallocated.
-    Owned,
-    /// Means the pointer is borrowed and should not be deallocated.
-    Borrowed,
+    /// Returns the maximum number of bits that are unused in the
+    /// virtual memory addressing determined at compile-time.
+    pub fn get_actual_unused_virtual_address_size_at_compile_time() -> Self {
+        *ACTUAL_MAXIMUM_UNUSED_BITS_COUNTS_AT_COMPILE_TIME
+    }
 }
 
 /// Defines a type that can be used as a pointer tag.
@@ -226,6 +248,16 @@ pub trait AbstractPointerTag {
     {
         tag_pointer(pointer, self)
     }
+}
+
+/// The tag which a pointer can have to store the information regarding
+/// its allocation: whether it needs to be deallocated or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash)]
+pub enum AllocationPointerTag {
+    /// Means the pointer is owned and should be deallocated.
+    Owned,
+    /// Means the pointer is borrowed and should not be deallocated.
+    Borrowed,
 }
 
 impl AbstractPointerTag for AllocationPointerTag {
