@@ -12,8 +12,6 @@ use std::{
     ptr::NonNull,
 };
 
-use once_cell::sync::Lazy;
-
 use crate::error::Result;
 
 /// The encoded presentation of the object as a byte array. This is
@@ -60,6 +58,24 @@ impl std::fmt::Display for VirtualMemoryUnusedBitsCount {
     }
 }
 
+// A compile-time function to parse a number from string.
+const fn parse_u8_from_str(string: &str) -> u8 {
+    let mut value: u8 = 0;
+    let mut bytes = string.as_bytes();
+
+    while let [byte, rest @ ..] = bytes {
+        bytes = rest;
+        if let b'0'..=b'9' = byte {
+            value *= 10;
+            value += (*byte - b'0') as u8;
+        } else {
+            panic!("The provided string is not a number.")
+        }
+    }
+
+    value
+}
+
 /// The actual maximum number of unused bits in the virtual memory
 /// addressing. This value is determined by the CPU architecture and
 /// the operating system. The value of this object must remain private
@@ -67,8 +83,8 @@ impl std::fmt::Display for VirtualMemoryUnusedBitsCount {
 ///
 /// The value is set at compile-time, as the target architecture is
 /// known at compile-time and must not change during the runtime.
-static ACTUAL_MAXIMUM_UNUSED_BITS_COUNTS_AT_COMPILE_TIME: Lazy<VirtualMemoryUnusedBitsCount> =
-    Lazy::new(|| VirtualMemoryUnusedBitsCount::get_actual_unused_virtual_address_size().unwrap());
+const ACTUAL_MAXIMUM_UNUSED_BITS_COUNTS_AT_COMPILE_TIME: u8 =
+    parse_u8_from_str(env!("VIRTUAL_ADDRESS_SIZE"));
 
 impl VirtualMemoryUnusedBitsCount {
     /// To be on the safe side, the implementor should consider a lower
@@ -84,6 +100,11 @@ impl VirtualMemoryUnusedBitsCount {
     /// taken from the current CPU architectures capabilities. One of
     /// the architectures uses 52 bits of the virtual memory addressing,
     /// this is where this number comes from.
+    ///
+    /// For the reference:
+    /// - `ARMv8` architecture uses `52` bits.
+    /// - `x86_64` uses `48` bits.
+    /// - Apple Silicon uses `47` bits.
     ///
     /// This number is highly likely to be always safe to use.
     pub const SAFE_UNUSED_BITS_COUNTS: Self = Self::TWELVE;
@@ -210,8 +231,8 @@ impl VirtualMemoryUnusedBitsCount {
 
     /// Returns the maximum number of bits that are unused in the
     /// virtual memory addressing determined at compile-time.
-    pub fn get_actual_unused_virtual_address_size_at_compile_time() -> Self {
-        *ACTUAL_MAXIMUM_UNUSED_BITS_COUNTS_AT_COMPILE_TIME
+    pub const fn get_actual_unused_virtual_address_size_at_compile_time() -> Self {
+        Self(ACTUAL_MAXIMUM_UNUSED_BITS_COUNTS_AT_COMPILE_TIME)
     }
 }
 
@@ -222,16 +243,23 @@ pub trait AbstractPointerTag {
     /// bits is limited to the size of a pointer (physically), but
     /// logically maximum to 16 bits only, as in the 64-bit systems
     /// there are only 48 bits available for virtual addressing, and on
-    /// some systems and architectures even less
+    /// some systems and architectures even less. See
+    /// [`VirtualMemoryUnusedBitsCount`] for more information.
     const BIT_LENGTH: VirtualMemoryUnusedBitsCount;
 
+    /// The number of bits in the [`usize`] type.
+    const USIZE_BITS_COUNT: usize = std::mem::size_of::<usize>() * 8;
+
     /// Returns the type tag from the given byte.
-    fn from_byte(byte: u8) -> Option<Self>
+    fn from_bytes(bytes: u16) -> Option<Self>
     where
         Self: Sized;
 
-    /// Returns the byte representation of the tag.
-    fn as_byte(&self) -> u8;
+    /// Returns the byte representation of the tag. A tag may consist of
+    /// maximum two bytes on a 64-bit system (as the pointer is 8 bytes
+    /// and the maximum number of bits that can be used for the tag is
+    /// 16). The first byte is the highest byte of the tag,
+    fn as_bytes(&self) -> u16;
 
     /// A convenience function to get the tag as a [`usize`] value.
     fn as_usize(&self) -> usize;
@@ -264,34 +292,33 @@ impl AbstractPointerTag for AllocationPointerTag {
     /// The number of bits the allocation tag occupies.
     const BIT_LENGTH: VirtualMemoryUnusedBitsCount = VirtualMemoryUnusedBitsCount::ONE;
 
-    fn from_byte(byte: u8) -> Option<Self> {
-        match byte {
-            0b0 => Some(Self::Owned),
-            0b1 => Some(Self::Borrowed),
+    fn from_bytes(bytes: u16) -> Option<Self> {
+        match bytes {
+            0 => Some(Self::Owned),
+            0b10000000_00000000 => Some(Self::Borrowed),
             _ => None,
         }
     }
 
-    fn as_byte(&self) -> u8 {
+    fn as_bytes(&self) -> u16 {
         match self {
-            Self::Owned => 0b0,
-            Self::Borrowed => 0b1,
+            Self::Owned => 0,
+            Self::Borrowed => 0b10000000_00000000,
         }
     }
 
     fn as_usize(&self) -> usize {
-        let byte = self.as_byte();
-        let usize_bits = std::mem::size_of::<usize>() * 8;
+        let bytes = self.as_bytes();
         let bit_length = Self::BIT_LENGTH.get_count_usize();
 
-        (byte as usize) << (usize_bits - bit_length) | ((1 << (usize_bits - bit_length)) - 1)
+        (bytes as usize) << (Self::USIZE_BITS_COUNT - bit_length)
+            | ((1 << (Self::USIZE_BITS_COUNT - bit_length)) - 1)
     }
 
     fn from_pointer<T>(pointer: *mut T) -> Option<Self> {
         let bit_length = Self::BIT_LENGTH.get_count_usize();
 
         // Get the number of bits in a usize
-        let usize_bits = std::mem::size_of::<usize>() * 8;
 
         // Convert the pointer to a usize to perform bitwise operations
         let ptr_value = pointer as usize;
@@ -299,9 +326,9 @@ impl AbstractPointerTag for AllocationPointerTag {
         let mask = generate_bit_mask_with_ones(bit_length);
 
         // Extract the highest two bits and shift them to the lowest two bits position
-        let tag_byte = (ptr_value >> (usize_bits - bit_length)) & mask;
+        let tag_byte = (ptr_value >> (Self::USIZE_BITS_COUNT - bit_length)) & mask;
 
-        Self::from_byte(tag_byte as u8)
+        Self::from_bytes((tag_byte as u16) << (16 - bit_length))
     }
 }
 
@@ -309,7 +336,7 @@ fn set_higher_bit<T, Tag>(ptr: *mut T, tag: &Tag) -> *mut T
 where
     Tag: AbstractPointerTag,
 {
-    let bits = tag.as_byte();
+    let bits = tag.as_bytes();
 
     set_higher_bits(ptr, bits as usize, 1)
 }
@@ -374,22 +401,22 @@ pub fn set_higher_bits<T>(ptr: *mut T, bits: usize, bit_length: usize) -> *mut T
     let mask = generate_bit_mask_with_ones(bit_length);
 
     // Ensure the bits have only the allowed range of values.
-    let bits = (bits & mask) as usize;
+    let bits = bits & mask;
 
     // Get the pointer value as a usize
     let ptr_value = ptr as *const u8 as usize;
 
     // Get the number of bits in a usize
-    let usize_bits = std::mem::size_of::<usize>() * 8;
+    const USIZE_BITS_COUNT: usize = std::mem::size_of::<usize>() * 8;
 
     // Create a mask to zero out the required bits
-    let zero_mask = !(mask << (usize_bits - bit_length));
+    let zero_mask = !(mask << (USIZE_BITS_COUNT - bit_length));
 
     // Clear the highest two bits of the pointer value
     let cleared_ptr_value = ptr_value & zero_mask;
 
     // Set the highest two bits using the provided `as_byte` value
-    let new_ptr_value = cleared_ptr_value | (bits << (usize_bits - bit_length));
+    let new_ptr_value = cleared_ptr_value | (bits << (USIZE_BITS_COUNT - bit_length));
 
     // Convert back to a pointer and return
     new_ptr_value as *mut T
@@ -400,7 +427,6 @@ pub fn tag_pointer<T, Tag>(pointer: *mut T, tag: &Tag) -> *mut T
 where
     Tag: AbstractPointerTag,
 {
-    // set_higher_bit(pointer, tag)
     set_higher_bits(pointer, tag.as_usize(), Tag::BIT_LENGTH.get_count_usize())
 }
 
@@ -1904,7 +1930,29 @@ mod tests {
         use super::*;
 
         #[test]
-        fn tag_raw_pointer() {
+        fn set_higher_bits() {
+            let pointer = 0x00000001 as *mut u8;
+
+            let tagged = super::set_higher_bits(pointer, 0b0000_0000_0000_0001usize, 1usize);
+            assert_eq!(
+                tagged,
+                0b1000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0001
+                    as *mut u8
+            );
+
+            let tagged = super::set_higher_bits(pointer, 0b0000_0000_0000_0101usize, 3usize);
+            assert_eq!(
+                tagged,
+                0b1010_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0001
+                    as *mut u8
+            );
+
+            let untagged_ptr = super::set_higher_bits(tagged, 0, 3usize);
+            assert_eq!(untagged_ptr, pointer);
+        }
+
+        #[test]
+        fn tag_raw_pointer_through_tag_impl() {
             let pointer = 0x00000001 as *mut u8;
 
             let parsed = AllocationPointerTag::from_pointer(pointer);
@@ -1922,10 +1970,47 @@ mod tests {
         }
 
         #[test]
-        fn tag_nonnull_pointer() {
+        fn tag_raw_pointer_through_tag_interface() {
+            let pointer = 0x00000001 as *mut u8;
+
+            let parsed = pointer.get_tag();
+            assert_eq!(parsed, Some(AllocationPointerTag::Owned));
+
+            let tagged_ptr = pointer.tag(AllocationPointerTag::Borrowed);
+            assert_eq!(
+                tagged_ptr,
+                0b1000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0001
+                    as *mut u8
+            );
+
+            let untagged_ptr = <*mut u8 as Taggable<AllocationPointerTag>>::remove_tag(&tagged_ptr);
+            assert_eq!(untagged_ptr, pointer);
+        }
+
+        #[test]
+        fn tag_nonnull_pointer_through_impl() {
             let pointer = NonNull::new(0x00000001 as *mut u8).unwrap();
 
             let parsed = AllocationPointerTag::from_pointer(pointer.as_ptr());
+            assert_eq!(parsed, Some(AllocationPointerTag::Owned));
+
+            let tagged_ptr = pointer.tag(AllocationPointerTag::Borrowed);
+            assert_eq!(
+                tagged_ptr.as_ptr(),
+                0b1000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0001
+                    as *mut u8
+            );
+
+            let untagged_ptr =
+                <std::ptr::NonNull<u8> as Taggable<AllocationPointerTag>>::remove_tag(&tagged_ptr);
+            assert_eq!(untagged_ptr, pointer);
+        }
+
+        #[test]
+        fn tag_nonnull_pointer_through_interface() {
+            let pointer = NonNull::new(0x00000001 as *mut u8).unwrap();
+
+            let parsed = pointer.get_tag();
             assert_eq!(parsed, Some(AllocationPointerTag::Owned));
 
             let tagged_ptr = pointer.tag(AllocationPointerTag::Borrowed);
