@@ -67,7 +67,7 @@ const fn parse_u8_from_str(string: &str) -> u8 {
         bytes = rest;
         if let b'0'..=b'9' = byte {
             value *= 10;
-            value += (*byte - b'0') as u8;
+            value += *byte - b'0';
         } else {
             panic!("The provided string is not a number.")
         }
@@ -84,7 +84,7 @@ const fn parse_u8_from_str(string: &str) -> u8 {
 /// The value is set at compile-time, as the target architecture is
 /// known at compile-time and must not change during the runtime.
 const ACTUAL_MAXIMUM_UNUSED_BITS_COUNTS_AT_COMPILE_TIME: u8 =
-    parse_u8_from_str(env!("VIRTUAL_ADDRESS_SIZE"));
+    parse_u8_from_str(env!("VIRTUAL_ADDRESS_UNUSED_SIZE"));
 
 impl VirtualMemoryUnusedBitsCount {
     /// To be on the safe side, the implementor should consider a lower
@@ -261,14 +261,14 @@ pub trait AbstractPointerTag {
     /// 16). The first byte is the highest byte of the tag,
     fn as_bytes(&self) -> u16;
 
-    /// Returns the extended type tag up to the size of a [usize], where
-    /// the unused bits are set to `1`.
+    /// Returns the extended type tag up to the size of a [usize];
     fn as_usize(&self) -> usize {
-        let bytes = self.as_bytes();
-        let bit_length = Self::BIT_LENGTH.get_count_usize();
+        self.as_bytes() as usize
+        // let bytes = self.as_bytes();
+        // let bit_length = Self::BIT_LENGTH.get_count_usize();
 
-        (bytes as usize) << (Self::USIZE_BITS_COUNT - bit_length)
-            | ((1 << (Self::USIZE_BITS_COUNT - bit_length)) - 1)
+        // (bytes as usize) << (Self::USIZE_BITS_COUNT - bit_length)
+        //     | ((1 << (Self::USIZE_BITS_COUNT - bit_length)) - 1)
     }
 
     /// Returns the tag from the given pointer.
@@ -286,7 +286,8 @@ pub trait AbstractPointerTag {
         // Extract the highest two bits and shift them to the lowest two bits position
         let tag_bytes = (ptr_value >> (Self::USIZE_BITS_COUNT - bit_length)) & mask;
 
-        Self::from_bytes((tag_bytes as u16) << (16 - bit_length))
+        // Self::from_bytes((tag_bytes as u16) << (16 - bit_length))
+        Self::from_bytes(tag_bytes as u16)
     }
 
     /// Tags the passed pointer with the value of this tag.
@@ -315,7 +316,7 @@ impl AbstractPointerTag for AllocationPointerTag {
     fn from_bytes(bytes: u16) -> Option<Self> {
         match bytes {
             0 => Some(Self::Owned),
-            0b10000000_00000000 => Some(Self::Borrowed),
+            0b0000_0000_0000_0001 => Some(Self::Borrowed),
             _ => None,
         }
     }
@@ -323,7 +324,7 @@ impl AbstractPointerTag for AllocationPointerTag {
     fn as_bytes(&self) -> u16 {
         match self {
             Self::Owned => 0,
-            Self::Borrowed => 0b10000000_00000000,
+            Self::Borrowed => 0b0000_0000_0000_0001,
         }
     }
 }
@@ -371,7 +372,7 @@ pub fn generate_bit_mask_with_ones(bit_length: usize) -> usize {
 /// # Arguments
 ///
 /// * `ptr` - The pointer to set the higher bits.
-/// * `bits` - The bits to set.
+/// * `bits` - The bits to set (the lower bits are taken).
 /// * `bit_length` - The number of bits to set.
 ///
 /// # Returns
@@ -1929,13 +1930,24 @@ mod tests {
         fn set_higher_bits() {
             let pointer = 0x00000001 as *mut u8;
 
-            let tagged = super::set_higher_bits(pointer, 0b0000_0000_0000_0001usize, 1usize);
+            // One bit
+            let bits = -1isize as usize;
+            let tagged = super::set_higher_bits(pointer, bits, 1usize);
             assert_eq!(
                 tagged,
                 0b1000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0001
                     as *mut u8
             );
 
+            // Two bits
+            let tagged = super::set_higher_bits(pointer, 0b1111111111, 2usize);
+            assert_eq!(
+                tagged,
+                0b1100_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0001
+                    as *mut u8
+            );
+
+            // Three bits
             let tagged = super::set_higher_bits(pointer, 0b0000_0000_0000_0101usize, 3usize);
             assert_eq!(
                 tagged,

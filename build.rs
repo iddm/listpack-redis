@@ -41,6 +41,9 @@ fn get_actual_virtual_address_size() -> Result<u8, &'static str> {
 }
 
 fn main() {
-    let address_size = get_actual_virtual_address_size().unwrap();
-    println!("cargo:rustc-env=VIRTUAL_ADDRESS_SIZE={address_size}");
+    let actual_address_size = get_actual_virtual_address_size().unwrap();
+    let maximum_address_size: usize = std::mem::size_of::<usize>() * 8;
+    let unused_address_size = maximum_address_size - actual_address_size as usize;
+
+    println!("cargo:rustc-env=VIRTUAL_ADDRESS_UNUSED_SIZE={unused_address_size}");
 }
