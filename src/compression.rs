@@ -164,14 +164,14 @@ impl VirtualMemoryUnusedBitsCount {
 
     /// Returns the number of bytes that are unused in the virtual
     /// memory addressing.
-    pub fn get_count(self) -> u8 {
+    pub const fn get_count(self) -> u8 {
         self.0
     }
 
     /// Returns the number of bytes that are unused in the virtual
     /// memory as a [`usize`] value (see
     /// [`Self::get_count`]).
-    pub fn get_count_usize(self) -> usize {
+    pub const fn get_count_usize(self) -> usize {
         self.0 as usize
     }
 
