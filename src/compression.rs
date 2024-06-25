@@ -274,7 +274,20 @@ pub trait AbstractPointerTag {
     /// Returns the tag from the given pointer.
     fn from_pointer<T>(pointer: *mut T) -> Option<Self>
     where
-        Self: Sized;
+        Self: Sized,
+    {
+        let bit_length = Self::BIT_LENGTH.get_count_usize();
+
+        // Convert the pointer to a usize to perform bitwise operations
+        let ptr_value = pointer as usize;
+
+        let mask = generate_bit_mask_with_ones(bit_length);
+
+        // Extract the highest two bits and shift them to the lowest two bits position
+        let tag_bytes = (ptr_value >> (Self::USIZE_BITS_COUNT - bit_length)) & mask;
+
+        Self::from_bytes((tag_bytes as u16) << (16 - bit_length))
+    }
 
     /// Tags the passed pointer with the value of this tag.
     fn tag_pointer<T>(&self, pointer: *mut T) -> *mut T
@@ -312,22 +325,6 @@ impl AbstractPointerTag for AllocationPointerTag {
             Self::Owned => 0,
             Self::Borrowed => 0b10000000_00000000,
         }
-    }
-
-    fn from_pointer<T>(pointer: *mut T) -> Option<Self> {
-        let bit_length = Self::BIT_LENGTH.get_count_usize();
-
-        // Get the number of bits in a usize
-
-        // Convert the pointer to a usize to perform bitwise operations
-        let ptr_value = pointer as usize;
-
-        let mask = generate_bit_mask_with_ones(bit_length);
-
-        // Extract the highest two bits and shift them to the lowest two bits position
-        let tag_byte = (ptr_value >> (Self::USIZE_BITS_COUNT - bit_length)) & mask;
-
-        Self::from_bytes((tag_byte as u16) << (16 - bit_length))
     }
 }
 
