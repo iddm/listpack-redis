@@ -261,8 +261,15 @@ pub trait AbstractPointerTag {
     /// 16). The first byte is the highest byte of the tag,
     fn as_bytes(&self) -> u16;
 
-    /// A convenience function to get the tag as a [`usize`] value.
-    fn as_usize(&self) -> usize;
+    /// Returns the extended type tag up to the size of a [usize], where
+    /// the unused bits are set to `1`.
+    fn as_usize(&self) -> usize {
+        let bytes = self.as_bytes();
+        let bit_length = Self::BIT_LENGTH.get_count_usize();
+
+        (bytes as usize) << (Self::USIZE_BITS_COUNT - bit_length)
+            | ((1 << (Self::USIZE_BITS_COUNT - bit_length)) - 1)
+    }
 
     /// Returns the tag from the given pointer.
     fn from_pointer<T>(pointer: *mut T) -> Option<Self>
@@ -305,14 +312,6 @@ impl AbstractPointerTag for AllocationPointerTag {
             Self::Owned => 0,
             Self::Borrowed => 0b10000000_00000000,
         }
-    }
-
-    fn as_usize(&self) -> usize {
-        let bytes = self.as_bytes();
-        let bit_length = Self::BIT_LENGTH.get_count_usize();
-
-        (bytes as usize) << (Self::USIZE_BITS_COUNT - bit_length)
-            | ((1 << (Self::USIZE_BITS_COUNT - bit_length)) - 1)
     }
 
     fn from_pointer<T>(pointer: *mut T) -> Option<Self> {
