@@ -40,10 +40,33 @@ fn get_actual_virtual_address_size() -> Result<u8, &'static str> {
     Ok(address_size)
 }
 
+fn get_minimum_mappable_address_offset() -> Result<usize, &'static str> {
+    // Read the /proc/sys/vm/mmap_min_addr file, and return the number
+    // that is written there.
+    // An example string:
+    //
+    // "65536"
+    //
+    // we return the number 65536.
+
+    let mmap_min_addr = std::fs::read_to_string("/proc/sys/vm/mmap_min_addr")
+        .map_err(|_| "Couldn't read the /proc/sys/fs/mmap_min_addr file.")?;
+
+    let mmap_min_addr = mmap_min_addr
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "Couldn't parse the number in the /proc/sys/fs/mmap_min_addr file.")?;
+
+    Ok(mmap_min_addr)
+}
+
 fn main() {
     let actual_address_size = get_actual_virtual_address_size().unwrap();
     let maximum_address_size: usize = std::mem::size_of::<usize>() * 8;
     let unused_address_size = maximum_address_size - actual_address_size as usize;
 
     println!("cargo:rustc-env=VIRTUAL_ADDRESS_UNUSED_SIZE={unused_address_size}");
+
+    let minimum_mappable_address_offset = get_minimum_mappable_address_offset().unwrap();
+    println!("cargo:rustc-env=MINIMUM_MAPPABLE_ADDRESS_OFFSET={minimum_mappable_address_offset}");
 }

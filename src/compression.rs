@@ -59,15 +59,15 @@ impl std::fmt::Display for VirtualMemoryUnusedBitsCount {
 }
 
 // A compile-time function to parse a number from string.
-const fn parse_u8_from_str(string: &str) -> u8 {
-    let mut value: u8 = 0;
+const fn parse_usize_from_str(string: &str) -> usize {
+    let mut value: usize = 0;
     let mut bytes = string.as_bytes();
 
     while let [byte, rest @ ..] = bytes {
         bytes = rest;
         if let b'0'..=b'9' = byte {
             value *= 10;
-            value += *byte - b'0';
+            value += (*byte - b'0') as usize;
         } else {
             panic!("The provided string is not a number.")
         }
@@ -84,7 +84,15 @@ const fn parse_u8_from_str(string: &str) -> u8 {
 /// The value is set at compile-time, as the target architecture is
 /// known at compile-time and must not change during the runtime.
 const ACTUAL_MAXIMUM_UNUSED_BITS_COUNTS_AT_COMPILE_TIME: u8 =
-    parse_u8_from_str(env!("VIRTUAL_ADDRESS_UNUSED_SIZE"));
+    parse_usize_from_str(env!("VIRTUAL_ADDRESS_UNUSED_SIZE")) as u8;
+
+/// The minimum mappable address offset. This value is set at
+/// compile-time but may be changed at runtime.
+///
+/// See <https://github.com/torvalds/linux/blob/master/mm/Kconfig#L708>
+/// , section `"config DEFAULT_MMAP_MIN_ADDR"` for more information.
+pub const MINIMUM_MAPPABLE_ADDRESS_OFFSET: usize =
+    parse_usize_from_str(env!("MINIMUM_MAPPABLE_ADDRESS_OFFSET"));
 
 impl VirtualMemoryUnusedBitsCount {
     /// To be on the safe side, the implementor should consider a lower
@@ -264,11 +272,6 @@ pub trait AbstractPointerTag {
     /// Returns the extended type tag up to the size of a [usize];
     fn as_usize(&self) -> usize {
         self.as_bytes() as usize
-        // let bytes = self.as_bytes();
-        // let bit_length = Self::BIT_LENGTH.get_count_usize();
-
-        // (bytes as usize) << (Self::USIZE_BITS_COUNT - bit_length)
-        //     | ((1 << (Self::USIZE_BITS_COUNT - bit_length)) - 1)
     }
 
     /// Returns the tag from the given pointer.
