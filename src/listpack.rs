@@ -19,7 +19,7 @@ use redis_custom_allocator::{CustomAllocator, MemoryConsumption};
 
 use crate::{
     allocator::ListpackAllocator,
-    compression::{AllocationPointerTag, Taggable, TryEncode},
+    compression::{AbstractPointerTag, AllocationPointerTag, Taggable, TryEncode},
     entry::{ListpackEntryInsert, ListpackEntryRef, ListpackEntryRemoved},
     error::{AllocationError, Result},
     iter::{ListpackChunks, ListpackIntoIter, ListpackIter, ListpackWindows},
@@ -327,6 +327,14 @@ impl ListpackAllocationPointer {
     /// Creates a lsitpack allocation pointer from a raw borrowed
     /// pointer. The function will return an error if the pointer does
     /// not contain a valid listpack.
+    ///
+    /// # Safety
+    ///
+    /// 1. The user must ensure that the pointer is valid throughout the
+    /// lifetime of the returned object.
+    /// 2. The user must deallocate the provided pointer manually, as
+    /// the returned object does not own the memory and will not
+    /// deallocate the memory referred to by the provided pointer.
     unsafe fn from_borrowed_raw_ptr(ptr: NonNull<u8>) -> Result<Self> {
         Self::from_borrowed_ptr(Self::ptr_as_slice(ptr))
     }
